@@ -10,7 +10,7 @@
 
 *AI Twin analyzes context, waits before reading, simulates typing, and makes realistic typos.*
 
-[🇷🇺 Read in Russian](https://github.com/newfpv/AiMovieSearcher/blob/main/READMERU.md)
+[🇷🇺 Read in Russian](READMERU.md)
 </div>
 
 **AI Twin** is not just another auto-reply script. It is an advanced hybrid system that combines your personal Telegram account (Pyrogram) with a secure control panel inside a separate bot (Aiogram). Under the hood, it uses Google Gemini's multimodal artificial intelligence, capable of seeing, hearing, and searching the internet for information.
