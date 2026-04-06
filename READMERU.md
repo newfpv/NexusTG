@@ -4,19 +4,19 @@
 
 -----
 
-\<div align="center"\>
+<div align="center">
 
 # 🤖 AI Twin Telegram Bot — Абсолютный цифровой клон
 
-\<img src="[https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge\&logo=python\&logoColor=white](https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge&logo=python&logoColor=white)" alt="Python"\>
-\<img src="[https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge\&logo=docker\&logoColor=white](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge&logo=docker&logoColor=white)" alt="Docker"\>
-\<img src="[https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge\&logo=telegram\&logoColor=white](https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge&logo=telegram&logoColor=white)" alt="aiogram"\>
-\<img src="[https://img.shields.io/badge/Pyrogram-2.x-blue.svg?style=for-the-badge\&logo=telegram\&logoColor=white](https://www.google.com/search?q=https://img.shields.io/badge/Pyrogram-2.x-blue.svg%3Fstyle%3Dfor-the-badge%26logo%3Dtelegram%26logoColor%3Dwhite)" alt="Pyrogram"\>
-\<img src="[https://img.shields.io/badge/Google\_Gemini-API-orange.svg?style=for-the-badge\&logo=google\&logoColor=white](https://img.shields.io/badge/Google_Gemini-API-orange.svg?style=for-the-badge&logo=google&logoColor=white)" alt="Gemini"\>
+<img src="[https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge\&logo=python\&logoColor=white](https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge&logo=python&logoColor=white)" alt="Python">
+<img src="[https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge\&logo=docker\&logoColor=white](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge&logo=docker&logoColor=white)" alt="Docker">
+<img src="[https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge\&logo=telegram\&logoColor=white](https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge&logo=telegram&logoColor=white)" alt="aiogram">
+<img src="[https://img.shields.io/badge/Pyrogram-2.x-blue.svg?style=for-the-badge\&logo=telegram\&logoColor=white](https://www.google.com/search?q=https://img.shields.io/badge/Pyrogram-2.x-blue.svg%3Fstyle%3Dfor-the-badge%26logo%3Dtelegram%26logoColor%3Dwhite)" alt="Pyrogram">
+<img src="[https://img.shields.io/badge/Google\_Gemini-API-orange.svg?style=for-the-badge\&logo=google\&logoColor=white](https://img.shields.io/badge/Google_Gemini-API-orange.svg?style=for-the-badge&logo=google&logoColor=white)" alt="Gemini">
 
 *AI Twin анализирует контекст, выжидает паузу, имитирует печать и делает реалистичные опечатки.*
 
-\</div\>
+</div>
 
 **AI Twin** — это не просто скрипт для автоответов. Это продвинутая гибридная система, объединяющая ваш личный аккаунт Telegram (Pyrogram) и защищенную панель управления в отдельном боте (Aiogram). Под капотом работает мультимодальный искусственный интеллект Google Gemini, способный видеть, слышать и искать информацию в интернете.
 
