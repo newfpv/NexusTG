@@ -2,16 +2,17 @@
 
 # 🤖 AI Twin Telegram Bot — The Ultimate Digital Clone
 
-<img src="[https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge\&logo=python\&logoColor=white](https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge&logo=python&logoColor=white)" alt="Python">
-<img src="[https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge\&logo=docker\&logoColor=white](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge&logo=docker&logoColor=white)" alt="Docker">
-<img src="[https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge\&logo=telegram\&logoColor=white](https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge&logo=telegram&logoColor=white)" alt="aiogram">
-<img src="[https://img.shields.io/badge/Pyrogram-2.x-blue.svg?style=for-the-badge\&logo=telegram\&logoColor=white](https://www.google.com/search?q=https://img.shields.io/badge/Pyrogram-2.x-blue.svg%3Fstyle%3Dfor-the-badge%26logo%3Dtelegram%26logoColor%3Dwhite)" alt="Pyrogram">
-<img src="[https://img.shields.io/badge/Google\_Gemini-API-orange.svg?style=for-the-badge\&logo=google\&logoColor=white](https://img.shields.io/badge/Google_Gemini-API-orange.svg?style=for-the-badge&logo=google&logoColor=white)" alt="Gemini">
+<img src="https://img.shields.io/badge/Python-3.11+-blue.svg?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+<img src="https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
+<img src="https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge&logo=telegram&logoColor=white" alt="aiogram">
+<img src="https://img.shields.io/badge/Google_Gemini-API-orange.svg?style=for-the-badge&logo=google&logoColor=white" alt="Gemini">
+<img src="https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge" alt="License">
 <img src="[https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge](https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge)" alt="License">
 <img src="[https://img.shields.io/github/last-commit/newfpv/AITwin?style=for-the-badge\&color=success](https://img.shields.io/github/last-commit/newfpv/AITwin?style=for-the-badge&color=success)" alt="Last Commit">
 
 *AI Twin analyzes context, waits before reading, simulates typing, and makes realistic typos.*
 
+[🇷🇺 Read in Russian](https://github.com/newfpv/AiMovieSearcher/blob/main/READMERU.md)
 </div>
 
 **AI Twin** is not just another auto-reply script. It is an advanced hybrid system that combines your personal Telegram account (Pyrogram) with a secure control panel inside a separate bot (Aiogram). Under the hood, it uses Google Gemini's multimodal artificial intelligence, capable of seeing, hearing, and searching the internet for information.
