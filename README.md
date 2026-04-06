@@ -20,7 +20,7 @@
 ## Screenshots
 
 <details>
-<summary>📸 Show interface and bot screenshots (click to expand)\</summary\>
+<summary>📸 Show interface and bot screenshots (click to expand)\</summary>
 
 <br>
 
