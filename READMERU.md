@@ -16,6 +16,21 @@
 
 -----
 
+
+## Скриншоты
+
+<details>
+<summary>📸 Show interface and bot screenshots (click to expand)\</summary\>
+
+<br>
+
+### Chat Example
+![Пример общения RU](exampleen.jpg)
+
+### Control Panel
+![Интерфейс настроек](settings.jpg)
+</details>
+
 ## 🧠 Мультимодальность: Бот понимает ВСЁ
 
 AI Twin не ограничен текстом. Модели Gemini позволяют ему воспринимать любой контент так же, как это делает живой человек:
