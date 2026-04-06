@@ -78,7 +78,6 @@ async def get_chat_menu_buttons(chat_id: int):
     c_search_active = config[7] if (config and len(config) > 7) else True
     c_search_status = _("ai_search_on") if c_search_active else _("ai_search_off")
     
-    # Берем задержки напрямую из конфигов, чтобы не зависеть от utils
     glob_db_min = glob_config[6] if glob_config and len(glob_config) > 6 and glob_config[6] is not None else 1
     glob_db_max = glob_config[7] if glob_config and len(glob_config) > 7 and glob_config[7] is not None else 3
     glob_da_min = glob_config[8] if glob_config and len(glob_config) > 8 and glob_config[8] is not None else 1
@@ -298,13 +297,64 @@ async def skip_wait_timer(call: types.CallbackQuery):
     skip_video_timers.add(chat_id)
     await call.answer(_("ai_skip_video_alert"), show_alert=True)
 
-@router.callback_query(F.data.startswith("ai_toggle_search_"))
+@router.callback_query(F.data == "ai_toggle_global")
+async def toggle_global_ai_cb(call: types.CallbackQuery):
+    if hasattr(database, "toggle_global_ai"):
+        await database.toggle_global_ai()
+    elif hasattr(database, "toggle_global"):
+        await database.toggle_global()
+        
+    config = await database.get_config()
+    g_ai_active = config[12] if (config and len(config) > 12) else False
+    g_ai_status = _("ai_g_status_on") if g_ai_active else _("ai_g_status_off")
+    
+    markup = call.message.reply_markup
+    if markup:
+        for row in markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == "ai_toggle_global":
+                    btn.text = _("btn_ai_mode", g_ai_status=g_ai_status)
+        try:
+            await call.message.edit_reply_markup(reply_markup=markup)
+        except Exception:
+            pass
+    await call.answer()
+
+@router.callback_query(F.data == "ai_toggle_search_global")
+async def toggle_search_global_cb(call: types.CallbackQuery):
+    if hasattr(database, "toggle_global_search"):
+        await database.toggle_global_search()
+        
+    config = await database.get_config()
+    g_search_active = config[13] if (config and len(config) > 13) else True
+    search_status = _("ai_search_on") if g_search_active else _("ai_search_off")
+    
+    markup = call.message.reply_markup
+    if markup:
+        for row in markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == "ai_toggle_search_global":
+                    btn.text = _("btn_ai_search_status", status=search_status)
+        try:
+            await call.message.edit_reply_markup(reply_markup=markup)
+        except Exception:
+            pass
+    await call.answer()
+
+@router.callback_query(F.data.regexp(r"^ai_toggle_search_-?\d+$"))
 async def toggle_chat_search_cb(call: types.CallbackQuery, state: FSMContext):
     chat_id = int(call.data.split("_")[3])
     await database.toggle_chat_search(chat_id)
     text, kb = await plugins.generate_chat_menu_cb(chat_id)
     await safe_edit(call.message, state, text, kb)
     await call.answer(_("ai_c_search_changed_alert"))
+
+@router.callback_query(F.data.regexp(r"^ai_toggle_-?\d+$"))
+async def toggle_chat(call: types.CallbackQuery, state: FSMContext):
+    chat_id = int(call.data.split("_")[2])
+    await database.toggle_chat(chat_id)
+    text, kb = await plugins.generate_chat_menu_cb(chat_id)
+    await safe_edit(call.message, state, text, kb)
 
 @router.callback_query(F.data.startswith("ai_ignore_"))
 async def toggle_ignore(call: types.CallbackQuery, state: FSMContext):
@@ -341,13 +391,6 @@ async def ask_delays(call: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data=f"chat_{chat_id}")]])
     await safe_edit(call.message, state, _("ai_c_delays_request"), kb)
     await state.set_state(AISettingsFSM.delays)
-
-@router.callback_query(F.data.startswith("ai_toggle_"))
-async def toggle_chat(call: types.CallbackQuery, state: FSMContext):
-    chat_id = int(call.data.split("_")[2])
-    await database.toggle_chat(chat_id)
-    text, kb = await plugins.generate_chat_menu_cb(chat_id)
-    await safe_edit(call.message, state, text, kb)
 
 # ==========================================
 # ОБРАБОТЧИКИ MESSAGES ДЛЯ FSM
