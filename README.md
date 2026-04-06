@@ -7,8 +7,6 @@
 <img src="https://img.shields.io/badge/aiogram-3.x-blue.svg?style=for-the-badge&logo=telegram&logoColor=white" alt="aiogram">
 <img src="https://img.shields.io/badge/Google_Gemini-API-orange.svg?style=for-the-badge&logo=google&logoColor=white" alt="Gemini">
 <img src="https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge" alt="License">
-<img src="[https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge](https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge)" alt="License">
-<img src="[https://img.shields.io/github/last-commit/newfpv/AITwin?style=for-the-badge\&color=success](https://img.shields.io/github/last-commit/newfpv/AITwin?style=for-the-badge&color=success)" alt="Last Commit">
 
 *AI Twin analyzes context, waits before reading, simulates typing, and makes realistic typos.*
 
