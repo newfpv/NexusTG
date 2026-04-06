@@ -18,17 +18,17 @@
 
 
 ## Скриншоты
-
 <details>
-<summary>📸 Show interface and bot screenshots (click to expand)\</summary\>
+  <summary>📸 Показать скриншоты интерфейса и работы бота (нажми, чтобы развернуть)</summary>
+  
+  <br>
 
-<br>
+  ### Пример общения
+  ![Пример общения RU](exampleru.jpg)
+  
+  ### Панель управления
+  ![Интерфейс настроек](settings.jpg)
 
-### Chat Example
-![Пример общения RU](exampleen.jpg)
-
-### Control Panel
-![Интерфейс настроек](settings.jpg)
 </details>
 
 ## 🧠 Мультимодальность: Бот понимает ВСЁ
