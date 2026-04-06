@@ -20,7 +20,7 @@
 ## Screenshots
 
 <details>
-<summary>📸 Show interface and bot screenshots (click to expand)\</summary>
+<summary>📸 Show interface and bot screenshots (click to expand)</summary>
 
 <br>
 
@@ -47,7 +47,7 @@
 AI Twin is not limited to text in either the background auto-reply mode or during manual invocation. In any situation, Gemini's multimodal models allow it to perceive the digital world just like a living person:
 
   * **🖼 Photo and Image Analysis:** If your chat partner sends a meme, chart, screenshot, or a photo asking "how do you like this?", the bot downloads the file (`.jpg`, `.png`) and passes its binary data directly to Gemini's "vision". The neural network details the image's contents for itself and generates an organic response, fully understanding the visual context. No more blind AIs\!
-  * **🎙 Voice and Video Messages (powered by `ffmpeg`):** You don't need third-party paid STT services like Whisper. [cite_start]The `ffmpeg` utility package built into the Docker container [cite: 5] allows the bot to process incoming audio (`.ogg`, `.oga`, `.mp3`, `.wav`, `.m4a`) and video messages (`.mp4`, `.mov`, `.avi`) on the fly. The audio stream is downloaded and sent directly to Gemini with a special system prompt for a verbatim transcript without distortions. The neural network reads not only the text but also emotions/intonation, after which it provides a meaningful text response to what was said.
+  * **🎙 Voice and Video Messages (powered by `ffmpeg`):** You don't need third-party paid STT services like Whisper. The `ffmpeg` utility package built into the Docker container allows the bot to process incoming audio (`.ogg`, `.oga`, `.mp3`, `.wav`, `.m4a`) and video messages (`.mp4`, `.mov`, `.avi`) on the fly. The audio stream is downloaded and sent directly to Gemini with a special system prompt for a verbatim transcript without distortions. The neural network reads not only the text but also emotions/intonation, after which it provides a meaningful text response to what was said.
   * **📄 Reading Files and Documents:** The bot can "read" the contents of an attached document or text file (e.g., code, logs, or essays). The AI will analyze the attached file to summarize it, find necessary information, or translate the text.
 
 -----
