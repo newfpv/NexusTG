@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  aitwin_bot:
+    build: .
+    container_name: aitwin_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
