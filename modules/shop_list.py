@@ -349,7 +349,12 @@ def register_userbot(app: Client):
                 chunk = tasks_list[i:i + CHUNK_SIZE]
                 checklist_tasks = [InputChecklistTask(id=idx+1, text=task_text) for idx, task_text in enumerate(chunk)]
                 
-                checklist = InputChecklist(title=t["checklist_title"], tasks=checklist_tasks)
+                checklist = InputChecklist(
+                    title=t["checklist_title"], 
+                    tasks=checklist_tasks,
+                    others_can_mark_tasks_as_done=True,
+                    others_can_add_tasks=True
+                )
                 
                 try:
                     if hasattr(client, "send_checklist"):
