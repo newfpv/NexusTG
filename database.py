@@ -122,6 +122,13 @@ async def toggle_global_search():
         await db.execute("UPDATE config SET google_search = CASE WHEN google_search = 1 THEN 0 ELSE 1 END WHERE id = 1")
         await db.commit()
 
+async def set_search_all_chats(state: bool):
+    """Принудительно устанавливает статус поиска для ВСЕХ чатов в БД."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        val = 1 if state else 0
+        await db.execute("UPDATE chats SET google_search = ?", (val,))
+        await db.commit()
+
 async def set_custom_reaction(reaction_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE config SET custom_reaction = ? WHERE id = 1", (reaction_id,))

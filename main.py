@@ -2,6 +2,7 @@ import asyncio
 import os
 import importlib
 import logging
+import inspect
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -174,7 +175,14 @@ async def start_userbot(session_string):
     userbot_app = Client("userbot", session_string=session_string, api_id=API_ID, api_hash=API_HASH, in_memory=True)
 
     for handler_func in plugins.userbot_handlers:
-        handler_func(userbot_app)
+        try:
+            sig = inspect.signature(handler_func)
+            if len(sig.parameters) >= 2:
+                handler_func(userbot_app, bot)
+            else:
+                handler_func(userbot_app)
+        except Exception as e:
+            logging.error(f"module init error: {e}")
 
     await userbot_app.start()
     logging.info(_("log_pyrogram_started"))
