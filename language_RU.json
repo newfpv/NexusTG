@@ -85,7 +85,7 @@
   "cmd_ai_task_query": "[ТВОЯ ЗАДАЧА - ОТВЕТИТЬ НА ЭТОТ ЗАПРОС]: {query}",
   "cmd_ai_custom_prompt": "Ты - Gemini. Отвечай максимально кратко, по делу, 1-2 предложения, без воды. Учитывай контекст переписки, но главное - ответь на сам ЗАПРОС.",
   "cmd_ai_safe_query_fallback": "Анализ медиа/сообщения",
-  "cmd_ai_reply_format": "<blockquote><b>🗣 Запрос:</b> <i>{safe_query}</i></blockquote>\n<b>🤖 Ответ Gemini:</b>\n{part}",
+  "cmd_ai_reply_format": "<blockquote><i>{safe_query}</i></blockquote>\n{part}",
   "cmd_ai_log_error": "Ошибка в .ai: {e}",
   "cmd_ai_error_msg": "❌ Ошибка Gemini: {e}",
 
@@ -247,5 +247,15 @@
   "ai_h_cfg_smart_req": "Отправь множитель секунд на 1 символ текста (например: `0.05` или `0.1`). Для сброса на дефолт отправь `сброс`:",
   "ai_h_cfg_smart_saved": "✅ Настройки Умного чтения успешно сохранены!",
   "ai_h_cfg_typing_req": "Отправь 4 числа (в секундах) для симуляции печати:\n`МинПечать МаксПечать МинПауза МаксПауза`\nПример: `1.5 3.5 0.5 2.0`\nДля сброса отправь `сброс`:",
-  "ai_h_cfg_typing_saved": "✅ Настройки Рваной печати успешно сохранены!"
+  "ai_h_cfg_typing_saved": "✅ Настройки Рваной печати успешно сохранены!",
+
+  "btn_ai_cmd_settings": "🧠 Настройки ручного ИИ (.ai)",
+  "menu_ai_cmd_title": "⚙️ <b>Настройки ручного вызова ИИ</b>\nЗдесь можно настроить команду вызова, поиск и метаданные.\n\n📝 <b>Текущий промпт:</b>\n<code>{prompt}</code>",
+  "btn_ai_cmd_trigger": "Команда: {cmd}",
+  "btn_ai_cmd_search": "Поиск: {status}",
+  "btn_ai_cmd_model": "Показывать модель: {status}",
+  "btn_ai_cmd_queries": "Показывать запросы: {status}",
+  "btn_ai_cmd_prompt": "📝 Глобальный промпт",
+  "ai_cmd_enter_cmd": "Отправь новую команду для вызова ИИ (например: <code>.gpt</code> или <code>gemini</code>):",
+  "ai_cmd_enter_prompt": "Отправь новый системный промпт для ручных запросов (или нажми Отмена):"
 }
