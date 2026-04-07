@@ -3,28 +3,205 @@ import re
 import html
 import asyncio
 import logging
-from pyrogram import Client, filters
+import aiosqlite
+from pyrogram import Client, filters, enums
+
+from aiogram import Router, F, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
 from gemini_core import generate_ai_response, transcribe_media
 from utils import simulate_typing
 from modules.youtube import fetch_youtube_data_sync
 from i18n import _
 
+# ==========================================
+# DATABASE LOGIC
+# ==========================================
+DB_PATH = "data/ai_cmd.sqlite"
+
+async def on_startup():
+    if not os.path.exists("data"):
+        os.makedirs("data")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS ai_msgs (chat_id INTEGER, msg_id INTEGER, PRIMARY KEY(chat_id, msg_id))")
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM settings")
+        count = (await cursor.fetchone())[0]
+        if count == 0:
+            defaults = [
+                ("command", ".ai"),
+                ("use_search", "1"),
+                ("show_model", "0"),
+                ("show_queries", "0"),
+                ("global_prompt", "Ты - Gemini. Отвечай кратко, по делу. Учитывай контекст.")
+            ]
+            await db.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", defaults)
+        await db.commit()
+
+async def get_all_settings():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT key, value FROM settings")
+        rows = await cursor.fetchall()
+        return {k: v for k, v in rows}
+
+async def get_setting(key, default=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else default
+
+async def set_setting(key, value):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        await db.commit()
+
+async def save_ai_msg(chat_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO ai_msgs (chat_id, msg_id) VALUES (?, ?)", (chat_id, msg_id))
+        await db.commit()
+
+async def is_ai_msg(chat_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM ai_msgs WHERE chat_id = ? AND msg_id = ?", (chat_id, msg_id))
+        row = await cursor.fetchone()
+        return row is not None
+
+# ==========================================
+# AIOGRAM UI & SETTINGS
+# ==========================================
+router = Router()
+
+class AICmdFSM(StatesGroup):
+    wait_command = State()
+    wait_prompt = State()
+
+async def get_settings_buttons():
+    return [[InlineKeyboardButton(text=_("btn_ai_cmd_settings"), callback_data="aicmd_main")]]
+
+def get_main_kb(cfg):
+    status_search = _("status_on") if cfg.get("use_search") == "1" else _("status_off")
+    status_model = _("status_on") if cfg.get("show_model") == "1" else _("status_off")
+    status_queries = _("status_on") if cfg.get("show_queries") == "1" else _("status_off")
+    
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=_("btn_ai_cmd_trigger", cmd=cfg.get("command", ".ai")), callback_data="aicmd_edit_cmd")],
+        [InlineKeyboardButton(text=_("btn_ai_cmd_search", status=status_search), callback_data="aicmd_toggle_search")],
+        [InlineKeyboardButton(text=_("btn_ai_cmd_model", status=status_model), callback_data="aicmd_toggle_model")],
+        [InlineKeyboardButton(text=_("btn_ai_cmd_queries", status=status_queries), callback_data="aicmd_toggle_queries")],
+        [InlineKeyboardButton(text=_("btn_ai_cmd_prompt"), callback_data="aicmd_edit_prompt")],
+        [InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]
+    ])
+
+@router.callback_query(F.data == "aicmd_main")
+async def aicmd_main_menu(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    await state.update_data(menu_msg_id=call.message.message_id) 
+    cfg = await get_all_settings()
+    text = _("menu_ai_cmd_title", prompt=html.escape(cfg.get("global_prompt", "")))
+    try:
+        await call.message.edit_text(text, reply_markup=get_main_kb(cfg), parse_mode="HTML")
+    except Exception:
+        pass
+
+@router.callback_query(F.data.startswith("aicmd_toggle_"))
+async def aicmd_toggles(call: types.CallbackQuery, state: FSMContext):
+    cfg = await get_all_settings()
+    action = call.data.split("_")[-1]
+    
+    if action == "search": 
+        new_val = "0" if cfg.get("use_search") == "1" else "1"
+        await set_setting("use_search", new_val)
+    elif action == "model": 
+        new_val = "0" if cfg.get("show_model") == "1" else "1"
+        await set_setting("show_model", new_val)
+    elif action == "queries": 
+        new_val = "0" if cfg.get("show_queries") == "1" else "1"
+        await set_setting("show_queries", new_val)
+    
+    cfg = await get_all_settings()
+    text = _("menu_ai_cmd_title", prompt=html.escape(cfg.get("global_prompt", "")))
+    try:
+        await call.message.edit_text(text, reply_markup=get_main_kb(cfg), parse_mode="HTML")
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "aicmd_edit_cmd")
+async def aicmd_edit_cmd(call: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="aicmd_main")]])
+    try:
+        await call.message.edit_text(_("ai_cmd_enter_cmd"), reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await state.set_state(AICmdFSM.wait_command)
+
+@router.message(AICmdFSM.wait_command)
+async def aicmd_save_cmd(message: types.Message, state: FSMContext):
+    new_cmd = message.text.strip().split()[0]
+    await set_setting("command", new_cmd)
+    
+    try: await message.delete()
+    except: pass
+    
+    data = await state.get_data()
+    await state.set_state(None) 
+    
+    menu_msg_id = data.get("menu_msg_id")
+    if menu_msg_id:
+        cfg = await get_all_settings()
+        text = _("menu_ai_cmd_title", prompt=html.escape(cfg.get("global_prompt", "")))
+        try: 
+            await message.bot.edit_message_text(text, chat_id=message.chat.id, message_id=menu_msg_id, reply_markup=get_main_kb(cfg), parse_mode="HTML")
+        except Exception:
+            pass
+
+@router.callback_query(F.data == "aicmd_edit_prompt")
+async def aicmd_edit_prompt(call: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="aicmd_main")]])
+    try:
+        await call.message.edit_text(_("ai_cmd_enter_prompt"), reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await state.set_state(AICmdFSM.wait_prompt)
+
+@router.message(AICmdFSM.wait_prompt)
+async def aicmd_save_prompt(message: types.Message, state: FSMContext):
+    new_prompt = message.text.strip()
+    await set_setting("global_prompt", new_prompt)
+    
+    try: await message.delete()
+    except: pass
+    
+    data = await state.get_data()
+    await state.set_state(None)
+    
+    menu_msg_id = data.get("menu_msg_id")
+    if menu_msg_id:
+        cfg = await get_all_settings()
+        text = _("menu_ai_cmd_title", prompt=html.escape(cfg.get("global_prompt", "")))
+        try: 
+            await message.bot.edit_message_text(text, chat_id=message.chat.id, message_id=menu_msg_id, reply_markup=get_main_kb(cfg), parse_mode="HTML")
+        except Exception:
+            pass
+
+# ==========================================
+# PYROGRAM LOGIC
+# ==========================================
 def register_userbot(app: Client):
     
-    # Кастомный фильтр для триггера ИИ
     async def is_ai_target(_, __, message):
-        # 1. Если это ручная команда .ai (строго только твои сообщения)
+        cmd = await get_setting("command", ".ai")
+        
         if message.from_user and message.from_user.is_self:
-            if message.text and re.match(r"^\.ai(?:\s+|$)", message.text):
+            if message.text and re.match(rf"^{re.escape(cmd)}(?:\s+|$)", message.text):
                 return True
         
-        # 2. Если это ответ (твой или чужой) на предыдущее сообщение от ИИ
-        if message.reply_to_message and message.reply_to_message.text:
-            # Ищем маркер ответа. Если в i18n он другой, поменяй строку ниже!
-            if "🤖 Ответ Gemini:" in message.reply_to_message.text:
-                # Исключаем ручную команду, чтобы фильтры не конфликтовали
-                if message.text and not message.text.startswith(".ai"):
+        if message.reply_to_message:
+            is_ai_reply = await is_ai_msg(message.chat.id, message.reply_to_message.id)
+            if is_ai_reply:
+                if message.text and not message.text.startswith(cmd):
                     return True
         return False
 
@@ -33,30 +210,35 @@ def register_userbot(app: Client):
     @app.on_message(ai_trigger)
     async def handle_ai_request(client, message):
         try:
-            # Определяем, был ли это ручной вызов .ai или автоматический реплай
-            is_manual = bool(message.from_user and message.from_user.is_self and message.text and message.text.startswith(".ai"))
+            cfg = await get_all_settings()
+            cmd = cfg.get("command", ".ai")
+            
+            is_manual = bool(message.from_user and message.from_user.is_self and message.text and message.text.startswith(cmd))
             
             query = ""
             if is_manual:
-                match = re.match(r"^\.ai(?:\s+(.*))?", message.text or message.caption or "", flags=re.DOTALL)
+                match = re.match(rf"^{re.escape(cmd)}(?:\s+(.*))?", message.text or message.caption or "", flags=re.DOTALL)
                 if match and match.group(1):
                     query = match.group(1).strip()
             else:
-                # Если авто-реплай, весь текст сообщения это и есть запрос
                 query = message.text or message.caption or ""
 
-            # Плашка статуса "Думаю..."
+            use_search = (cfg.get("use_search") == "1")
+            sys_prompt = cfg.get("global_prompt", "")
+            
+            if cfg.get("show_queries") == "1":
+                sys_prompt += "\n\n[SYSTEM RULE]: Если ты использовал Google Search для ответа, ОБЯЗАТЕЛЬНО напиши в самом конце ответа с новой строки: '🔍 Поиск: [перечисли твои поисковые запросы]'."
+            if cfg.get("show_model") == "1":
+                sys_prompt += "\n\n[SYSTEM RULE]: ОБЯЗАТЕЛЬНО напиши в самом конце ответа с новой строки: '🤖 Модель: [напиши версию твоей модели Gemini]'."
+
             status_msg = None
             if is_manual:
-                # Свою команду .ai можно просто заменить
-                status_msg = await message.edit(_("cmd_ai_thinking"))
+                status_msg = await message.edit(_("cmd_ai_thinking"), parse_mode=enums.ParseMode.HTML)
             else:
-                # На обычный реплай (даже свой) отвечаем новым сообщением, чтобы не стереть запрос из истории
-                status_msg = await message.reply(_("cmd_ai_thinking"))
+                status_msg = await message.reply(_("cmd_ai_thinking"), parse_mode=enums.ParseMode.HTML)
             
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             
-            # Определяем целевое сообщение для поиска медиа и ссылок
             target_msg = message.reply_to_message if (is_manual and message.reply_to_message) else message
             
             media_path = None
@@ -85,7 +267,6 @@ def register_userbot(app: Client):
                     logging.info(_("cmd_ai_yt_found"))
                     _dur, yt_context = await asyncio.to_thread(fetch_youtube_data_sync, yt_links[0])
 
-            # Собираем контекст из последних сообщений (он сам захватит предыдущий ответ Gemini)
             hist = []
             async for m in client.get_chat_history(message.chat.id, limit=6):
                 if m.id == message.id: continue
@@ -116,7 +297,8 @@ def register_userbot(app: Client):
             reply = await generate_ai_response(
                 full_query, 
                 media_path=media_path,
-                custom_prompt=_("cmd_ai_custom_prompt")
+                custom_prompt=sys_prompt,
+                search_enabled=use_search
             )
             
             typing_task.cancel()
@@ -128,7 +310,6 @@ def register_userbot(app: Client):
             if reply:
                 parts.append(reply)
             
-            # Отправляем ответ
             for i, part in enumerate(parts):
                 if i == 0:
                     safe_query = html.escape(query if query != _("cmd_ai_default_query") else _("cmd_ai_safe_query_fallback"))
@@ -137,16 +318,16 @@ def register_userbot(app: Client):
                     text = part
                 
                 if i == 0:
-                    # Редактируем первую часть прямо в плашке "Думаю..."
-                    await status_msg.edit(text)
+                    await status_msg.edit(text, parse_mode=enums.ParseMode.HTML)
+                    await save_ai_msg(message.chat.id, status_msg.id)
                 else:
-                    # Если кусков несколько, шлем их реплаем друг на друга
-                    await client.send_message(message.chat.id, text, reply_to_message_id=status_msg.id)
+                    sent_msg = await client.send_message(message.chat.id, text, reply_to_message_id=status_msg.id, parse_mode=enums.ParseMode.HTML)
+                    await save_ai_msg(message.chat.id, sent_msg.id)
 
         except Exception as e:
             logging.error(_("cmd_ai_log_error", e=e))
             if 'status_msg' in locals() and status_msg:
-                await status_msg.edit(_("cmd_ai_error_msg", e=e))
+                await status_msg.edit(_("cmd_ai_error_msg", e=e), parse_mode=enums.ParseMode.HTML)
         finally:
             if 'media_path' in locals() and media_path and os.path.exists(media_path):
                 try: os.remove(media_path)
