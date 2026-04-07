@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 # ВАЖНО: Настраиваем логи ДО импорта остальных библиотек и модулей!
 logging.basicConfig(level=logging.INFO, force=True)
+logging.getLogger("aiogram.event").setLevel(logging.WARNING) # УБИРАЕМ СПАМ ОТ AIOGRAM
 load_dotenv(override=True)
 
 from aiogram import Bot, Dispatcher, types, F
