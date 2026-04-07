@@ -36,9 +36,15 @@ async def show_my_info(call: types.CallbackQuery, state: FSMContext):
         phone = f"+{me.phone_number}" if getattr(me, 'phone_number', None) else _("info_hidden_none")
         bio_text = html.escape(getattr(chat, 'bio', None) or _("info_not_filled"))
         
+        # Обновленная безопасная проверка статусов верификации
+        vs = getattr(me, 'verification_status', None)
+        check_scam = getattr(vs, 'is_scam', getattr(me, 'is_scam', False))
+        check_fake = getattr(vs, 'is_fake', getattr(me, 'is_fake', False))
+        check_verified = getattr(vs, 'is_verified', getattr(me, 'is_verified', False))
+
         is_premium = _("info_yes_star") if getattr(me, 'is_premium', False) else _("info_no")
-        is_scam = _("info_yes_warn") if (getattr(me, 'is_scam', False) or getattr(me, 'is_fake', False)) else _("info_no")
-        is_verified = _("info_yes_check") if getattr(me, 'is_verified', False) else _("info_no")
+        is_scam = _("info_yes_warn") if (check_scam or check_fake) else _("info_no")
+        is_verified = _("info_yes_check") if check_verified else _("info_no")
         is_restricted = _("info_yes_stop") if getattr(me, 'is_restricted', False) else _("info_no")
         dc_id_text = str(getattr(me, 'dc_id', _("info_unknown")))
 
@@ -77,9 +83,15 @@ async def show_user_info(call: types.CallbackQuery, state: FSMContext):
         phone = f"+{user.phone_number}" if getattr(user, 'phone_number', None) else _("info_hidden_none")
         bio_text = html.escape(getattr(chat, 'bio', None) or _("info_not_filled"))
         
+        # Обновленная безопасная проверка статусов верификации
+        vs = getattr(user, 'verification_status', None)
+        check_scam = getattr(vs, 'is_scam', getattr(user, 'is_scam', False))
+        check_fake = getattr(vs, 'is_fake', getattr(user, 'is_fake', False))
+        check_verified = getattr(vs, 'is_verified', getattr(user, 'is_verified', False))
+
         is_premium = _("info_yes_star") if getattr(user, 'is_premium', False) else _("info_no")
-        is_scam = _("info_yes_warn") if (getattr(user, 'is_scam', False) or getattr(user, 'is_fake', False)) else _("info_no")
-        is_verified = _("info_yes_check") if getattr(user, 'is_verified', False) else _("info_no")
+        is_scam = _("info_yes_warn") if (check_scam or check_fake) else _("info_no")
+        is_verified = _("info_yes_check") if check_verified else _("info_no")
         is_deleted = _("info_yes_ghost") if getattr(user, 'is_deleted', False) else _("info_no")
         is_restricted = _("info_yes_stop") if getattr(user, 'is_restricted', False) else _("info_no")
         is_contact = _("info_yes_user") if getattr(user, 'is_contact', False) else _("info_no")
