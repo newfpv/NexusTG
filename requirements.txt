@@ -1,5 +1,5 @@
 aiogram==3.4.1
-pyrogram==2.0.106
+Kurigram
 tgcrypto==1.2.5
 google-genai==0.3.0
 python-dotenv==1.0.1
