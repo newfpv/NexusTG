@@ -15,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from pyrogram import Client, filters, enums
 from pyrogram.enums import ChatType
 from pyrogram.raw import functions
+from pyrogram.types import ReplyParameters # Добавлено для устранения предупреждения
 
 import database
 from gemini_core import generate_ai_response, transcribe_media
@@ -322,12 +323,17 @@ async def toggle_global_ai_cb(call: types.CallbackQuery):
 
 @router.callback_query(F.data == "ai_toggle_search_global")
 async def toggle_search_global_cb(call: types.CallbackQuery):
+    # 1. Переключаем глобальный статус в таблице config
     if hasattr(database, "toggle_global_search"):
         await database.toggle_global_search()
         
     config = await database.get_config()
     g_search_active = config[13] if (config and len(config) > 13) else True
     search_status = _("ai_search_on") if g_search_active else _("ai_search_off")
+    
+    # 2. ИСПРАВЛЕНИЕ: Принудительно обновляем настройки поиска для всех чатов в БД
+    if hasattr(database, "set_search_all_chats"):
+        await database.set_search_all_chats(g_search_active)
     
     markup = call.message.reply_markup
     if markup:
@@ -339,7 +345,8 @@ async def toggle_search_global_cb(call: types.CallbackQuery):
             await call.message.edit_reply_markup(reply_markup=markup)
         except Exception:
             pass
-    await call.answer()
+    
+    await call.answer("Глобальный статус поиска применен ко всем чатам!")
 
 @router.callback_query(F.data.regexp(r"^ai_toggle_search_-?\d+$"))
 async def toggle_chat_search_cb(call: types.CallbackQuery, state: FSMContext):
@@ -713,7 +720,7 @@ def register_userbot(app: Client):
                 logging.info(_("ai_log_skip_ignored", chat_id=chat_id))
                 return
             
-            # --- Вручную собираем глобальные настройки (обход utils.py) ---
+            # --- Вручную собираем глобальные настройки ---
             typing_speed = config_db[5] if len(config_db) > 5 and config_db[5] is not None else 0.08
             glob_db_min = config_db[6] if len(config_db) > 6 and config_db[6] is not None else 1
             glob_db_max = config_db[7] if len(config_db) > 7 and config_db[7] is not None else 3
@@ -747,12 +754,13 @@ def register_userbot(app: Client):
             use_h_smart = g_h_smart if c_h_smart == 2 else bool(c_h_smart)
             use_h_ignore = g_h_ignore if c_h_ignore == -1 else c_h_ignore
             
-            if is_global_ai:
-                search_enabled = config_db[13] if (config_db and len(config_db) > 13) else True
+            # ТЕПЕРЬ ВСЕГДА ВАЖНЕЕ ИНДИВИДУАЛЬНАЯ НАСТРОЙКА ЧАТА ДЛЯ ПОИСКА (ДАЖЕ В ГЛОБАЛЬНОМ РЕЖИМЕ)
+            if chat_cfg and len(chat_cfg) > 7 and chat_cfg[7] is not None:
+                search_enabled = bool(chat_cfg[7])
             else:
-                search_enabled = chat_cfg[7] if (chat_cfg and len(chat_cfg) > 7) else True
+                search_enabled = bool(config_db[13]) if (config_db and len(config_db) > 13) else True
                 
-            # --- Вручную собираем промпт (обход utils.py) ---
+            # --- Вручную собираем промпт ---
             global_prompt = config_db[4] if len(config_db) > 4 and config_db[4] else ""
             c_prompt = chat_cfg[1] if chat_cfg and len(chat_cfg) > 1 and chat_cfg[1] else ""
             final_prompt = global_prompt
@@ -931,11 +939,12 @@ def register_userbot(app: Client):
                     use_typo = random.random() < 0.05
                     final_part = introduce_typo(part) if use_typo else part
                     
-                    reply_id = message.id if (i == 0 and use_reply) else None
-                    sent_msg = await client.send_message(chat_id, final_part, reply_to_message_id=reply_id)
+                    # ИСПРАВЛЕНИЕ: Замена reply_to_message_id на reply_parameters
+                    reply_params = ReplyParameters(message_id=message.id) if (i == 0 and use_reply) else None
+                    sent_msg = await client.send_message(chat_id, final_part, reply_parameters=reply_params)
                     
                     if use_typo and final_part != part:
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
+                        await asyncio.sleep(random.uniform(3, 10.0))
                         try: await sent_msg.edit_text(part)
                         except: pass
                     
