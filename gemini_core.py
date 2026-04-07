@@ -16,11 +16,12 @@ raw_keys = os.getenv("API_KEYS", "")
 API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 MODEL_FALLBACK_LIST = [m.strip() for m in os.getenv("MODEL_FALLBACK_LIST", "").split(",") if m.strip()]
 
+# Используем словари для хранения времени окончания бана (timestamp)
 api_key_states = {k: {
     "unban_time": 0, 
-    "exhausted_models": set(),
+    "exhausted_models": {}, 
     "search_unban_time": 0,
-    "search_exhausted_models": set()
+    "search_exhausted_models": {}
 } for k in API_KEYS}
 key_lock = asyncio.Lock()
 
@@ -48,8 +49,12 @@ async def _send_to_gemini(contents, search_enabled=True, is_fallback=False):
         async with key_lock:
             for model in MODEL_FALLBACK_LIST:
                 for key, state in api_key_states.items():
-                    if now >= state["unban_time"] and model not in state["exhausted_models"]:
-                        if search_enabled and (now < state["search_unban_time"] or model in state["search_exhausted_models"]):
+                    # Проверяем, не в бане ли модель (время разбана больше текущего)
+                    is_model_exhausted = state["exhausted_models"].get(model, 0) > now
+                    
+                    if now >= state["unban_time"] and not is_model_exhausted:
+                        is_search_exhausted = state["search_exhausted_models"].get(model, 0) > now
+                        if search_enabled and (now < state["search_unban_time"] or is_search_exhausted):
                             continue
                         
                         selected_key, selected_model = key, model
@@ -63,7 +68,7 @@ async def _send_to_gemini(contents, search_enabled=True, is_fallback=False):
                 now_check = time.time()
                 for model in MODEL_FALLBACK_LIST:
                     for key, state in api_key_states.items():
-                        if now_check >= state["unban_time"] and model not in state["exhausted_models"]:
+                        if now_check >= state["unban_time"] and state["exhausted_models"].get(model, 0) <= now_check:
                             can_fallback = True
                             break
                     if can_fallback: break
@@ -102,25 +107,28 @@ async def _send_to_gemini(contents, search_enabled=True, is_fallback=False):
             return response.text.strip() if response.text else ""
 
         except Exception as e:
-            err_str = str(e).lower()
+            # Склеиваем текст ошибки и её класс, чтобы точно поймать ServerError
+            err_str = f"{str(e)} {type(e).__name__}".lower()
             async with key_lock:
-                is_quota_error = "429" in err_str or "resource_exhausted" in err_str or "500" in err_str or "servererror" in err_str or "internal" in err_str
+                is_quota_error = any(x in err_str for x in ["429", "resource_exhausted", "500", "servererror", "internal", "overloaded"])
                 
                 if is_quota_error:
+                    ban_duration = 7200 # Бан ровно на 2 часа (в секундах)
                     if search_enabled:
                         logging.warning(_("log_gemini_search_ban", selected_model=selected_model, key_mask=key_mask))
-                        api_key_states[selected_key]["search_exhausted_models"].add(selected_model)
+                        api_key_states[selected_key]["search_exhausted_models"][selected_model] = time.time() + ban_duration
                         api_key_states[selected_key]["unban_time"] = 0 
                         
-                        if len(api_key_states[selected_key]["search_exhausted_models"]) >= len(MODEL_FALLBACK_LIST):
+                        # Если забанены все модели для поиска — баним ключ на 8 часов
+                        active_search_bans = sum(1 for t in api_key_states[selected_key]["search_exhausted_models"].values() if t > time.time())
+                        if active_search_bans >= len(MODEL_FALLBACK_LIST):
                             logging.warning(_("log_gemini_search_key_ban", key_mask=key_mask))
-                            # БАН ПОИСКА НА 8 ЧАСОВ
                             api_key_states[selected_key]["search_unban_time"] = time.time() + 28800
                             api_key_states[selected_key]["search_exhausted_models"].clear()
                     else:
-                        logging.warning(_("log_gemini_limit", selected_model=selected_model, key_mask=key_mask))
-                        api_key_states[selected_key]["exhausted_models"].add(selected_model)
-                        api_key_states[selected_key]["unban_time"] = time.time()
+                        logging.warning(_("log_gemini_model_ban", selected_model=selected_model, key_mask=key_mask))
+                        api_key_states[selected_key]["exhausted_models"][selected_model] = time.time() + ban_duration
+                        api_key_states[selected_key]["unban_time"] = time.time() # Освобождаем ключ для других моделей
                 elif "400" in err_str or "invalid" in err_str:
                     logging.error(_("log_gemini_400", selected_model=selected_model, key_mask=key_mask))
                     api_key_states[selected_key]["unban_time"] = time.time() + 5
