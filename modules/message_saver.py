@@ -13,10 +13,8 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, User
 from pyrogram.enums import ChatType
 
-from utils import safe_edit
-
 # ==========================================
-# ISOLATED DB AND MODULE CACHE
+# ИЗОЛИРОВАННАЯ БД И КЭШ МОДУЛЯ
 # ==========================================
 DB_FILE = "data/saver_db.sqlite"
 CACHE_DIR = "data/spy_cache/"
@@ -88,7 +86,7 @@ async def set_config(key: str, value: str):
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
         await db.commit()
 
-# --- SMART TOPIC CREATION AND UPDATE VIA BOT API ---
+# --- УМНОЕ СОЗДАНИЕ И ОБНОВЛЕНИЕ ТОПИКА ЧЕРЕЗ BOT API ---
 async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id: int, user_obj: User = None) -> int:
     action_delay = 1.5 
     
@@ -136,18 +134,18 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
             await db.execute("INSERT INTO topics (user_id, topic_id, user_name) VALUES (?, ?, ?)", (user_id, topic_id, full_name))
             await db.commit()
 
-        username = f"@{user_obj.username}" if user_obj and user_obj.username else "No"
-        phone = f"+{user_obj.phone_number}" if user_obj and getattr(user_obj, "phone_number", None) else "Hidden"
-        premium = "Yes 🌟" if user_obj and getattr(user_obj, "is_premium", False) else "No"
-        contact = "Yes 📇" if user_obj and getattr(user_obj, "is_contact", False) else "No"
+        username = f"@{user_obj.username}" if user_obj and user_obj.username else "Нет"
+        phone = f"+{user_obj.phone_number}" if user_obj and getattr(user_obj, "phone_number", None) else "Скрыт"
+        premium = "Да 🌟" if user_obj and getattr(user_obj, "is_premium", False) else "Нет"
+        contact = "Да 📇" if user_obj and getattr(user_obj, "is_contact", False) else "Нет"
 
         profile_text = (
-            f"📁 <b>USER DOSSIER</b>\n\n"
-            f"👤 <b>Name:</b> {html.escape(full_name)}\n"
+            f"📁 <b>ДОСЬЕ ПОЛЬЗОВАТЕЛЯ</b>\n\n"
+            f"👤 <b>Имя:</b> {html.escape(full_name)}\n"
             f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-            f"🔗 <b>Username:</b> {html.escape(username)}\n"
-            f"📱 <b>Phone:</b> <code>{html.escape(phone)}</code>\n"
-            f"📇 <b>In contacts:</b> {contact}\n"
+            f"🔗 <b>Юзернейм:</b> {html.escape(username)}\n"
+            f"📱 <b>Телефон:</b> <code>{html.escape(phone)}</code>\n"
+            f"📇 <b>В контактах:</b> {contact}\n"
             f"🌟 <b>Premium:</b> {premium}\n"
         )
 
@@ -179,7 +177,7 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
         logging.error(f"Save Module: Topic create error: {e}")
         return None
 
-# --- SENDING QUEUE ---
+# --- ОЧЕРЕДЬ ОТПРАВКИ ---
 async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, topic_id: int, text: str, file_path: str, media_type: str, d_min: float, d_max: float, delete_file_after=False, is_ttl=False, parse_mode=None):
     delay_sec = random.randint(int(d_min * 60), int(d_max * 60))
     await asyncio.sleep(delay_sec)
@@ -199,7 +197,7 @@ async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, 
             else: return await bot.send_message(**kwargs)
         else:
             msg_txt = text
-            if file_path: msg_txt += "\n\n<i>(Media file not saved)</i>"
+            if file_path: msg_txt += "\n\n<i>(Медиа файл не сохранен)</i>"
             return await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=msg_txt, parse_mode=parse_mode)
 
     try:
@@ -222,7 +220,7 @@ async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, 
             except: pass
 
 # ==========================================
-# AIOGRAM SETTINGS (UI)
+# НАСТРОЙКИ AIOGRAM (UI С HTML)
 # ==========================================
 router = Router()
 
@@ -233,36 +231,48 @@ class SaverStates(StatesGroup):
     waiting_for_delay = State()
     waiting_for_limits = State()
 
+async def safe_html_edit(message: types.Message, text: str, kb: InlineKeyboardMarkup = None):
+    try:
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
 async def get_settings_buttons():
-    return [[InlineKeyboardButton(text="🕵️ Spy Settings", callback_data="saver_main_menu")]]
+    return [[InlineKeyboardButton(text="🕵️ Настройки Шпиона", callback_data="saver_main_menu")]]
 
 async def get_saver_keyboard():
     cfg = await get_config()
-    st_main = "ON ✅" if cfg.get("is_active") == "1" else "OFF ❌"
-    dump_chat = cfg.get("dump_chat_id") or "Not set ❌"
-    t_chats = cfg.get("target_chats")
-    t_chats_lbl = f"{len(t_chats.split(','))} chats" if t_chats else "EVERYWHERE ⚠️"
-    b_list = cfg.get("blacklist")
-    b_list_lbl = f"{len(b_list.split(','))} users" if b_list else "Empty"
+    st_main = "ВКЛ ✅" if cfg.get("is_active") == "1" else "ВЫКЛ ❌"
+    dump_chat = cfg.get("dump_chat_id") or "Не задан ❌"
+    
+    t_chats = cfg.get("target_chats", "")
+    t_count = len([x for x in t_chats.split(',') if x.strip()])
+    t_chats_lbl = f"{t_count} чатов" if t_count > 0 else "ВЕЗДЕ ⚠️"
+    
+    b_list = cfg.get("blacklist", "")
+    b_count = len([x for x in b_list.split(',') if x.strip()])
+    b_list_lbl = f"{b_count} юзеров" if b_count > 0 else "Пусто"
+    
     d_min, d_max = cfg.get("delay_min", "1"), cfg.get("delay_max", "5")
     l_reg, l_ttl = cfg.get("limit_reg", "20"), cfg.get("limit_ttl", "50")
     
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Status: {st_main}", callback_data="saver_tgl_main")],
-        [InlineKeyboardButton(text=f"🔔 Chat: {dump_chat}", callback_data="saver_edit_dump")],
-        [InlineKeyboardButton(text=f"🎯 Parsing: {t_chats_lbl}", callback_data="saver_edit_targets"),
-         InlineKeyboardButton(text=f"🚫 Ignore: {b_list_lbl}", callback_data="saver_edit_bl")],
-        [InlineKeyboardButton(text=f"Deleted: {'✅' if cfg.get('save_deleted')=='1' else '❌'}", callback_data="saver_tgl_del"),
-         InlineKeyboardButton(text=f"Edited: {'✅' if cfg.get('save_edited')=='1' else '❌'}", callback_data="saver_tgl_edit"),
+        [InlineKeyboardButton(text=f"Статус: {st_main}", callback_data="saver_tgl_main")],
+        [InlineKeyboardButton(text=f"🔔 Чат: {dump_chat}", callback_data="saver_edit_dump")],
+        [InlineKeyboardButton(text=f"🎯 Парсим: {t_chats_lbl}", callback_data="saver_edit_targets"),
+         InlineKeyboardButton(text=f"🚫 Игнор: {b_list_lbl}", callback_data="saver_edit_bl")],
+        [InlineKeyboardButton(text=f"Удаленка: {'✅' if cfg.get('save_deleted')=='1' else '❌'}", callback_data="saver_tgl_del"),
+         InlineKeyboardButton(text=f"Редакт: {'✅' if cfg.get('save_edited')=='1' else '❌'}", callback_data="saver_tgl_edit"),
          InlineKeyboardButton(text=f"TTL: {'✅' if cfg.get('save_ttl')=='1' else '❌'}", callback_data="saver_tgl_ttl")],
-        [InlineKeyboardButton(text=f"⏳ Delay: {d_min}-{d_max} min", callback_data="saver_edit_delay")],
-        [InlineKeyboardButton(text=f"💾 Limits: {l_reg}MB | TTL {l_ttl}MB", callback_data="saver_edit_limits")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="global_settings")]
+        [InlineKeyboardButton(text=f"⏳ Задержка: {d_min}-{d_max} мин", callback_data="saver_edit_delay")],
+        [InlineKeyboardButton(text=f"💾 Лимиты: {l_reg}MB | TTL {l_ttl}MB", callback_data="saver_edit_limits")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="global_settings")]
     ])
 
 @router.callback_query(F.data == "saver_main_menu")
 async def saver_menu_handler(call: types.CallbackQuery, state: FSMContext):
-    await safe_edit(call.message, state, "🕵️ <b>Spy Settings</b>", await get_saver_keyboard())
+    await state.set_state(None)
+    await safe_html_edit(call.message, "🕵️ <b>Настройки Шпиона</b>", await get_saver_keyboard())
 
 @router.callback_query(F.data.startswith("saver_tgl_"))
 async def saver_toggles_handler(call: types.CallbackQuery, state: FSMContext):
@@ -270,46 +280,53 @@ async def saver_toggles_handler(call: types.CallbackQuery, state: FSMContext):
     key_map = {"saver_tgl_main": "is_active", "saver_tgl_del": "save_deleted", "saver_tgl_edit": "save_edited", "saver_tgl_ttl": "save_ttl"}
     k = key_map.get(call.data)
     if k: await set_config(k, "0" if cfg.get(k) == "1" else "1")
-    await call.answer()
-    await safe_edit(call.message, state, "🕵️ <b>Spy Settings</b>", await get_saver_keyboard())
+    
+    try: await call.answer()
+    except: pass
+    
+    await safe_html_edit(call.message, "🕵️ <b>Настройки Шпиона</b>", await get_saver_keyboard())
 
 async def request_input(call: types.CallbackQuery, state: FSMContext, text: str, target_state: State):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Cancel", callback_data="saver_main_menu")]])
-    await safe_edit(call.message, state, text, kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="saver_main_menu")]])
+    await safe_html_edit(call.message, text, kb)
     await state.update_data(edit_msg_id=call.message.message_id)
     await state.set_state(target_state)
 
 async def finish_input(message: types.Message, state: FSMContext):
     data = await state.get_data()
     msg_id = data.get("edit_msg_id")
-    await message.delete()
-    await state.clear()
-    text = "✅ Updated\n\n🕵️ <b>Spy Settings</b>"
+    
+    try: await message.delete()
+    except: pass
+    
+    await state.set_state(None)
+    
+    text = "🕵️ <b>Настройки Шпиона</b>"
     kb = await get_saver_keyboard()
+    
     if msg_id:
         try:
             await message.bot.edit_message_text(text=text, chat_id=message.chat.id, message_id=msg_id, reply_markup=kb, parse_mode="HTML")
             return
         except Exception: pass
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data == "saver_edit_dump")
-async def edit_dump(call, state): await request_input(call, state, "Group ID:", SaverStates.waiting_for_dump_chat)
+async def edit_dump(call, state): await request_input(call, state, "ID группы:", SaverStates.waiting_for_dump_chat)
 @router.message(SaverStates.waiting_for_dump_chat)
 async def save_dump(message, state): await set_config("dump_chat_id", message.text.strip()); await finish_input(message, state)
 
 @router.callback_query(F.data == "saver_edit_targets")
-async def edit_targets(call, state): await request_input(call, state, "Chat IDs (comma-separated) or <code>reset</code>:", SaverStates.waiting_for_targets)
+async def edit_targets(call, state): await request_input(call, state, "ID чатов (через запятую) или <code>сброс</code>:", SaverStates.waiting_for_targets)
 @router.message(SaverStates.waiting_for_targets)
-async def save_targets(message, state): await set_config("target_chats", "" if message.text.lower() == "reset" else message.text.strip()); await finish_input(message, state)
+async def save_targets(message, state): await set_config("target_chats", "" if message.text.lower() == "сброс" else message.text.strip()); await finish_input(message, state)
 
 @router.callback_query(F.data == "saver_edit_bl")
-async def edit_bl(call, state): await request_input(call, state, "Blacklist IDs or <code>reset</code>:", SaverStates.waiting_for_blacklist)
+async def edit_bl(call, state): await request_input(call, state, "Блеклист ID или <code>сброс</code>:", SaverStates.waiting_for_blacklist)
 @router.message(SaverStates.waiting_for_blacklist)
-async def save_bl(message, state): await set_config("blacklist", "" if message.text.lower() == "reset" else message.text.strip()); await finish_input(message, state)
+async def save_bl(message, state): await set_config("blacklist", "" if message.text.lower() == "сброс" else message.text.strip()); await finish_input(message, state)
 
 @router.callback_query(F.data == "saver_edit_delay")
-async def edit_delay(call, state): await request_input(call, state, "Delay (min-max):", SaverStates.waiting_for_delay)
+async def edit_delay(call, state): await request_input(call, state, "Задержка (мин-макс):", SaverStates.waiting_for_delay)
 @router.message(SaverStates.waiting_for_delay)
 async def save_delay(message, state):
     txt = message.text.replace("-", " ").split()
@@ -321,7 +338,7 @@ async def save_delay(message, state):
     await finish_input(message, state)
 
 @router.callback_query(F.data == "saver_edit_limits")
-async def edit_limits(call, state): await request_input(call, state, "Limits (reg TTL):", SaverStates.waiting_for_limits)
+async def edit_limits(call, state): await request_input(call, state, "Лимиты (обычн TTL):", SaverStates.waiting_for_limits)
 @router.message(SaverStates.waiting_for_limits)
 async def save_limits(message, state):
     txt = message.text.split()
@@ -332,7 +349,7 @@ async def save_limits(message, state):
     await finish_input(message, state)
 
 # ==========================================
-# USERBOT LOGIC
+# ЛОГИКА ЮЗЕРБОТА
 # ==========================================
 def register_userbot(app: Client, bot: Bot):
     async def process_caching(client, message, cfg):
@@ -384,9 +401,9 @@ def register_userbot(app: Client, bot: Bot):
         try: dump_id = int(cfg.get("dump_chat_id", ""))
         except: return
         if message.chat.id == dump_id: return
-        if str(user.id) in [x.strip() for x in cfg.get("blacklist", "").split(",")]: return
+        if str(user.id) in [x.strip() for x in cfg.get("blacklist", "").split(",") if x.strip()]: return
         targets = cfg.get("target_chats", "")
-        if targets and str(message.chat.id) not in [x.strip() for x in targets.split(",")]: return
+        if targets and str(message.chat.id) not in [x.strip() for x in targets.split(",") if x.strip()]: return
         asyncio.create_task(process_caching(client, message, cfg))
 
     @app.on_deleted_messages()
@@ -405,7 +422,7 @@ def register_userbot(app: Client, bot: Bot):
                     u_id, txt, m_type, f_path, _ = row
                     topic_id = await get_or_create_topic(app, bot, dump_id, u_id)
                     safe_txt = html.escape(txt) if txt else ""
-                    alert_txt = f"<i>{safe_txt}</i>" if safe_txt else "<i>(media)</i>"
+                    alert_txt = f"<i>{safe_txt}</i>" if safe_txt else "<i>(медиа)</i>"
                     async def delayed_clean(m_id, c_id):
                         await send_alert_delayed(bot, app, dump_id, u_id, topic_id, alert_txt, f_path, m_type, float(cfg.get("delay_min", "1")), float(cfg.get("delay_max", "5")), delete_file_after=True, is_ttl=False, parse_mode="HTML")
                         if c_id: 
@@ -432,7 +449,6 @@ def register_userbot(app: Client, bot: Bot):
                 new_t = message.text or message.caption or ""
                 if old_t != new_t:
                     topic_id = await get_or_create_topic(app, bot, dump_id, user.id, user_obj=user)
-                    # Removed extra line break \n\n -> \n
                     alert_txt = f"<s>{html.escape(old_t)}</s>\n{html.escape(new_t)}"
                     asyncio.create_task(send_alert_delayed(bot, app, dump_id, user.id, topic_id, alert_txt, f_path, m_type, float(cfg.get("delay_min", "1")), float(cfg.get("delay_max", "5")), delete_file_after=False, is_ttl=False, parse_mode="HTML"))
                     await db.execute("UPDATE msg_cache SET text = ? WHERE message_id = ? AND chat_id = ?", (new_t, message.id, message.chat.id))
