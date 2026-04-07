@@ -145,6 +145,31 @@ The project is fully ready for translation into any language. All system message
 
 -----
 
+# What's new: Updated modules
+
+The latest updates have added powerful modules that significantly expand the capabilities of the user bot.:
+
+## The Smart Shopping List module (`shop_list.py `)
+
+An intelligent shopping manager that understands live speech and integrates with native Telegram checklists.
+
+  * **AI parsing:** You can write a list in solid text (for example: * "buy bread, a couple of liters of milk and cheese"*), and the neural network itself will break it down into items, add suitable emojis and group similar products.
+  * **Native checklists:** The bot uses Telegram's built-in checklist feature (Kurigram). If it is unavailable, it correctly rolls back to the Markdown lists.
+  * **Smart addition:** Can add new products to an existing list in response to a message.
+  * **Flexible settings:** The ability to link the module's operation to specific chats/topics (Auto-chats), allow other users to use it, and set up a custom prompt for sorting.
+
+## The "Spy / Message Interceptor" module (`message_saver.py `)
+
+An advanced tool for saving deleted content and one-time files in personal conversations. All intercepted data is carefully stored in the dump group you specified.
+
+  * **Interception of deleted and modified:** The bot imperceptibly saves deleted messages and shows the exact history of changes (in the format \<s\>became\</s\>/was) if the interlocutor edited the text.
+  * **Bypass Single-use Media (TTL):** Automatically downloads photos, videos, and voice messages sent for one-time viewing and forwards them to you.
+  * **Convenient file system (Forums):** In a chat dump, the bot automatically creates a separate topic (thread) for each user. At the beginning of the topic, a mini-dossier is formed for the interlocutor: the current avatar, ID, username, phone number and Premium status.
+  * **Smart limits and delays:** Configurable random delay before sending intercepted material (to reduce the load and simulate organicity), as well as limits on the size of saved files and automatic clearing of the old cache (older than 180 days).
+  * **Flexible filtering:** The module allows you to set up work point—by-point - you can select specific chats for "surveillance" or add user IDs to the blacklist (ignore).
+
+-----
+
 ## 📝 Example of an Ideal Prompt
 
 For the bot to behave as naturally as possible, it needs strict rules and a "knowledge base". Here is an example of a high-quality prompt that can be set globally or for a specific chat.
