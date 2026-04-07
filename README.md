@@ -150,7 +150,7 @@ The project is fully ready for translation into any language. All system message
 The latest updates have added powerful modules that significantly expand the capabilities of the user bot.:
 
 ## The Smart Shopping List module (`shop_list.py `)
-Work with TG Premium only
+Work with TG Premium only. 
 An intelligent shopping manager that understands live speech and integrates with native Telegram checklists.
 
   * **AI parsing:** You can write a list in solid text (for example: * "buy bread, a couple of liters of milk and cheese"*), and the neural network itself will break it down into items, add suitable emojis and group similar products.
