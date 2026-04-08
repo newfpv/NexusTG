@@ -3,6 +3,8 @@ import re
 import json
 import logging
 import requests
+import sqlite3
+from datetime import datetime, timedelta
 
 import yt_dlp
 
@@ -15,25 +17,50 @@ from utils import safe_edit
 from i18n import _
 
 router = Router()
-COOKIES_PATH = "data/cookies.txt" 
+COOKIES_PATH = "data/cookies.txt"
+YT_DB_PATH = "data/youtube_cache.db"
 
 # ==========================================
-# ИНИЦИАЛИЗАЦИЯ
+# INITIALIZATION AND DATABASE
 # ==========================================
+def init_yt_db():
+    conn = sqlite3.connect(YT_DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS yt_cache (
+            video_id TEXT PRIMARY KEY,
+            duration INTEGER,
+            context TEXT,
+            timestamp DATETIME
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def clean_old_yt_cache():
+    conn = sqlite3.connect(YT_DB_PATH)
+    c = conn.cursor()
+    seven_days_ago = datetime.now() - timedelta(days=7)
+    c.execute('DELETE FROM yt_cache WHERE timestamp < ?', (seven_days_ago,))
+    conn.commit()
+    conn.close()
+
 async def on_startup():
     os.makedirs("data", exist_ok=True)
+    init_yt_db()
+    clean_old_yt_cache()
     if os.path.exists(COOKIES_PATH):
         logging.info(_("yt_cookies_found"))
     else:
         logging.warning(_("yt_cookies_not_found"))
 
-async def get_settings_buttons(): # <--- Теперь возвращает в Настройки
+async def get_settings_buttons():
     return [
         [InlineKeyboardButton(text=_("btn_yt_cookies_menu"), callback_data="yt_cookies_menu")]
     ]
 
 # ==========================================
-# FSM И МЕНЮ УПРАВЛЕНИЯ COOKIES
+# FSM AND COOKIES MANAGEMENT MENU
 # ==========================================
 class YTCookiesFSM(StatesGroup):
     wait_for_document = State()
@@ -44,7 +71,7 @@ async def yt_nop(call: types.CallbackQuery):
 
 @router.callback_query(F.data == "yt_cookies_menu")
 async def yt_cookies_menu(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(None) # <--- ИСПРАВЛЕНО, меню теперь не исчезает
+    await state.set_state(None)
     
     has_cookies = os.path.exists(COOKIES_PATH)
     status = _("yt_status_loaded") if has_cookies else _("yt_status_missing")
@@ -88,7 +115,7 @@ async def yt_cookies_doc_handler(message: types.Message, state: FSMContext):
     
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_to_menu"), callback_data="yt_cookies_menu")]])
     await safe_edit(msg, state, _("yt_cookies_updated"), kb)
-    await state.set_state(None) # <--- ИСПРАВЛЕНО
+    await state.set_state(None)
 
 @router.callback_query(F.data == "yt_cookies_delete")
 async def yt_cookies_delete(call: types.CallbackQuery, state: FSMContext):
@@ -98,7 +125,7 @@ async def yt_cookies_delete(call: types.CallbackQuery, state: FSMContext):
     await yt_cookies_menu(call, state)
 
 # ==========================================
-# ЛОГИКА РАБОТЫ С YOUTUBE URL
+# YOUTUBE URL LOGIC
 # ==========================================
 def extract_youtube_id(url: str) -> str | None:
     patterns = [
@@ -112,9 +139,7 @@ def extract_youtube_id(url: str) -> str | None:
     return None
 
 def parse_subtitles_text(raw_text: str, ext: str) -> str:
-    if not raw_text:
-        return ""
-        
+    if not raw_text: return ""
     clean_text = ""
     try:
         if ext == 'json3':
@@ -123,30 +148,36 @@ def parse_subtitles_text(raw_text: str, ext: str) -> str:
             for event in events:
                 for seg in event.get('segs', []):
                     utf8_text = seg.get('utf8', '').replace('\n', ' ')
-                    if utf8_text.strip():
-                        clean_text += utf8_text + " "
+                    if utf8_text.strip(): clean_text += utf8_text + " "
         else:
             lines = raw_text.split('\n')
             for line in lines:
-                if '-->' in line or line.startswith(('WEBVTT', 'Kind:', 'Language:', 'Style:')):
-                    continue
+                if '-->' in line or line.startswith(('WEBVTT', 'Kind:', 'Language:', 'Style:')): continue
                 clean_line = re.sub(r'<[^>]+>', '', line.strip())
-                if clean_line and not clean_line.isdigit():
-                    clean_text += clean_line + " "
-                    
+                if clean_line and not clean_line.isdigit(): clean_text += clean_line + " "
     except Exception as e:
         logging.error(_("yt_sub_clean_error", e=e))
         return raw_text[:10000] 
-        
     return re.sub(r'\s+', ' ', clean_text).strip()
 
 def fetch_youtube_data_sync(url: str):
+    clean_old_yt_cache()
     video_id = extract_youtube_id(url)
-    duration = 0
-    context = ""
     
     if not video_id: 
-        return 0, f"URL: {url}"
+        return 0, _("yt_url_fallback", url=url)
+
+    conn = sqlite3.connect(YT_DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT duration, context FROM yt_cache WHERE video_id = ?', (video_id,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        logging.info(_("yt_cache_hit", video_id=video_id))
+        return row[0], row[1]
+
+    duration = 0
+    context = ""
 
     ydl_opts = {
         'quiet': True,
@@ -158,9 +189,7 @@ def fetch_youtube_data_sync(url: str):
         'subtitleslangs': ['ru', 'en'],
         'subtitlesformat': 'json3/vtt/best',
         'ignore_no_formats_error': True, 
-        'extractor_args': {
-            'youtube': ['player_client=android,web'] 
-        }
+        'extractor_args': {'youtube': ['player_client=android,web']}
     }
     
     if os.path.exists(COOKIES_PATH):
@@ -177,9 +206,7 @@ def fetch_youtube_data_sync(url: str):
             duration = info.get('duration', 0)
             
             context += _("yt_video_title", title=title)
-            if description:
-                context += _("yt_video_desc", description=description)
-            logging.info(_("yt_data_fetched", video_id=video_id))
+            if description: context += _("yt_video_desc", description=description)
             
             requested_subs = info.get('requested_subtitles')
             subs_text = ""
@@ -192,29 +219,22 @@ def fetch_youtube_data_sync(url: str):
                         sub_ext = sub_info.get('ext', 'json3')
                         
                         if sub_url:
-                            logging.info(_("yt_downloading_subs", lang=lang, sub_ext=sub_ext))
-                            
                             try:
-                                resp = requests.get(
-                                    sub_url, 
-                                    headers={"User-Agent": "Mozilla/5.0"}, 
-                                    timeout=10
-                                )
+                                resp = requests.get(sub_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                                 if resp.status_code == 200:
                                     subs_text = parse_subtitles_text(resp.text, sub_ext)
-                                    logging.info(_("yt_subs_success", lang=lang))
                                     break
                             except Exception as dl_e:
                                 logging.error(_("yt_subs_dl_error", dl_e=dl_e))
                                 
-            if subs_text:
-                context += _("yt_subs_text", text=subs_text[:75000])
-            else:
-                logging.warning(_("yt_subs_missing", video_id=video_id))
+            if subs_text: context += _("yt_subs_text", text=subs_text[:75000])
                 
     except Exception as e:
         logging.error(_("yt_ytdlp_error", video_id=video_id, e=e))
         
-    logging.info(_("yt_final_context_log", context=context))
+    c.execute('INSERT OR REPLACE INTO yt_cache (video_id, duration, context, timestamp) VALUES (?, ?, ?, ?)', 
+              (video_id, duration, context, datetime.now()))
+    conn.commit()
+    conn.close()
         
     return duration, context
