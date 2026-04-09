@@ -47,7 +47,13 @@ async def init_db():
             "h_typ_tmin REAL DEFAULT 1.5",
             "h_typ_tmax REAL DEFAULT 3.5",
             "h_typ_pmin REAL DEFAULT 0.5",
-            "h_typ_pmax REAL DEFAULT 2.0"
+            "h_typ_pmax REAL DEFAULT 2.0",
+            "v_auto_my BOOLEAN DEFAULT 0",
+            "v_auto_other BOOLEAN DEFAULT 0",
+            "v_allow_cmd BOOLEAN DEFAULT 0",
+            "v_summarize BOOLEAN DEFAULT 1",
+            "v_command TEXT DEFAULT '.text'",
+            "ai_debug_log BOOLEAN DEFAULT 0"
         ]
         for col in new_columns:
             try: await db.execute(f"ALTER TABLE config ADD COLUMN {col}")
@@ -63,11 +69,22 @@ async def init_db():
             "h_typ_tmin REAL DEFAULT NULL",
             "h_typ_tmax REAL DEFAULT NULL",
             "h_typ_pmin REAL DEFAULT NULL",
-            "h_typ_pmax REAL DEFAULT NULL"
+            "h_typ_pmax REAL DEFAULT NULL",
+            "v_auto_my INTEGER DEFAULT 2",
+            "v_auto_other INTEGER DEFAULT 2",
+            "v_allow_cmd INTEGER DEFAULT 2"
         ]
         for col in chat_cols:
             try: await db.execute(f"ALTER TABLE chats ADD COLUMN {col}")
             except aiosqlite.OperationalError: pass
+                
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ignored_msgs (
+                chat_id INTEGER,
+                msg_id INTEGER,
+                PRIMARY KEY (chat_id, msg_id)
+            )
+        """)
                 
         await db.commit()
 
@@ -83,8 +100,13 @@ async def save_session(phone, session_string):
 
 async def get_config():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT phone, session_string, sleep_start, sleep_end, global_prompt, typing_speed, g_delay_before_min, g_delay_before_max, g_delay_after_min, g_delay_after_max, g_split_chance, g_split_min, global_ai_active, google_search, custom_reaction, h_typing, h_ignore_chance, h_smart_read, h_smart_mul, h_typ_tmin, h_typ_tmax, h_typ_pmin, h_typ_pmax FROM config WHERE id = 1") as cursor:
+        async with db.execute("SELECT phone, session_string, sleep_start, sleep_end, global_prompt, typing_speed, g_delay_before_min, g_delay_before_max, g_delay_after_min, g_delay_after_max, g_split_chance, g_split_min, global_ai_active, google_search, custom_reaction, h_typing, h_ignore_chance, h_smart_read, h_smart_mul, h_typ_tmin, h_typ_tmax, h_typ_pmin, h_typ_pmax, v_auto_my, v_auto_other, v_allow_cmd, v_summarize, v_command, ai_debug_log FROM config WHERE id = 1") as cursor:
             return await cursor.fetchone()
+
+async def toggle_ai_debug_log():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE config SET ai_debug_log = CASE WHEN ai_debug_log = 1 THEN 0 ELSE 1 END WHERE id = 1")
+        await db.commit()
 
 async def set_sleep_hours(start_time, end_time):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -123,7 +145,6 @@ async def toggle_global_search():
         await db.commit()
 
 async def set_search_all_chats(state: bool):
-    """Принудительно устанавливает статус поиска для ВСЕХ чатов в БД."""
     async with aiosqlite.connect(DB_PATH) as db:
         val = 1 if state else 0
         await db.execute("UPDATE chats SET google_search = ?", (val,))
@@ -159,9 +180,19 @@ async def set_global_h_typing_cfg(tmin: float, tmax: float, pmin: float, pmax: f
         await db.execute("UPDATE config SET h_typ_tmin=?, h_typ_tmax=?, h_typ_pmin=?, h_typ_pmax=? WHERE id = 1", (tmin, tmax, pmin, pmax))
         await db.commit()
 
+async def toggle_v_setting_global(setting_name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE config SET {setting_name} = CASE WHEN {setting_name} = 1 THEN 0 ELSE 1 END WHERE id = 1")
+        await db.commit()
+
+async def set_v_command_global(cmd: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE config SET v_command = ? WHERE id = 1", (cmd,))
+        await db.commit()
+
 async def get_chat_settings(chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT is_active, custom_prompt, delay_before_min, delay_before_max, delay_after_min, delay_after_max, is_ignored, google_search, h_typing, h_ignore_chance, h_smart_read, h_smart_mul, h_typ_tmin, h_typ_tmax, h_typ_pmin, h_typ_pmax FROM chats WHERE chat_id = ?", (chat_id,)) as cursor:
+        async with db.execute("SELECT is_active, custom_prompt, delay_before_min, delay_before_max, delay_after_min, delay_after_max, is_ignored, google_search, h_typing, h_ignore_chance, h_smart_read, h_smart_mul, h_typ_tmin, h_typ_tmax, h_typ_pmin, h_typ_pmax, v_auto_my, v_auto_other, v_allow_cmd FROM chats WHERE chat_id = ?", (chat_id,)) as cursor:
             return await cursor.fetchone()
 
 async def toggle_chat(chat_id):
@@ -249,3 +280,25 @@ async def set_chat_h_typing_cfg(chat_id: int, tmin, tmax, pmin, pmax):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO chats (chat_id, h_typ_tmin, h_typ_tmax, h_typ_pmin, h_typ_pmax) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET h_typ_tmin=?, h_typ_tmax=?, h_typ_pmin=?, h_typ_pmax=?", (chat_id, tmin, tmax, pmin, pmax, tmin, tmax, pmin, pmax))
         await db.commit()
+
+async def toggle_v_setting_chat(chat_id: int, setting_index: int, setting_name: str):
+    cfg = await get_chat_settings(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        if not cfg:
+            await db.execute(f"INSERT INTO chats (chat_id, {setting_name}) VALUES (?, 1)", (chat_id,))
+        else:
+            curr = cfg[setting_index] if len(cfg) > setting_index and cfg[setting_index] is not None else 2
+            nxt = 1 if curr == 2 else (0 if curr == 1 else 2)
+            await db.execute(f"UPDATE chats SET {setting_name} = ? WHERE chat_id = ?", (nxt, chat_id))
+        await db.commit()
+
+async def add_ignored_msg(chat_id: int, msg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO ignored_msgs (chat_id, msg_id) VALUES (?, ?)", (chat_id, msg_id))
+        await db.commit()
+
+async def is_ignored_msg(chat_id: int, msg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM ignored_msgs WHERE chat_id = ? AND msg_id = ?", (chat_id, msg_id))
+        row = await cursor.fetchone()
+        return row is not None
