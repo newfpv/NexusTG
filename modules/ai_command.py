@@ -16,9 +16,17 @@ from utils import simulate_typing
 from modules.youtube import fetch_youtube_data_sync
 from i18n import _
 
-# ==========================================
+# MARKDOWN TO HTML TELEGRAM=
+def md_to_html(text: str) -> str:
+    text = html.escape(text)
+    text = re.sub(r'```(\w+)?\n?(.*?)```', r'<pre><code>\2</code></pre>', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+    text = re.sub(r'^#+\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    return text
+
 # DATABASE LOGIC
-# ==========================================
 DB_PATH = "data/ai_cmd.sqlite"
 
 async def on_startup():
@@ -36,9 +44,15 @@ async def on_startup():
                 ("use_search", "1"),
                 ("show_model", "0"),
                 ("show_queries", "0"),
-                ("global_prompt", "Ты - Gemini. Отвечай кратко, по делу. Учитывай контекст.")
+                ("use_quote", "0"),
+                ("global_prompt", "You are Gemini. Answer me briefly, to the point. Consider the context.")
             ]
             await db.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", defaults)
+        else:
+            cursor = await db.execute("SELECT value FROM settings WHERE key = 'use_quote'")
+            if not await cursor.fetchone():
+                await db.execute("INSERT INTO settings (key, value) VALUES ('use_quote', '0')")
+                
         await db.commit()
 
 async def get_all_settings():
@@ -69,9 +83,7 @@ async def is_ai_msg(chat_id, msg_id):
         row = await cursor.fetchone()
         return row is not None
 
-# ==========================================
 # AIOGRAM UI & SETTINGS
-# ==========================================
 router = Router()
 
 class AICmdFSM(StatesGroup):
@@ -85,12 +97,14 @@ def get_main_kb(cfg):
     status_search = _("status_on") if cfg.get("use_search") == "1" else _("status_off")
     status_model = _("status_on") if cfg.get("show_model") == "1" else _("status_off")
     status_queries = _("status_on") if cfg.get("show_queries") == "1" else _("status_off")
+    status_quote = _("status_on") if cfg.get("use_quote") == "1" else _("status_off")
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=_("btn_ai_cmd_trigger", cmd=cfg.get("command", ".ai")), callback_data="aicmd_edit_cmd")],
         [InlineKeyboardButton(text=_("btn_ai_cmd_search", status=status_search), callback_data="aicmd_toggle_search")],
         [InlineKeyboardButton(text=_("btn_ai_cmd_model", status=status_model), callback_data="aicmd_toggle_model")],
         [InlineKeyboardButton(text=_("btn_ai_cmd_queries", status=status_queries), callback_data="aicmd_toggle_queries")],
+        [InlineKeyboardButton(text=_("btn_ai_cmd_quote", status=status_quote), callback_data="aicmd_toggle_quote")],
         [InlineKeyboardButton(text=_("btn_ai_cmd_prompt"), callback_data="aicmd_edit_prompt")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]
     ])
@@ -120,6 +134,9 @@ async def aicmd_toggles(call: types.CallbackQuery, state: FSMContext):
     elif action == "queries": 
         new_val = "0" if cfg.get("show_queries") == "1" else "1"
         await set_setting("show_queries", new_val)
+    elif action == "quote": 
+        new_val = "0" if cfg.get("use_quote") == "1" else "1"
+        await set_setting("use_quote", new_val)
     
     cfg = await get_all_settings()
     text = _("menu_ai_cmd_title", prompt=html.escape(cfg.get("global_prompt", "")))
@@ -186,9 +203,7 @@ async def aicmd_save_prompt(message: types.Message, state: FSMContext):
         except Exception:
             pass
 
-# ==========================================
 # PYROGRAM LOGIC
-# ==========================================
 def register_userbot(app: Client):
     
     async def is_ai_target(_, __, message):
@@ -212,11 +227,13 @@ def register_userbot(app: Client):
         try:
             cfg = await get_all_settings()
             cmd = cfg.get("command", ".ai")
+            use_quote = (cfg.get("use_quote") == "1")
             
-            is_manual = bool(message.from_user and message.from_user.is_self and message.text and message.text.startswith(cmd))
+            is_me = bool(message.from_user and message.from_user.is_self)
+            is_cmd = bool(message.text and message.text.startswith(cmd))
             
             query = ""
-            if is_manual:
+            if is_cmd:
                 match = re.match(rf"^{re.escape(cmd)}(?:\s+(.*))?", message.text or message.caption or "", flags=re.DOTALL)
                 if match and match.group(1):
                     query = match.group(1).strip()
@@ -232,14 +249,14 @@ def register_userbot(app: Client):
                 sys_prompt += "\n\n[SYSTEM RULE]: ОБЯЗАТЕЛЬНО напиши в самом конце ответа с новой строки: '🤖 Модель: [напиши версию твоей модели Gemini]'."
 
             status_msg = None
-            if is_manual:
+            if is_me:
                 status_msg = await message.edit(_("cmd_ai_thinking"), parse_mode=enums.ParseMode.HTML)
             else:
                 status_msg = await message.reply(_("cmd_ai_thinking"), parse_mode=enums.ParseMode.HTML)
             
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             
-            target_msg = message.reply_to_message if (is_manual and message.reply_to_message) else message
+            target_msg = message.reply_to_message if (is_cmd and message.reply_to_message) else message
             
             media_path = None
             transcript = ""
@@ -277,7 +294,7 @@ def register_userbot(app: Client):
             
             full_query = _("cmd_ai_context_dialogue", hist_str=hist_str)
             
-            if is_manual and message.reply_to_message:
+            if is_cmd and message.reply_to_message:
                 orig_sender = _("me_sender") if (target_msg.from_user and target_msg.from_user.is_self) else _("other_sender")
                 full_query += _("cmd_ai_context_reply", orig_sender=orig_sender, text_to_search=text_to_search)
             
@@ -304,18 +321,30 @@ def register_userbot(app: Client):
             typing_task.cancel()
             
             parts = []
-            while len(reply) > 4000:
-                parts.append(reply[:4000])
-                reply = reply[4000:]
-            if reply:
-                parts.append(reply)
+            current_part = ""
+            for line in reply.split('\n'):
+                if len(current_part) + len(line) < 3800:
+                    current_part += line + '\n'
+                else:
+                    parts.append(current_part.strip())
+                    current_part = line + '\n'
+            if current_part.strip():
+                parts.append(current_part.strip())
             
             for i, part in enumerate(parts):
+                html_part = md_to_html(part)
+                
                 if i == 0:
                     safe_query = html.escape(query if query != _("cmd_ai_default_query") else _("cmd_ai_safe_query_fallback"))
-                    text = _("cmd_ai_reply_format", safe_query=safe_query, part=part)
+                    if use_quote:
+                        text = f"<blockquote><i>{safe_query}</i></blockquote>\n<blockquote expandable>{html_part}</blockquote>"
+                    else:
+                        text = f"<blockquote><i>{safe_query}</i></blockquote>\n{html_part}"
                 else:
-                    text = part
+                    if use_quote:
+                        text = f"<blockquote expandable>{html_part}</blockquote>"
+                    else:
+                        text = html_part
                 
                 if i == 0:
                     await status_msg.edit(text, parse_mode=enums.ParseMode.HTML)
