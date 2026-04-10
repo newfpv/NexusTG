@@ -16,7 +16,6 @@ from utils import simulate_typing
 from modules.youtube import fetch_youtube_data_sync
 from i18n import _
 
-# MARKDOWN TO HTML TELEGRAM=
 def md_to_html(text: str) -> str:
     text = html.escape(text)
     text = re.sub(r'```(\w+)?\n?(.*?)```', r'<pre><code>\2</code></pre>', text, flags=re.DOTALL)
@@ -45,7 +44,7 @@ async def on_startup():
                 ("show_model", "0"),
                 ("show_queries", "0"),
                 ("use_quote", "0"),
-                ("global_prompt", "You are Gemini. Answer me briefly, to the point. Consider the context.")
+                ("global_prompt", "Ты - Gemini. Отвечай кратко, по делу. Учитывай контекст.")
             ]
             await db.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", defaults)
         else:
@@ -319,6 +318,11 @@ def register_userbot(app: Client):
             )
             
             typing_task.cancel()
+
+            if not reply or not reply.strip() or reply == "⏳":
+                err_text = _("ai_cmd_error_empty")
+                await status_msg.edit(err_text, parse_mode=enums.ParseMode.HTML)
+                return
             
             parts = []
             current_part = ""
