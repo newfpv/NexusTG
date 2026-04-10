@@ -25,6 +25,10 @@
   "log_gemini_search_key_ban": "⛔️ Все модели ключа {key_mask} исчерпали лимит поиска. Ключ забанен для гугления на 8 часов.",
   "log_gemini_400": "❌ [{selected_model} | {key_mask}] Ошибка формата запроса (400). Бан ключа на 5 сек.",
   "log_gemini_unknown_error": "⚠️ [{selected_model} | {key_mask}] Неизвестная ошибка API: {error_type}",
+  "log_gemini_timeout": "⚠️ Таймаут 40с от Google (Модель {model}). Ищу замену...",
+  "log_gemini_empty_retry": "⚠️ Пустой ответ от Gemini. Попытка {attempt} из {max_retries}...",
+  "ai_cmd_error_empty": "❌ Ошибка: Gemini вернул пустой ответ (сработал фильтр безопасности).",
+  
   "log_transcribe_start": "🎙 [ТРАНСКРИБАЦИЯ] Запуск для файла: {media_path}",
   "prompt_transcribe": "Транскрибируй это аудио/видео дословно на русском языке. Напиши ТОЛЬКО текст того, что сказано.",
   "log_transcribe_error": "🎙 [ТРАНСКРИБАЦИЯ] Ошибка: {e}",
@@ -297,6 +301,7 @@
   "yt_cache_hit": "🔄 Взято из кэша YouTube: {video_id}",
   "btn_ai_debug": "🐞 Дебаг лог: {status}",
   "yt_url_fallback": "URL: {url}",
+  "btn_ai_g_quote": "💬 Ответ в цитате: {status}",
 
   "menu_v_title": "🎙 <b>Глобальные настройки (Голос в текст)</b>",
   "menu_v_chat_title": "🎙 <b>Голос в текст для чата</b> <code>{}</code>\nПереопределение глобальных настроек:",
@@ -310,7 +315,7 @@
   "btn_v_command": "Команда: {}",
   "v_enter_command": "Введите новую команду для распознавания (например, .text или .гс):",
   "v_command_changed": "✅ Команда успешно изменена на <code>{}</code>",
-  "v_voice_prefix": "🎙",
+  "v_voice_prefix": "",
   "v_process_error": "❌ Ошибка обработки медиа.",
   "v_summary_prefix": "📝 <b>Краткая выжимка:</b>\n{summary}",
   "v_summary_prompt": "Сделай максимально краткую выжимку (самое главное в 1-3 предложениях) из этого текста:\n\n",
