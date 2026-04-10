@@ -2,7 +2,6 @@ import os
 import time
 import asyncio
 import logging
-import re
 from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
@@ -16,13 +15,13 @@ raw_keys = os.getenv("API_KEYS", "")
 API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 MODEL_FALLBACK_LIST = [m.strip() for m in os.getenv("MODEL_FALLBACK_LIST", "").split(",") if m.strip()]
 
-# Используем словари для хранения времени окончания бана (timestamp)
 api_key_states = {k: {
     "unban_time": 0, 
     "exhausted_models": {}, 
     "search_unban_time": 0,
     "search_exhausted_models": {}
 } for k in API_KEYS}
+
 key_lock = asyncio.Lock()
 
 def get_model_config(search_enabled=True):
@@ -37,110 +36,95 @@ def get_model_config(search_enabled=True):
         tools=tools
     )
 
-async def _send_to_gemini(contents, search_enabled=True, is_fallback=False):
-    start_time = time.time()
-    timeout = 55
-    config = get_model_config(search_enabled)
+async def _send_to_gemini(contents, search_enabled=True):
+    """Sends a request to Gemini with fallback mechanisms and timeouts, without deadlocking."""
+    max_empty_retries = 3
+    empty_attempts = 0
 
-    while time.time() - start_time < timeout:
-        selected_key, selected_model = None, None
-        now = time.time()
-
-        async with key_lock:
-            for model in MODEL_FALLBACK_LIST:
-                for key, state in api_key_states.items():
-                    # Проверяем, не в бане ли модель (время разбана больше текущего)
-                    is_model_exhausted = state["exhausted_models"].get(model, 0) > now
+    while empty_attempts < max_empty_retries:
+        for model_name in MODEL_FALLBACK_LIST:
+            for api_key in API_KEYS:
+                
+                async with key_lock:
+                    state = api_key_states[api_key]
+                    current_time = time.time()
                     
-                    if now >= state["unban_time"] and not is_model_exhausted:
-                        is_search_exhausted = state["search_exhausted_models"].get(model, 0) > now
-                        if search_enabled and (now < state["search_unban_time"] or is_search_exhausted):
-                            continue
-                        
-                        selected_key, selected_model = key, model
-                        state["unban_time"] = now + 999 
-                        break
-                if selected_key: break
-
-        if not selected_key:
-            if search_enabled and not is_fallback:
-                can_fallback = False
-                now_check = time.time()
-                for model in MODEL_FALLBACK_LIST:
-                    for key, state in api_key_states.items():
-                        if now_check >= state["unban_time"] and state["exhausted_models"].get(model, 0) <= now_check:
-                            can_fallback = True
-                            break
-                    if can_fallback: break
-                
-                if can_fallback:
-                    logging.warning(_("log_gemini_search_exhausted_fallback"))
-                    new_contents = list(contents)
-                    warning = "\n\n[СИСТЕМНОЕ ПРАВИЛО]: ВНИМАНИЕ! ИНТЕРНЕТ И GOOGLE SEARCH СЕЙЧАС НЕДОСТУПНЫ ИЗ-ЗА ЛИМИТОВ. Если в запросе пользователя есть ссылка — ЧЕСТНО СКАЖИ, что сейчас не можешь её открыть. СТРОЖАЙШЕ ЗАПРЕЩЕНО выдумывать содержимое ссылки или элементы интерфейса."
-                    if isinstance(new_contents[0], str):
-                        new_contents[0] += warning
-                    else:
-                        new_contents.append(warning)
-                        
-                    return await _send_to_gemini(new_contents, search_enabled=False, is_fallback=True)
-            
-            await asyncio.sleep(1)
-            continue
-            
-        key_mask = f"{selected_key[:5]}...{selected_key[-4:]}"
-
-        try:
-            client = genai.Client(api_key=selected_key)
-            response = await client.aio.models.generate_content(
-                model=selected_model,
-                contents=contents,
-                config=config
-            )
-            
-            if response.candidates and response.candidates[0].grounding_metadata:
-                logging.info(_("log_gemini_success_search", selected_model=selected_model, key_mask=key_mask))
-            else:
-                logging.info(_("log_gemini_success", selected_model=selected_model, key_mask=key_mask))
-                
-            async with key_lock:
-                api_key_states[selected_key]["unban_time"] = time.time() + 2 
-            return response.text.strip() if response.text else ""
-
-        except Exception as e:
-            # Склеиваем текст ошибки и её класс, чтобы точно поймать ServerError
-            err_str = f"{str(e)} {type(e).__name__}".lower()
-            async with key_lock:
-                is_quota_error = any(x in err_str for x in ["429", "resource_exhausted", "500", "servererror", "internal", "overloaded"])
-                
-                if is_quota_error:
-                    ban_duration = 7200 # Бан ровно на 2 часа (в секундах)
+                    if current_time < state["unban_time"]:
+                        continue
+                    if model_name in state["exhausted_models"] and current_time < state["exhausted_models"][model_name]:
+                        continue
+                    
+                    key_mask = f"{api_key[:7]}...{api_key[-4:]}"
+                    
+                    actual_search = search_enabled
                     if search_enabled:
-                        logging.warning(_("log_gemini_search_ban", selected_model=selected_model, key_mask=key_mask))
-                        api_key_states[selected_key]["search_exhausted_models"][selected_model] = time.time() + ban_duration
-                        api_key_states[selected_key]["unban_time"] = 0 
-                        
-                        # Если забанены все модели для поиска — баним ключ на 8 часов
-                        active_search_bans = sum(1 for t in api_key_states[selected_key]["search_exhausted_models"].values() if t > time.time())
-                        if active_search_bans >= len(MODEL_FALLBACK_LIST):
-                            logging.warning(_("log_gemini_search_key_ban", key_mask=key_mask))
-                            api_key_states[selected_key]["search_unban_time"] = time.time() + 28800
-                            api_key_states[selected_key]["search_exhausted_models"].clear()
+                        if current_time < state["search_unban_time"] or \
+                           (model_name in state["search_exhausted_models"] and current_time < state["search_exhausted_models"][model_name]):
+                            actual_search = False
+
+                try:
+                    client = genai.Client(api_key=api_key)
+                    config = get_model_config(search_enabled=actual_search)
+                    
+                    response = await asyncio.wait_for(
+                        client.aio.models.generate_content(
+                            model=model_name,
+                            contents=contents,
+                            config=config
+                        ),
+                        timeout=40.0
+                    )
+                    
+                    if not response.text or not response.text.strip():
+                        empty_attempts += 1
+                        logging.warning(_("log_gemini_empty_retry", attempt=empty_attempts, max_retries=max_empty_retries))
+                        break
+
+                    if search_enabled and not actual_search:
+                        logging.warning(_("log_gemini_search_exhausted_fallback"))
+                    
+                    if getattr(response.candidates[0], "grounding_metadata", None) and getattr(response.candidates[0].grounding_metadata, "search_entry_point", None):
+                        logging.info(_("log_gemini_success_search", selected_model=model_name, key_mask=key_mask))
                     else:
-                        logging.warning(_("log_gemini_model_ban", selected_model=selected_model, key_mask=key_mask))
-                        api_key_states[selected_key]["exhausted_models"][selected_model] = time.time() + ban_duration
-                        api_key_states[selected_key]["unban_time"] = time.time() # Освобождаем ключ для других моделей
-                elif "400" in err_str or "invalid" in err_str:
-                    logging.error(_("log_gemini_400", selected_model=selected_model, key_mask=key_mask))
-                    api_key_states[selected_key]["unban_time"] = time.time() + 5
-                else:
-                    logging.error(_("log_gemini_unknown_error", selected_model=selected_model, key_mask=key_mask, error_type=type(e).__name__))
-                    api_key_states[selected_key]["unban_time"] = time.time() + 10
+                        logging.info(_("log_gemini_success", selected_model=model_name, key_mask=key_mask))
+                    
+                    return response.text
+
+                except asyncio.TimeoutError:
+                    logging.warning(_("log_gemini_timeout", model=model_name))
+                    continue
+                    
+                except Exception as e:
+                    error_str = str(e).lower()
+                    
+                    async with key_lock:
+                        if "429" in error_str:
+                            if "search" in error_str or "grounding" in error_str:
+                                state["search_exhausted_models"][model_name] = time.time() + 10800
+                                logging.warning(_("log_gemini_search_ban", selected_model=model_name, key_mask=key_mask))
+                                if len(state["search_exhausted_models"]) == len(MODEL_FALLBACK_LIST):
+                                    state["search_unban_time"] = time.time() + 28800
+                                    logging.warning(_("log_gemini_search_key_ban", key_mask=key_mask))
+                            else:
+                                state["exhausted_models"][model_name] = time.time() + 7200
+                                logging.warning(_("log_gemini_limit", selected_model=model_name, key_mask=key_mask))
+                        
+                        elif "500" in error_str or "503" in error_str:
+                            state["exhausted_models"][model_name] = time.time() + 7200
+                            logging.warning(_("log_gemini_model_ban", selected_model=model_name, key_mask=key_mask))
+                            
+                        elif "400" in error_str:
+                            state["unban_time"] = time.time() + 5
+                            logging.error(_("log_gemini_400", selected_model=model_name, key_mask=key_mask))
+                        else:
+                            logging.error(_("log_gemini_unknown_error", selected_model=model_name, key_mask=key_mask, error_type=type(e).__name__))
+                    continue
+
     return "⏳"
 
 async def transcribe_media(media_path: str) -> str:
+    if not os.path.exists(media_path): return ""
     logging.info(_("log_transcribe_start", media_path=media_path))
-    if not media_path or not os.path.exists(media_path): 
-        return ""
     try:
         with open(media_path, "rb") as f:
             media_bytes = f.read()
@@ -157,7 +141,6 @@ async def transcribe_media(media_path: str) -> str:
 
 async def generate_ai_response(prompt_context: str, media_path: str = None, custom_prompt: str = None, search_enabled: bool = True) -> str:
     logging.info(_("log_generate_start"))
-    
     contents = [_("context_assembly", custom_prompt=custom_prompt, prompt_context=prompt_context)]
     
     if media_path and os.path.exists(media_path):
@@ -169,7 +152,6 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                     contents.append(genai_types.Part.from_bytes(data=media_bytes, mime_type="image/jpeg"))
             except Exception as e:
                 logging.error(_("log_attach_image_error", e=e))
-
+                
     logging.info(_("log_gemini_send"))
-    reply = await _send_to_gemini(contents, search_enabled=search_enabled)
-    return reply
+    return await _send_to_gemini(contents, search_enabled=search_enabled)
