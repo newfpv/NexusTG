@@ -1,3 +1,5 @@
+#!/bin/bash
+
 set -e
 
 CYAN='\033[0;36m'
@@ -132,6 +134,16 @@ done
 set -e
 
 draw_progress_bar 5 "Starting bot in Docker..."
+
+# --- СИСТЕМНЫЙ ФИКС СЕТИ ---
+echo -e "${YELLOW}⚙️  Optimizing network settings (IPv4 priority to prevent Docker build errors)...${NC}"
+if [ -f /etc/gai.conf ]; then
+    sudo sed -i 's/#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
+else
+    echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf > /dev/null
+fi
+# ---------------------------
+
 echo -e "${YELLOW}⚡ Building and launching container (this might take a minute)...${NC}"
 
 sudo docker compose up -d --build
