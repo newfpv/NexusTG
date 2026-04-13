@@ -13,7 +13,8 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "yt-dlp>=2024.03.10",
     "aiohttp>=3.9.3",
-    "pydantic-settings>=2.2.1"
+    "pydantic-settings>=2.2.1",
+    "tzdata"
 ]
 
 [tool.ruff]
