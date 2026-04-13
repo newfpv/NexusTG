@@ -134,7 +134,7 @@ try {
     Draw-ProgressBar 5 "Building environment with 'uv'..."
     Write-Host "⚡ Installing libraries (this will just take a few seconds)..." -ForegroundColor Yellow
     
-    uv venv
+    uv venv --python 3.11
     uv pip install -r pyproject.toml
     Draw-ProgressBar 6 "Creating Desktop shortcuts..."
     

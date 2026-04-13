@@ -41,7 +41,7 @@ Go to Telegram, search for [@BotFather](https://t.me/BotFather), and send `/newb
 1. Open the Start menu, type **PowerShell**, right-click it, and select **"Run as Administrator"**.
 2. Paste the following command and press Enter:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm [https://raw.githubusercontent.com/newfpv/NexusTG/main/install.ps1](https://raw.githubusercontent.com/newfpv/NexusTG/main/install.ps1) | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/newfpv/NexusTG/main/install.ps1 | iex"
 ```
 3. Follow the on-screen instructions (the script will ask for your preferred language and your Bot Token).
 4. A shortcut named **Start NexusTG** will appear on your desktop. Double-click it to run your bot!
@@ -49,7 +49,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm [https://raw.githubu
 #### 🐧 For Linux / Ubuntu (VPS Server)
 Connect to your server via SSH and paste this command:
 ```bash
-bash <(curl -sL "[https://raw.githubusercontent.com/newfpv/NexusTG/main/install.sh?t=$(date](https://raw.githubusercontent.com/newfpv/NexusTG/main/install.sh?t=$(date) +%s)")
+bash <(curl -sL "https://raw.githubusercontent.com/newfpv/NexusTG/main/install.sh?t=$(date +%s)")
 ```
 The script will install the bot in the `~/NexusTG` folder and create a convenient `./start.sh` execution file.
 

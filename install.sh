@@ -142,7 +142,7 @@ set -e
 draw_progress_bar 5 "Building environment with 'uv'..."
 echo -e "${YELLOW}⚡ Installing libraries (this will just take a few seconds)...${NC}"
 
-uv venv
+uv venv --python 3.11
 uv pip install -r pyproject.toml
 draw_progress_bar 6 "Creating start script..."
 
