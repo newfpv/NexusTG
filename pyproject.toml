@@ -1,0 +1,29 @@
+[project]
+name = "aitwin-bot"
+version = "0.1.0"
+description = "High-load Telegram bot + userbot"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram==3.4.1",
+    "Kurigram",
+    "tgcrypto==1.2.5",
+    "google-genai==0.3.0",
+    "python-dotenv==1.0.1",
+    "sqlalchemy[asyncio]>=2.0.29",
+    "aiosqlite>=0.20.0",
+    "yt-dlp>=2024.03.10",
+    "aiohttp>=3.9.3",
+    "pydantic-settings>=2.2.1"
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+strict = true
+disallow_untyped_defs = true
