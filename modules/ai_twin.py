@@ -58,7 +58,9 @@ async def _get_g_cfg():
         return {
             "is_active": getattr(c, "global_ai_active", False),
             "search_enabled": getattr(c, "google_search", True),
-            "prompt": getattr(c, "global_prompt", ""),
+            
+            "prompt": getattr(c, "global_prompt", None) or _("default_prompt_env"),
+            
             "typing_speed": getattr(c, "typing_speed", 0.08),
             "sleep_start": s_start,
             "sleep_end": s_end,
@@ -77,7 +79,6 @@ async def _get_g_cfg():
             "pmax": a.get("pmax", 2.0),
             "ai_debug": a.get("ai_debug", True) 
         }
-
 async def _upd_g_cfg(db_fields=None, **kwargs):
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
