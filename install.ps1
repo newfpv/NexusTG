@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 $InstallDir = "$env:USERPROFILE\NexusTG"
-$RepoUrl = "https://github.com/newfpv/NexusTGTest.git"
+$RepoUrl = "https://github.com/newfpv/NexusTG.git"
 $TotalSteps = 6
 
 function Wait-And-Exit {

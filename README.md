@@ -5,7 +5,7 @@
   <p><b>A powerful Telegram Userbot managed through a classic Telegram Bot interface.</b></p>
 
   <p>
-    <a href="https://github.com/newfpv/NexusTGTest"><img src="https://img.shields.io/badge/GitHub-Repository-blue?style=for-the-badge&logo=github" alt="GitHub Repo"></a>
+    <a href="https://github.com/newfpv/NexusTG"><img src="https://img.shields.io/badge/GitHub-Repository-blue?style=for-the-badge&logo=github" alt="GitHub Repo"></a>
     <img src="https://img.shields.io/badge/Python-3.11+-yellow?style=for-the-badge&logo=python" alt="Python">
     <img src="https://img.shields.io/badge/Gemini_AI-Powered-orange?style=for-the-badge&logo=google" alt="Gemini">
   </p>
@@ -42,7 +42,7 @@ Go to Telegram, search for [@BotFather](https://t.me/BotFather), and send `/newb
 1. Open the Start menu, type **PowerShell**, right-click it, and select **"Run as Administrator"**.
 2. Paste the following command and press Enter:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm [https://raw.githubusercontent.com/newfpv/NexusTGTest/main/install.ps1](https://raw.githubusercontent.com/newfpv/NexusTGTest/main/install.ps1) | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm [https://raw.githubusercontent.com/newfpv/NexusTG/main/install.ps1](https://raw.githubusercontent.com/newfpv/NexusTG/main/install.ps1) | iex"
 ```
 3. Follow the on-screen instructions (the script will ask for your preferred language and your Bot Token).
 4. A shortcut named **Start NexusTG** will appear on your desktop. Double-click it to run your bot!
@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm [https://raw.githubu
 #### 🐧 For Linux / Ubuntu (VPS Server)
 Connect to your server via SSH and paste this command:
 ```bash
-bash <(curl -sL "[https://raw.githubusercontent.com/newfpv/NexusTGTest/main/install.sh?t=$(date](https://raw.githubusercontent.com/newfpv/NexusTGTest/main/install.sh?t=$(date) +%s)")
+bash <(curl -sL "[https://raw.githubusercontent.com/newfpv/NexusTG/main/install.sh?t=$(date](https://raw.githubusercontent.com/newfpv/NexusTG/main/install.sh?t=$(date) +%s)")
 ```
 The script will install the bot in the `~/NexusTG` folder and create a convenient `./start.sh` execution file.
 
@@ -78,8 +78,8 @@ If you prefer to deploy the project using Docker Compose:
 
 ```bash
 # 1. Clone the repository
-git clone [https://github.com/newfpv/NexusTGTest.git](https://github.com/newfpv/NexusTGTest.git)
-cd NexusTGTest
+git clone https://github.com/newfpv/NexusTG.git
+cd NexusTG
 
 # 2. Configure the environment
 cp .env.example .env

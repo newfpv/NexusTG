@@ -13,7 +13,7 @@ NC='\033[0m'
 
 
 INSTALL_DIR="$HOME/NexusTG"
-REPO_URL="https://github.com/newfpv/NexusTGTest.git"
+REPO_URL="https://github.com/newfpv/NexusTG.git"
 TOTAL_STEPS=6
 
 
