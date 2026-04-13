@@ -1,8 +1,6 @@
 #!/bin/bash
 
-
 set -e
-
 
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -11,11 +9,9 @@ RED='\033[0;31m'
 DARKGRAY='\033[1;30m'
 NC='\033[0m'
 
-
 INSTALL_DIR="$HOME/NexusTG"
 REPO_URL="https://github.com/newfpv/NexusTG.git"
-TOTAL_STEPS=6
-
+TOTAL_STEPS=5
 
 wait_and_exit() {
     echo -e "\n${DARKGRAY}Press ENTER to close this window...${NC}"
@@ -23,9 +19,7 @@ wait_and_exit() {
     exit 1
 }
 
-
 trap 'echo -e "\n${RED}❌ An unexpected error occurred. Exiting...${NC}"; wait_and_exit' ERR
-
 
 draw_progress_bar() {
     local step=$1
@@ -69,17 +63,16 @@ else
     echo -e "${GREEN}✔ Project downloaded successfully!${NC}"
 fi
 
-draw_progress_bar 3 "Checking 'uv' (Turbo Python Manager)..."
-if ! command -v uv &> /dev/null; then
-    echo -e "${YELLOW}Installing uv...${NC}"
-    curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1
-    
-    # Обновляем пути "на лету"
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    
-    echo -e "${GREEN}✔ uv installed successfully!${NC}"
+draw_progress_bar 3 "Checking Docker & Docker Compose..."
+if ! command -v docker &> /dev/null; then
+    echo -e "${YELLOW}Installing Docker...${NC}"
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq docker.io docker-compose-v2 > /dev/null 2>&1
+    sudo systemctl enable --now docker > /dev/null 2>&1
+    sudo usermod -aG docker $USER
+    echo -e "${GREEN}✔ Docker installed successfully!${NC}"
 else
-    echo -e "${GREEN}✔ uv is ready!${NC}"
+    echo -e "${GREEN}✔ Docker is ready!${NC}"
 fi
 
 draw_progress_bar 4 "Configuring your bot..."
@@ -139,40 +132,25 @@ while true; do
     fi
 done
 set -e
-draw_progress_bar 5 "Building environment with 'uv'..."
-echo -e "${YELLOW}⚡ Installing libraries (this will just take a few seconds)...${NC}"
 
-uv venv --python 3.11
-uv pip install -r pyproject.toml
-draw_progress_bar 6 "Creating start script..."
+draw_progress_bar 5 "Starting bot in Docker..."
+echo -e "${YELLOW}⚡ Building and launching container (this might take a minute)...${NC}"
 
-START_SCRIPT="$INSTALL_DIR/start.sh"
-cat << 'EOF' > "$START_SCRIPT"
-#!/bin/bash
-cd "$(dirname "$0")" || exit
-echo -e "\033[0;36m========================================\033[0m"
-echo -e "\033[0;32m  NexusTG Bot is Starting...\033[0m"
-echo -e "\033[0;33m  Please do NOT close this window!\033[0m"
-echo -e "\033[0;36m========================================\033[0m"
-uv run main.py
-echo -e "\n\033[1;30mPress ENTER to exit...\033[0m"
-read -r
-EOF
-
-chmod +x "$START_SCRIPT"
-echo -e "${GREEN}✔ Script 'start.sh' created successfully!${NC}"
+# Запускаем докер
+sudo docker compose up -d --build
 
 echo -e "\n${CYAN}====================================================${NC}"
 echo -e "${GREEN} 🎉 INSTALLATION COMPLETED SUCCESSFULLY! 🎉${NC}"
 echo -e "${CYAN}====================================================\n${NC}"
 
-echo -e "${RED}⚠️ IMPORTANT RULE:${NC}"
-echo -e "${YELLOW}The bot only runs while the terminal window is open."
-echo -e "If you close it, the bot will immediately shut down!\n${NC}"
+echo -e "${GREEN}📌 The bot is now running in the background via Docker.${NC}"
+echo -e "${DARKGRAY}You can safely close this terminal window.\n${NC}"
 
-echo -e "${CYAN}📌 HOW TO RUN THE BOT NOW:${NC}"
-echo -e "1. Go to the bot folder: ${GREEN}cd ~/NexusTG${NC}"
-echo -e "2. Run the start script: ${GREEN}./start.sh${NC}"
-echo -e "3. Open Telegram and send /start to your bot.\n"
+echo -e "${CYAN}🛠️  HOW TO MANAGE YOUR BOT NOW:${NC}"
+echo -e "1. ${YELLOW}View Logs:${NC}      cd ~/NexusTG && sudo docker compose logs -f"
+echo -e "2. ${YELLOW}Restart Bot:${NC}    cd ~/NexusTG && sudo docker compose restart"
+echo -e "3. ${YELLOW}Stop Bot:${NC}       cd ~/NexusTG && sudo docker compose down\n"
+echo -e "👉 Open Telegram and send /start to your bot."
 
-wait_and_exit
+echo -e "\n${DARKGRAY}Press ENTER to exit...${NC}"
+read -r
