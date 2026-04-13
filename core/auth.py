@@ -38,7 +38,8 @@ def get_numpad_kb():
         [InlineKeyboardButton(text="1", callback_data="num_1"), InlineKeyboardButton(text="2", callback_data="num_2"), InlineKeyboardButton(text="3", callback_data="num_3")],
         [InlineKeyboardButton(text="4", callback_data="num_4"), InlineKeyboardButton(text="5", callback_data="num_5"), InlineKeyboardButton(text="6", callback_data="num_6")],
         [InlineKeyboardButton(text="7", callback_data="num_7"), InlineKeyboardButton(text="8", callback_data="num_8"), InlineKeyboardButton(text="9", callback_data="num_9")],
-        [InlineKeyboardButton(text=_("btn_numpad_del"), callback_data="num_del"), InlineKeyboardButton(text="0", callback_data="num_0"), InlineKeyboardButton(text=_("btn_numpad_submit"), callback_data="num_submit")]
+        [InlineKeyboardButton(text=_("btn_numpad_del"), callback_data="num_del"), InlineKeyboardButton(text="0", callback_data="num_0"), InlineKeyboardButton(text=_("btn_numpad_submit"), callback_data="num_submit")],
+        [InlineKeyboardButton(text=_("btn_change_phone"), callback_data="auth_change_phone")]
     ])
 
 def get_auth_error_kb():
@@ -123,6 +124,16 @@ async def auth_start(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AuthFSM.phone)
     await safe_edit(call.message, state, _("auth_enter_phone"), parse_mode="HTML")
 
+@router.callback_query(F.data == "auth_change_phone")
+async def auth_change_phone(call: types.CallbackQuery, state: FSMContext):
+    client = auth_clients.get(call.from_user.id)
+    if client:
+        try: await client.disconnect()
+        except: pass
+        del auth_clients[call.from_user.id]
+    await state.set_state(AuthFSM.phone)
+    await safe_edit(call.message, state, _("auth_enter_phone"), parse_mode="HTML")
+
 @router.message(AuthFSM.phone)
 async def auth_phone(message: types.Message, state: FSMContext):
     try: await message.delete()
@@ -134,7 +145,7 @@ async def auth_phone(message: types.Message, state: FSMContext):
     try:
         sent_code = await client.send_code(phone)
         auth_clients[message.from_user.id] = client
-        await safe_edit(message, state, _("auth_code_sent"), get_numpad_kb())
+        await safe_edit(message, state, _("auth_code_sent", phone=phone), get_numpad_kb(), parse_mode="HTML")
         await state.update_data(phone=phone, hash=sent_code.phone_code_hash, entered_code="")
         await state.set_state(AuthFSM.code)
     except Exception as e:
@@ -157,7 +168,8 @@ async def process_numpad(call: types.CallbackQuery, state: FSMContext):
         if len(current_code) < 5: current_code += action
     await state.update_data(entered_code=current_code)
     display_code = " ".join(list(current_code)) + " _" * (5 - len(current_code))
-    await safe_edit(call.message, state, _("auth_enter_code_display", display_code=display_code), get_numpad_kb(), parse_mode="HTML")
+    phone = data.get("phone", "Неизвестно")
+    await safe_edit(call.message, state, _("auth_enter_code_display", display_code=display_code, phone=phone), get_numpad_kb(), parse_mode="HTML")
 
 async def process_auth_code(call: types.CallbackQuery, state: FSMContext, code: str):
     data = await state.get_data()
