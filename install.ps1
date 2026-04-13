@@ -168,7 +168,8 @@ try {
     Write-Host "📌 HOW TO RUN THE BOT NOW:" -ForegroundColor Cyan
     Write-Host "1. Find the shortcut on your Desktop: " -NoNewline; Write-Host "Start NexusTG" -ForegroundColor Green
     Write-Host "2. Double-click it to start." -ForegroundColor Cyan
-    Write-Host "3. Open Telegram and send /start to your bot.`n" -ForegroundColor Cyan
+    Write-Host "3. Open Telegram and send /start to your bot." -ForegroundColor Cyan
+    Write-Host "After pressing the button, wait a minute. The bot creates a database.`n" -ForegroundColor Cyan
 
     Wait-And-Exit
 

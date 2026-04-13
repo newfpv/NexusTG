@@ -1,5 +1,3 @@
-#!/bin/bash
-
 set -e
 
 CYAN='\033[0;36m'
@@ -136,7 +134,6 @@ set -e
 draw_progress_bar 5 "Starting bot in Docker..."
 echo -e "${YELLOW}⚡ Building and launching container (this might take a minute)...${NC}"
 
-# Запускаем докер
 sudo docker compose up -d --build
 
 echo -e "\n${CYAN}====================================================${NC}"
@@ -151,6 +148,7 @@ echo -e "1. ${YELLOW}View Logs:${NC}      cd ~/NexusTG && sudo docker compose lo
 echo -e "2. ${YELLOW}Restart Bot:${NC}    cd ~/NexusTG && sudo docker compose restart"
 echo -e "3. ${YELLOW}Stop Bot:${NC}       cd ~/NexusTG && sudo docker compose down\n"
 echo -e "👉 Open Telegram and send /start to your bot."
+echo -e "👉 After pressing the button, wait a minute. The bot creates a database."
 
 echo -e "\n${DARKGRAY}Press ENTER to exit...${NC}"
 read -r
