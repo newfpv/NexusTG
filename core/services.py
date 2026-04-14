@@ -53,9 +53,6 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
         except Exception as e:
             logging.error(_("log_media_attach_error", e=e))
 
-    primary_model = model_fallback_list[0] if model_fallback_list else None
-    last_attempted_model = None
-
     for model_name in model_fallback_list:
         for api_key in api_keys:
             async with AsyncSessionLocal() as session:
@@ -67,12 +64,6 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                 if model_name in (state.exhausted_models or {}) and current_time < state.exhausted_models[model_name]:
                     continue
                 
-                if last_attempted_model and last_attempted_model != model_name:
-                    logging.warning(_("log_model_switch", old_model=last_attempted_model, new_model=model_name))
-                elif not last_attempted_model and model_name != primary_model:
-                    logging.warning(_("log_model_switch", old_model=primary_model, new_model=model_name))
-                
-                last_attempted_model = model_name
                 actual_search = search_enabled
                 if search_enabled:
                     if current_time < state.search_unban_time or (model_name in (state.search_exhausted_models or {}) and current_time < state.search_exhausted_models[model_name]):
@@ -97,19 +88,30 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                     err_str = str(e).lower()
                     new_exh = dict(state.exhausted_models or {})
                     new_s_exh = dict(state.search_exhausted_models or {})
+                    key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
                     
-                    if "429" in err_str:
+                    if any(x in err_str for x in ["500", "503", "502"]):
+                        for k in api_keys:
+                            k_state = await repo.get_ai_key_state(k)
+                            k_exh = dict(k_state.exhausted_models or {})
+                            k_exh[model_name] = current_time + 180
+                            await repo.update_ai_key_state(k, exhausted_models=k_exh)
+                        logging.warning(_("log_model_banned_global", model=model_name))
+                        break 
+                        
+                    elif "429" in err_str:
                         if "search" in err_str or "grounding" in err_str:
-                            new_s_exh[model_name] = current_time + 86400
+                            new_s_exh[model_name] = current_time + 60
                             await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
+                            logging.warning(_("log_model_banned_search", model=model_name, key=key_hidden))
                         else:
-                            new_exh[model_name] = current_time + 86400
+                            new_exh[model_name] = current_time + 60
                             await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
-                    elif any(x in err_str for x in ["500", "503"]):
-                        new_exh[model_name] = current_time + 7200
-                        await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
+                            logging.warning(_("log_model_banned_local", model=model_name, key=key_hidden))
+                            
                     elif "400" in err_str:
                         await repo.update_ai_key_state(api_key, unban_time=current_time + 10)
+                        
                     continue
     return "⏳"
 
@@ -137,9 +139,6 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                 contents.append(genai_types.Part.from_bytes(data=f.read(), mime_type=mime_type))
         except Exception: pass
 
-    primary_model = model_fallback_list[0] if model_fallback_list else None
-    last_attempted_model = None
-
     for model_name in model_fallback_list:
         for api_key in api_keys:
             async with AsyncSessionLocal() as session:
@@ -151,12 +150,6 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                 if model_name in (state.exhausted_models or {}) and current_time < state.exhausted_models[model_name]:
                     continue
                 
-                if last_attempted_model and last_attempted_model != model_name:
-                    logging.warning(_("log_model_switch", old_model=last_attempted_model, new_model=model_name))
-                elif not last_attempted_model and model_name != primary_model:
-                    logging.warning(_("log_model_switch", old_model=primary_model, new_model=model_name))
-                
-                last_attempted_model = model_name
                 actual_search = search_enabled
                 if search_enabled:
                     if current_time < state.search_unban_time or (model_name in (state.search_exhausted_models or {}) and current_time < state.search_exhausted_models[model_name]):
@@ -179,9 +172,31 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                 except Exception as e:
                     err_str = str(e).lower()
                     new_exh = dict(state.exhausted_models or {})
-                    if "429" in err_str:
-                        new_exh[model_name] = current_time + 7200
-                        await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
+                    new_s_exh = dict(state.search_exhausted_models or {})
+                    key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
+                    
+                    if any(x in err_str for x in ["500", "503", "502"]):
+                        for k in api_keys:
+                            k_state = await repo.get_ai_key_state(k)
+                            k_exh = dict(k_state.exhausted_models or {})
+                            k_exh[model_name] = current_time + 180
+                            await repo.update_ai_key_state(k, exhausted_models=k_exh)
+                        logging.warning(_("log_model_banned_global", model=model_name))
+                        break 
+                        
+                    elif "429" in err_str:
+                        if "search" in err_str or "grounding" in err_str:
+                            new_s_exh[model_name] = current_time + 60
+                            await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
+                            logging.warning(_("log_model_banned_search", model=model_name, key=key_hidden))
+                        else:
+                            new_exh[model_name] = current_time + 60
+                            await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
+                            logging.warning(_("log_model_banned_local", model=model_name, key=key_hidden))
+                            
+                    elif "400" in err_str:
+                        await repo.update_ai_key_state(api_key, unban_time=current_time + 10)
+                        
                     continue
 
 async def test_ai_credentials(progress_cb=None) -> str:

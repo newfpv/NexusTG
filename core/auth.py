@@ -1,7 +1,9 @@
 import os
 import logging
 import re
+import time
 import zoneinfo
+from datetime import datetime
 from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -9,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
 
+from core.db import AsyncSessionLocal, CoreRepository
 from core.utils import plugins, safe_edit
 from core.config import _
 
@@ -360,3 +363,64 @@ async def yt_cookies_delete(call: types.CallbackQuery, state: FSMContext):
         os.remove("data/cookies.txt")
     await call.answer(_("yt_cookies_deleted_alert"), show_alert=False)
     await yt_cookies_menu(call, state)
+
+# --- БЛОК ЛИМИТОВ И БАНОВ ---
+
+async def get_limits_text(repo: CoreRepository, api_keys: list[str]) -> str:
+    if not api_keys:
+        return _("limits_empty")
+    
+    current_time = time.time()
+    res = ""
+    for key in api_keys:
+        hidden_key = f"{key[:4]}***{key[-4:]}"
+        res += _("limits_key_header", key=hidden_key)
+        
+        state = await repo.get_ai_key_state(key)
+        has_bans = False
+        
+        if state.unban_time and state.unban_time > current_time:
+            has_bans = True
+            dt = datetime.fromtimestamp(state.unban_time).strftime('%d.%m %H:%M:%S')
+            res += _("limits_global_ban", time=dt)
+            
+        if state.exhausted_models:
+            for mod, unban_ts in state.exhausted_models.items():
+                if unban_ts > current_time:
+                    has_bans = True
+                    dt = datetime.fromtimestamp(unban_ts).strftime('%d.%m %H:%M:%S')
+                    res += _("limits_model_ban", model=mod, time=dt)
+                    
+        if state.search_exhausted_models:
+            for mod, unban_ts in state.search_exhausted_models.items():
+                if unban_ts > current_time:
+                    has_bans = True
+                    dt = datetime.fromtimestamp(unban_ts).strftime('%d.%m %H:%M:%S')
+                    res += _("limits_search_ban", model=mod, time=dt)
+                    
+        if not has_bans:
+            res += _("limits_ok")
+        res += "\n"
+        
+    return res
+
+@router.callback_query(F.data == "sys_limits_menu")
+async def limits_menu(call: types.CallbackQuery, state: FSMContext):
+    config = await plugins.db.get_global_config()
+    keys = [k.strip() for k in (config.api_keys or "").split(",") if k.strip()]
+    
+    async with AsyncSessionLocal() as session:
+        repo = CoreRepository(session)
+        text_info = await get_limits_text(repo, keys)
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=_("btn_reset_limits"), callback_data="sys_limits_reset")],
+        [InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]
+    ])
+    await safe_edit(call.message, state, _("limits_menu_title", limits_text=text_info), kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "sys_limits_reset")
+async def limits_reset(call: types.CallbackQuery, state: FSMContext):
+    await plugins.db.reset_all_limits()
+    await call.answer(_("limits_reset_alert"), show_alert=True)
+    await limits_menu(call, state)

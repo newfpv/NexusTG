@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from pyrogram import Client, filters, enums
+from pyrogram.types import LinkPreviewOptions
 from pyrogram.errors import FloodWait
 
 from aiogram import Router, F, types
@@ -133,7 +134,10 @@ def register_userbot(app: Client):
             else:
                 query = message.text or message.caption or ""
 
-            status_msg = await message.edit(_("cmd_ai_thinking")) if is_me else await message.reply(_("cmd_ai_thinking"))
+            # Новый параметр для отключения превью ссылок
+            no_preview = LinkPreviewOptions(is_disabled=True)
+
+            status_msg = await message.edit(_("cmd_ai_thinking"), link_preview_options=no_preview) if is_me else await message.reply(_("cmd_ai_thinking"), link_preview_options=no_preview)
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 20))
             
             target_msg = message.reply_to_message if (is_cmd and message.reply_to_message) else message
@@ -181,7 +185,7 @@ def register_userbot(app: Client):
 
                         if current_display.strip() != last_sent_text.strip():
                             try:
-                                await status_msg.edit(current_display, parse_mode=enums.ParseMode.HTML)
+                                await status_msg.edit(current_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
                                 last_sent_text = current_display
                                 last_ui_update = time.time()
                             except FloodWait as e:
@@ -197,22 +201,22 @@ def register_userbot(app: Client):
                     
                     if final_display.strip() != last_sent_text.strip():
                         try: 
-                            await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML)
+                            await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
                         except FloodWait as e:
                             await asyncio.sleep(e.value + 1)
-                            await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML)
+                            await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
                         except Exception:
                             pass
 
             except Exception as e:
                 if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
                     logging.error(_("cmd_ai_log_error", e=str(e)))
-                    if not last_sent_text: await status_msg.edit(_("cmd_ai_error_msg", e=str(e)))
+                    if not last_sent_text: await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
             
             if not typing_task.done(): typing_task.cancel()
             
             if not full_reply or full_reply == "⏳":
-                return await status_msg.edit(_("ai_cmd_error_empty"))
+                return await status_msg.edit(_("ai_cmd_error_empty"), link_preview_options=no_preview)
 
             if cfg["show_debug"]:
                 print(_("log_debug_output", reply=full_reply))
@@ -224,7 +228,7 @@ def register_userbot(app: Client):
         except Exception as e:
             logging.error(_("cmd_ai_log_error", e=str(e)))
             if 'status_msg' in locals() and status_msg: 
-                try: await status_msg.edit(_("cmd_ai_error_msg", e=str(e)))
+                try: await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
                 except: pass
         finally:
             for p in media_paths_to_cleanup:

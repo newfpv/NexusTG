@@ -114,6 +114,12 @@ class CoreAPI:
             await repo.full_reset()
 
     @staticmethod
+    async def reset_all_limits():
+        async with AsyncSessionLocal() as session:
+            repo = CoreRepository(session)
+            await repo.reset_all_limits()
+
+    @staticmethod
     async def get_module_cfg(module_name: str) -> dict:
         async with AsyncSessionLocal() as session:
             repo = CoreRepository(session)
@@ -319,6 +325,7 @@ def introduce_typo(text: str) -> str:
 
 async def extract_text_from_message(message: types.Message) -> str | None:
     if message.document:
+        import io
         buffer = io.BytesIO()
         await plugins.bot.download(message.document, destination=buffer)
         raw_data = buffer.getvalue()

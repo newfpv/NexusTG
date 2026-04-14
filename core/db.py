@@ -134,8 +134,11 @@ class CoreRepository:
         conf.admin_id = None
         conf.admin_menu_id = None
         conf.is_setup_completed = False
-        # Optional: clear key states on full reset
         await self.session.execute(text("DELETE FROM ai_key_state"))
+        await self.session.commit()
+
+    async def reset_all_limits(self):
+        await self.session.execute(text("UPDATE ai_key_state SET exhausted_models = '{}', search_exhausted_models = '{}', unban_time = 0, search_unban_time = 0"))
         await self.session.commit()
 
     async def get_chat_config(self, chat_id: int) -> ChatConfig:

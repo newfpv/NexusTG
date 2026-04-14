@@ -50,17 +50,17 @@ def load_language():
         except Exception as e:
             logging.error(f"❌ i18n Error: {e}")
 
-def _(key: str, **kwargs) -> str:
-    if key not in translations:
-        logging.warning(f"Missing i18n key: '{key}'")
-        text = key
+def _(i18n_key: str, **kwargs) -> str:
+    if i18n_key not in translations:
+        logging.warning(f"Missing i18n key: '{i18n_key}'")
+        text = i18n_key
     else:
-        text = translations[key]
+        text = translations[i18n_key]
         
     if kwargs:
         try: return text.format(**kwargs)
         except KeyError as e: 
-            logging.warning(f"Missing format argument '{e.args[0]}' in i18n key: '{key}'")
+            logging.warning(f"Missing format argument '{e.args[0]}' in i18n key: '{i18n_key}'")
     return text
 
 def validate_i18n_keys():
