@@ -231,8 +231,10 @@ async def safe_edit(message: types.Message, state: FSMContext, text: str, reply_
         await plugins.db.update_global_config(admin_menu_id=msg.message_id)
 
 async def safe_delete(message):
-    try: await message.delete()
-    except: pass
+    try:
+        await message.delete()
+    except Exception as e:
+        logging.debug(f"safe_delete failed: {e}")
 
 async def get_current_global_settings():
     c = await plugins.db.get_global_config()
@@ -282,14 +284,14 @@ async def simulate_human_typing(client, chat_id, total_time, is_human_mode, t_mi
     if not is_human_mode or total_time < 3.0:
         await simulate_typing(client, chat_id, total_time)
         try: await client.send_chat_action(chat_id, ChatAction.CANCEL)
-        except: pass
+        except Exception as e: logging.debug(f"cancel typing error: {e}")
         return
         
     elapsed = 0
     while elapsed < total_time:
         t_type = min(random.uniform(t_min, t_max), total_time - elapsed)
         try: await client.send_chat_action(chat_id, ChatAction.TYPING)
-        except: pass
+        except Exception as e: logging.debug(f"typing action error: {e}")
         
         await asyncio.sleep(t_type)
         elapsed += t_type
@@ -297,13 +299,13 @@ async def simulate_human_typing(client, chat_id, total_time, is_human_mode, t_mi
             
         t_pause = min(random.uniform(p_min, p_max), total_time - elapsed)
         try: await client.send_chat_action(chat_id, ChatAction.CANCEL)
-        except: pass
+        except Exception as e: logging.debug(f"cancel action error: {e}")
         
         await asyncio.sleep(t_pause)
         elapsed += t_pause
         
     try: await client.send_chat_action(chat_id, ChatAction.CANCEL)
-    except: pass
+    except Exception as e: logging.debug(f"final cancel typing error: {e}")
 
 def introduce_typo(text: str) -> str:
     if len(text) < 5: return text

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import html
 import traceback
+import time
 from datetime import datetime, timezone
 
 from aiogram import Router, F, types, Bot
@@ -21,11 +22,12 @@ from pyrogram.types import ReplyParameters
 
 from core.db import AsyncSessionLocal, CoreRepository
 from core.services import generate_ai_response, transcribe_media, get_youtube_context, build_dialog_context
-from core.utils import safe_edit, plugins, simulate_human_typing, introduce_typo
+from core.utils import safe_edit, plugins, simulate_human_typing
 from core.config import _
 
 router = Router()
-skip_video_timers = set()
+skip_video_timers = {}
+SKIP_VIDEO_TTL = 300
 active_reply_tasks = {}
 
 class AISettingsFSM(StatesGroup):
@@ -245,7 +247,7 @@ async def toggle_chat(call: types.CallbackQuery, state: FSMContext):
     await _upd_c_cfg(chat_id, db_fields={"is_active": not cfg["is_active"]})
     await chat_settings_menu(call, state, chat_id=chat_id)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_chat answer error: {e}")
 
 @router.callback_query(F.data.startswith("ai_ignore_"))
 async def toggle_ignore(call: types.CallbackQuery, state: FSMContext):
@@ -254,7 +256,7 @@ async def toggle_ignore(call: types.CallbackQuery, state: FSMContext):
     await _upd_c_cfg(chat_id, db_fields={"is_ignored": not cfg["is_ignored"]})
     await chat_settings_menu(call, state, chat_id=chat_id)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_ignore answer error: {e}")
 
 @router.callback_query(F.data == "ai_human_settings_global")
 async def human_settings_global(call: types.CallbackQuery, state: FSMContext):
@@ -296,7 +298,7 @@ async def toggle_global_ai_cb(call: types.CallbackQuery, state: FSMContext):
     await _upd_g_cfg(db_fields={"global_ai_active": not cfg["is_active"]})
     await global_settings_menu(call, state)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_global answer error: {e}")
     
 @router.callback_query(F.data == "ai_toggle_debug")
 async def toggle_debug_cb(call: types.CallbackQuery, state: FSMContext):
@@ -304,7 +306,7 @@ async def toggle_debug_cb(call: types.CallbackQuery, state: FSMContext):
     await _upd_g_cfg(ai_debug=not cfg["ai_debug"])
     await global_settings_menu(call, state)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_debug answer error: {e}")
 
 @router.callback_query(F.data == "ai_h_toggle_typing_g")
 async def toggle_typ_g(call: types.CallbackQuery, state: FSMContext):
@@ -312,7 +314,7 @@ async def toggle_typ_g(call: types.CallbackQuery, state: FSMContext):
     await _upd_g_cfg(h_typing=not cfg["h_typing"])
     await human_settings_global(call, state)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_typ_g answer error: {e}")
 
 @router.callback_query(F.data == "ai_h_toggle_smart_g")
 async def toggle_smart_g(call: types.CallbackQuery, state: FSMContext):
@@ -320,7 +322,7 @@ async def toggle_smart_g(call: types.CallbackQuery, state: FSMContext):
     await _upd_g_cfg(h_smart=not cfg["h_smart"])
     await human_settings_global(call, state)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_smart_g answer error: {e}")
 
 @router.callback_query(F.data.startswith("ai_h_toggle_typing_c_"))
 async def toggle_typ_c(call: types.CallbackQuery, state: FSMContext):
@@ -330,7 +332,7 @@ async def toggle_typ_c(call: types.CallbackQuery, state: FSMContext):
     await _upd_c_cfg(chat_id, h_typing=nxt)
     await human_settings_chat(call, state, chat_id=chat_id)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_typ_c answer error: {e}")
 
 @router.callback_query(F.data.startswith("ai_h_toggle_smart_c_"))
 async def toggle_smart_c(call: types.CallbackQuery, state: FSMContext):
@@ -340,7 +342,7 @@ async def toggle_smart_c(call: types.CallbackQuery, state: FSMContext):
     await _upd_c_cfg(chat_id, h_smart=nxt)
     await human_settings_chat(call, state, chat_id=chat_id)
     try: await call.answer()
-    except: pass
+    except Exception as e: logging.debug(f"toggle_smart_c answer error: {e}")
 
 @router.callback_query(F.data == "ai_h_set_reaction")
 async def ask_reaction(call: types.CallbackQuery, state: FSMContext):
@@ -428,7 +430,7 @@ async def settings_sleep(call: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("skipwait_"))
 async def skip_wait_timer(call: types.CallbackQuery):
     chat_id = int(call.data.split("_")[1])
-    skip_video_timers.add(chat_id)
+    skip_video_timers[chat_id] = time.time()
     await call.answer(_("ai_skip_video_alert"), show_alert=True)
 
 @router.callback_query(F.data.startswith("ai_prompt_"))
@@ -458,7 +460,7 @@ async def ask_delays(call: types.CallbackQuery, state: FSMContext):
 @router.message(AISettingsFSM.custom_reaction)
 async def save_reaction(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_human_settings_global")]])
     reaction_val = "👍"
     if message.entities:
@@ -474,7 +476,7 @@ async def save_reaction(message: types.Message, state: FSMContext):
 @router.message(AISettingsFSM.g_ignore_chance)
 async def save_ign_g(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_human_settings_global")]])
     try:
         val = int(message.text.strip())
@@ -482,13 +484,15 @@ async def save_ign_g(message: types.Message, state: FSMContext):
             await _upd_g_cfg(h_ignore=val)
             await safe_edit(message, state, _("ai_ignore_saved"), kb)
         else: raise ValueError
-    except: await safe_edit(message, state, _("ai_ignore_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_ign_g error: {e}")
+        await safe_edit(message, state, _("ai_ignore_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.c_ignore_chance)
 async def save_ign_c(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     data = await state.get_data()
     chat_id = data['chat_id']
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data=f"ai_human_chat_{chat_id}")]])
@@ -499,25 +503,29 @@ async def save_ign_c(message: types.Message, state: FSMContext):
             await _upd_c_cfg(chat_id, h_ignore=val)
             await safe_edit(message, state, _("ai_ignore_saved"), kb)
         else: raise ValueError
-    except: await safe_edit(message, state, _("ai_ignore_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_ign_c error: {e}")
+        await safe_edit(message, state, _("ai_ignore_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.g_h_smart_cfg)
 async def save_cfg_smart_g(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_human_settings_global")]])
     try:
         val = 0.05 if message.text.lower() == _("cmd_reset").lower() else float(message.text.replace(",", "."))
         await _upd_g_cfg(s_mul=val)
         await safe_edit(message, state, _("ai_h_cfg_smart_saved"), kb)
-    except: await safe_edit(message, state, _("ai_format_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_cfg_smart_g error: {e}")
+        await safe_edit(message, state, _("ai_format_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.c_h_smart_cfg)
 async def save_cfg_smart_c(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     data = await state.get_data()
     chat_id = data['chat_id']
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data=f"ai_human_chat_{chat_id}")]])
@@ -525,13 +533,15 @@ async def save_cfg_smart_c(message: types.Message, state: FSMContext):
         val = None if message.text.lower() == _("cmd_reset").lower() else float(message.text.replace(",", "."))
         await _upd_c_cfg(chat_id, s_mul=val)
         await safe_edit(message, state, _("ai_h_cfg_smart_saved"), kb)
-    except: await safe_edit(message, state, _("ai_format_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_cfg_smart_c error: {e}")
+        await safe_edit(message, state, _("ai_format_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.g_h_typing_cfg)
 async def save_cfg_typ_g(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_human_settings_global")]])
     try:
         if message.text.lower() == _("cmd_reset").lower(): 
@@ -540,13 +550,15 @@ async def save_cfg_typ_g(message: types.Message, state: FSMContext):
             tmin, tmax, pmin, pmax = map(float, message.text.replace(",", ".").split())
             await _upd_g_cfg(tmin=tmin, tmax=tmax, pmin=pmin, pmax=pmax)
         await safe_edit(message, state, _("ai_h_cfg_typing_saved"), kb)
-    except: await safe_edit(message, state, _("ai_format_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_cfg_typ_g error: {e}")
+        await safe_edit(message, state, _("ai_format_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.c_h_typing_cfg)
 async def save_cfg_typ_c(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     data = await state.get_data()
     chat_id = data['chat_id']
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data=f"ai_human_chat_{chat_id}")]])
@@ -557,13 +569,15 @@ async def save_cfg_typ_c(message: types.Message, state: FSMContext):
             tmin, tmax, pmin, pmax = map(float, message.text.replace(",", ".").split())
             await _upd_c_cfg(chat_id, tmin=tmin, tmax=tmax, pmin=pmin, pmax=pmax)
         await safe_edit(message, state, _("ai_h_cfg_typing_saved"), kb)
-    except: await safe_edit(message, state, _("ai_format_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_cfg_typ_c error: {e}")
+        await safe_edit(message, state, _("ai_format_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.global_prompt)
 async def save_g_prompt(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_global_settings")]])
     prompt_text = ""
     try:
@@ -578,37 +592,43 @@ async def save_g_prompt(message: types.Message, state: FSMContext):
         else: return await safe_edit(message, state, _("ai_g_prompt_error_format"), kb)
         await _upd_g_cfg(db_fields={"global_prompt": prompt_text})
         await safe_edit(message, state, _("ai_g_prompt_saved"), kb)
-    except Exception as e: await safe_edit(message, state, _("ai_general_error", e=e), kb)
+    except Exception as e: 
+        logging.error(f"save_g_prompt error: {e}")
+        await safe_edit(message, state, _("ai_general_error", e=e), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.global_delays)
 async def save_g_delays(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_global_settings")]])
     try:
         db_m, db_mx, da_m, da_mx = map(int, message.text.split())
         await _upd_g_cfg(db_min=db_m, db_max=db_mx, da_min=da_m, da_max=da_mx)
         await safe_edit(message, state, _("ai_g_delays_saved"), kb)
-    except: await safe_edit(message, state, _("ai_g_delays_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_g_delays error: {e}")
+        await safe_edit(message, state, _("ai_g_delays_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.global_typing)
 async def save_g_typing(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_global_settings")]])
     try:
         speed = float(message.text.replace(",", "."))
         await _upd_g_cfg(db_fields={"typing_speed": speed})
         await safe_edit(message, state, _("ai_g_typing_saved"), kb)
-    except: await safe_edit(message, state, _("ai_g_typing_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_g_typing error: {e}")
+        await safe_edit(message, state, _("ai_g_typing_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.sleep_hours)
 async def save_sleep_hours(message: types.Message, state: FSMContext):
     try: await message.delete() 
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     text = message.text.lower().strip()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_settings"), callback_data="ai_global_settings")]])
     try:
@@ -622,13 +642,15 @@ async def save_sleep_hours(message: types.Message, state: FSMContext):
                 end_fmt = datetime.strptime(end, "%H:%M").strftime("%H:%M")
                 await _upd_g_cfg(db_fields={"sleep_start": start_fmt, "sleep_end": end_fmt})
                 await safe_edit(message, state, _("ai_sleep_saved", start=start_fmt, end=end_fmt), kb)
-            except: await safe_edit(message, state, _("ai_sleep_error"), kb)
+            except Exception as e: 
+                logging.warning(f"save_sleep_hours parse error: {e}")
+                await safe_edit(message, state, _("ai_sleep_error"), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.custom_prompt)
 async def save_prompt(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     data = await state.get_data()
     chat_id = data['chat_id']
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_chat"), callback_data=f"ai_chat_menu_{chat_id}")]])
@@ -645,13 +667,15 @@ async def save_prompt(message: types.Message, state: FSMContext):
         final_prompt = None if prompt_text.lower() == _("cmd_reset").lower() else prompt_text
         await _upd_c_cfg(chat_id, db_fields={"custom_prompt": final_prompt})
         await safe_edit(message, state, _("ai_c_prompt_saved"), kb)
-    except Exception as e: await safe_edit(message, state, _("ai_c_prompt_error", e=e), kb)
+    except Exception as e: 
+        logging.error(f"save_prompt error: {e}")
+        await safe_edit(message, state, _("ai_c_prompt_error", e=e), kb)
     finally: await state.set_state(None)
 
 @router.message(AISettingsFSM.delays)
 async def save_delays(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
+    except Exception as e: logging.debug(f"delete error: {e}")
     data = await state.get_data()
     chat_id = data['chat_id']
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_chat"), callback_data=f"ai_chat_menu_{chat_id}")]])
@@ -663,14 +687,16 @@ async def save_delays(message: types.Message, state: FSMContext):
         db_min, db_max, da_min, da_max = map(int, message.text.split())
         await _upd_c_cfg(chat_id, db_fields={"delay_before_min": db_min, "delay_before_max": db_max, "delay_after_min": da_min, "delay_after_max": da_max})
         await safe_edit(message, state, _("ai_c_delays_saved"), kb)
-    except: await safe_edit(message, state, _("ai_c_delays_error"), kb)
+    except Exception as e: 
+        logging.warning(f"save_delays error: {e}")
+        await safe_edit(message, state, _("ai_c_delays_error"), kb)
     finally: await state.set_state(None)
 
 def register_userbot(app: Client, bot: Bot):
     async def process_reply(client, message):
         media_paths_to_cleanup = []
+        chat_id = message.chat.id
         try:
-            chat_id = message.chat.id
             g_cfg = await _get_g_cfg()
             c_cfg = await _get_c_cfg(chat_id)
             
@@ -772,27 +798,27 @@ def register_userbot(app: Client, bot: Bot):
                 if random.randint(1, 100) <= use_h_ignore:
                     ai_generate_task.cancel() 
                     try: await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
-                    except: pass
+                    except Exception as e: logging.debug(f"cancel action error: {e}")
                     await asyncio.sleep(1.0)
                     try:
                         await client.read_chat_history(chat_id)
                         if message.voice or message.video_note or message.video:
                             await client.invoke(functions.messages.ReadMessageContents(id=[message.id]))
-                    except: pass
+                    except Exception as e: logging.debug(f"read history error: {e}")
                     if random.random() < 0.5:
                         try: await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-                        except: pass
+                        except Exception as e: logging.debug(f"send reaction error: {e}")
                     if g_cfg["ai_debug"]: logging.info(_("ai_log_ignored", chat_id=chat_id, chance=use_h_ignore))
                     return
 
             try: await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
-            except: pass
+            except Exception as e: logging.debug(f"cancel action error: {e}")
             await asyncio.sleep(1.0)
             try:
                 await client.read_chat_history(chat_id)
                 if message.voice or message.video_note or message.video:
                     await client.invoke(functions.messages.ReadMessageContents(id=[message.id]))
-            except: pass
+            except Exception as e: logging.debug(f"read history error: {e}")
 
             c_s_mul = c_cfg["s_mul"] if c_cfg["s_mul"] is not None else g_cfg["s_mul"]
             smart_delay = 0
@@ -802,10 +828,16 @@ def register_userbot(app: Client, bot: Bot):
                 else: smart_delay = len(text_to_search) * c_s_mul
 
             if smart_delay > 0:
+                current_time = time.time()
+                # Cleanup old timers
+                for cid in list(skip_video_timers.keys()):
+                    if current_time - skip_video_timers[cid] > SKIP_VIDEO_TTL:
+                        del skip_video_timers[cid]
+                
                 elapsed_wait = 0
                 while elapsed_wait < smart_delay:
                     if chat_id in skip_video_timers:
-                        skip_video_timers.remove(chat_id)
+                        del skip_video_timers[chat_id]
                         if g_cfg["ai_debug"]: logging.info(_("log_skip_delay", chat_id=chat_id))
                         break
                     await asyncio.sleep(1)
@@ -813,7 +845,9 @@ def register_userbot(app: Client, bot: Bot):
 
             try: reply = await ai_generate_task
             except asyncio.CancelledError: return
-            except Exception: reply = None
+            except Exception as e:
+                logging.error(f"ai_generate_task error: {e}")
+                reply = None
 
             if not reply or reply == "⏳": return
             if g_cfg["ai_debug"]: logging.info(_("log_llm_res_main", reply=reply))
@@ -821,12 +855,12 @@ def register_userbot(app: Client, bot: Bot):
             reply_upper = reply.upper().strip()
             if reply_upper.startswith("[LIKE]"):
                 try: await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-                except: pass
+                except Exception as e: logging.debug(f"send reaction error: {e}")
                 return
                 
             if "[LIKE]" in reply_upper:
                 try: await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-                except: pass
+                except Exception as e: logging.debug(f"send reaction error: {e}")
                 reply = re.sub(r'(?i)\[LIKE\]', '', reply).strip()
 
             if not reply: return 
@@ -854,36 +888,42 @@ def register_userbot(app: Client, bot: Bot):
                 await simulate_human_typing(client, chat_id, typing_time, use_h_typing, c_tmin, c_tmax, c_pmin, c_pmax)
                 
                 use_typo = random.random() < 0.05
-                final_part = introduce_typo(part) if use_typo else part
+                if use_typo:
+                    final_part = await asyncio.to_thread(introduce_typo, part)
+                else:
+                    final_part = part
                 
                 reply_params = ReplyParameters(message_id=message.id) if (i == 0 and use_reply) else None
                 sent_msg = await client.send_message(chat_id, final_part, reply_parameters=reply_params)
                 
                 try: await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
-                except: pass
+                except Exception as e: logging.debug(f"cancel action error: {e}")
                 
                 if use_typo and final_part != part:
                     await asyncio.sleep(random.uniform(3, 10.0))
                     try: await sent_msg.edit_text(part)
-                    except: pass
+                    except Exception as e: logging.debug(f"edit typo error: {e}")
                 
                 if i < len(parts) - 1:
                     await asyncio.sleep(random.uniform(0.5, 2.0)) 
 
-        except asyncio.CancelledError: pass
+        except asyncio.CancelledError: 
+            raise
         except Exception as e:
             logging.error(_("log_ai_critical_error", e=e))
             traceback.print_exc()
             try:
-                logging.error(_("ai_log_chat_error", chat_id=message.chat.id, e=str(e)))
+                logging.error(_("ai_log_chat_error", chat_id=chat_id, e=str(e)))
             except: pass
         finally:
             for p in media_paths_to_cleanup:
                 if p and os.path.exists(p):
-                    try: os.remove(p)
-                    except: pass
-            if active_reply_tasks.get(message.chat.id) == asyncio.current_task():
-                del active_reply_tasks[message.chat.id]
+                    try: 
+                        os.remove(p)
+                    except Exception as e: 
+                        logging.debug(f"cleanup media error: {e}")
+            if active_reply_tasks.get(chat_id) == asyncio.current_task():
+                del active_reply_tasks[chat_id]
 
     @app.on_message(filters.private & ~filters.me)
     async def ai_auto_reply(client, message):
