@@ -694,8 +694,10 @@ async def save_delays(message: types.Message, state: FSMContext):
 
 def register_userbot(app: Client, bot: Bot):
     async def process_reply(client, message):
-        media_paths_to_cleanup = []
         chat_id = message.chat.id
+        start_time = time.time()
+        logging.info(f"[AI Twin] Начало обработки чата {chat_id}")
+        media_paths_to_cleanup = []
         try:
             g_cfg = await _get_g_cfg()
             c_cfg = await _get_c_cfg(chat_id)
@@ -782,7 +784,10 @@ def register_userbot(app: Client, bot: Bot):
                 logging.info("="*50)
 
             ai_generate_task = asyncio.create_task(
-                generate_ai_response(full_history_str, live_media_path, custom_prompt="", search_enabled=search_enabled)
+                asyncio.wait_for(
+                    generate_ai_response(full_history_str, live_media_path, custom_prompt="", search_enabled=search_enabled),
+                    timeout=180.0
+                )
             )
 
             c_db_min = c_cfg["db_min"] if c_cfg["db_min"] is not None else g_cfg["db_min"]
@@ -829,7 +834,6 @@ def register_userbot(app: Client, bot: Bot):
 
             if smart_delay > 0:
                 current_time = time.time()
-                # Cleanup old timers
                 for cid in list(skip_video_timers.keys()):
                     if current_time - skip_video_timers[cid] > SKIP_VIDEO_TTL:
                         del skip_video_timers[cid]
@@ -845,8 +849,11 @@ def register_userbot(app: Client, bot: Bot):
 
             try: reply = await ai_generate_task
             except asyncio.CancelledError: return
+            except asyncio.TimeoutError:
+                logging.error(f"[AI Twin] Таймаут генерации ИИ для чата {chat_id}")
+                reply = None
             except Exception as e:
-                logging.error(f"ai_generate_task error: {e}")
+                logging.error(f"[AI Twin] Ошибка генерации ИИ для чата {chat_id}: {e}")
                 reply = None
 
             if not reply or reply == "⏳": return
@@ -916,6 +923,8 @@ def register_userbot(app: Client, bot: Bot):
                 logging.error(_("ai_log_chat_error", chat_id=chat_id, e=str(e)))
             except: pass
         finally:
+            elapsed = time.time() - start_time
+            logging.info(f"[AI Twin] Завершение обработки чата {chat_id}, время: {elapsed:.1f}с")
             for p in media_paths_to_cleanup:
                 if p and os.path.exists(p):
                     try: 

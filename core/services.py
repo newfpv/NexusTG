@@ -205,26 +205,33 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                     client = genai.Client(api_key=api_key)
                     got_response = False
                     
-                    async def _stream_with_timeout():
-                        async for chunk in client.aio.models.generate_content_stream(
-                            model=model_name,
-                            contents=contents,
-                            config=get_model_config(search_enabled=actual_search)
-                        ):
-                            yield chunk
+                    stream = client.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=contents,
+                        config=get_model_config(search_enabled=actual_search)
+                    )
                     
                     try:
-                        async for chunk in asyncio.wait_for(_stream_with_timeout(), timeout=GEMINI_TIMEOUT * 2):
+                        while True:
+                            try:
+                                chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
+                            except StopAsyncIteration:
+                                break
+                                
                             if chunk.text and chunk.text.strip():
                                 if not got_response:
                                     logging.info(_("log_ai_generated", model=model_name, search="on" if actual_search else "off"))
                                     got_response = True
                                     circuit_failures[api_key] = 0
                                 yield chunk.text
-                        if got_response: return
+                                
+                        if got_response: 
+                            return
+                            
                     except asyncio.TimeoutError:
                         _record_failure(api_key)
-                        if got_response: return
+                        if got_response: 
+                            return
                         continue
                         
                 except Exception as e:
@@ -403,20 +410,36 @@ async def build_dialog_context(client, chat_id: int, limit: int, target_msg_id: 
         media_tasks = []
 
         async def fetch_audio(msg):
-            m_ext = ".ogg" if msg.voice else ".mp4"
-            dl_path = await client.download_media(msg, file_name=f"data/{msg.id}_audio{m_ext}")
-            if dl_path:
-                media_paths_to_cleanup.append(dl_path)
-                transc = await transcribe_media(dl_path)
-                if transc: await repo.save_media_memory(msg.id, "transcript", transc)
+            try:
+                m_ext = ".ogg" if msg.voice else ".mp4"
+                dl_path = await asyncio.wait_for(
+                    client.download_media(msg, file_name=f"data/{msg.id}_audio{m_ext}"),
+                    timeout=30.0
+                )
+                if dl_path:
+                    media_paths_to_cleanup.append(dl_path)
+                    transc = await transcribe_media(dl_path)
+                    if transc: await repo.save_media_memory(msg.id, "transcript", transc)
+            except asyncio.TimeoutError:
+                logging.warning(f"Таймаут скачивания аудио msg_id={msg.id}")
+            except Exception as e:
+                logging.error(f"Ошибка скачивания аудио: {e}")
 
         async def fetch_video(msg):
-            m_ext = ".jpg" if msg.photo else ".mp4"
-            dl_path = await client.download_media(msg, file_name=f"data/{msg.id}_media{m_ext}")
-            if dl_path:
-                media_paths_to_cleanup.append(dl_path)
-                desc = await generate_media_description(dl_path)
-                if desc: await repo.save_media_memory(msg.id, "description", desc)
+            try:
+                m_ext = ".jpg" if msg.photo else ".mp4"
+                dl_path = await asyncio.wait_for(
+                    client.download_media(msg, file_name=f"data/{msg.id}_media{m_ext}"),
+                    timeout=30.0
+                )
+                if dl_path:
+                    media_paths_to_cleanup.append(dl_path)
+                    desc = await generate_media_description(dl_path)
+                    if desc: await repo.save_media_memory(msg.id, "description", desc)
+            except asyncio.TimeoutError:
+                logging.warning(f"Таймаут скачивания видео msg_id={msg.id}")
+            except Exception as e:
+                logging.error(f"Ошибка скачивания видео: {e}")
 
         for msg in messages:
             is_ignored_msg = False

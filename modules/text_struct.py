@@ -45,7 +45,7 @@ async def get_settings_buttons() -> list:
 
 @router.callback_query(F.data.in_({"ts_main", "ts_toggle"}))
 async def ts_menu_or_toggle(call: types.CallbackQuery, state: FSMContext):
-    if call.data == "ts_toggle":ы
+    if call.data == "ts_toggle":
     cfg = await _get_cfg()
     await CoreAPI.update_module_cfg(MODULE_NAME, is_active=not cfg["is_active"])
         
