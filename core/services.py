@@ -7,7 +7,7 @@ import requests
 import yt_dlp
 from google import genai
 from google.genai import types as genai_types
-from typing import AsyncIterable
+from typing import AsyncIterable, Optional
 from datetime import timezone
 
 from core.config import _
@@ -33,8 +33,21 @@ def get_model_config(search_enabled=True):
         tools=tools
     )
 
+def extract_retry_delay(error_message: str) -> int:
+    """Извлекает время задержки из ошибки 429"""
+    # Формат: 'retryDelay': '50s' или "retryDelay": "50s"
+    match = re.search(r"['\"]retryDelay['\"]:\s*['\"](\d+)s['\"]", error_message)
+    if match:
+        return int(match.group(1))
+    # Формат: retry in 50.7s или Please retry in 50s
+    match = re.search(r"retry\s+in\s+(\d+\.?\d*)s", error_message, re.IGNORECASE)
+    if match:
+        return int(float(match.group(1)))
+    # Стандартное значение по документации Gemini (обычно 60с для 429)
+    return 60
+
 async def _call_gemini_with_timeout(client, model_name, contents, config):
-    """Улучшенная версия с принудительным закрытием при таймауте"""
+    """Улучшенная версия с пробросом исключений для обработки вне"""
     try:
         task = asyncio.create_task(
             client.aio.models.generate_content(
@@ -53,9 +66,7 @@ async def _call_gemini_with_timeout(client, model_name, contents, config):
             except asyncio.CancelledError:
                 pass
         return None
-    except Exception as e:
-        logging.error(f"Ошибка Gemini: {e}")
-        return None
+    # НЕ ловим здесь другие исключения - пусть летят вверх для обработки 429!
 
 def _check_circuit_breaker(api_key: str) -> bool:
     now = time.time()
@@ -136,31 +147,40 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                         continue
                         
                 except Exception as e:
-                    err_str = str(e).lower()
+                    err_str = str(e)
+                    err_lower = err_str.lower()
                     new_exh = dict(state.exhausted_models or {})
                     new_s_exh = dict(state.search_exhausted_models or {})
                     key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
                     
-                    if any(x in err_str for x in ["500", "503", "502"]):
+                    # Обработка ошибок 5xx - бан модели на всех ключах
+                    if any(x in err_lower for x in ["500", "503", "502"]):
                         _record_failure(api_key)
+                        ban_until = current_time + 180  # 3 минуты на перегрузку
                         for k in api_keys:
                             k_state = await repo.get_ai_key_state(k)
                             k_exh = dict(k_state.exhausted_models or {})
-                            k_exh[model_name] = current_time + 180
+                            k_exh[model_name] = ban_until
                             await repo.update_ai_key_state(k, exhausted_models=k_exh)
                         logging.warning(_("log_model_banned_global", model=model_name))
                         break 
-                        
-                    elif "429" in err_str:
+                    
+                    # ОБРАБОТКА 429 - КВОТА ИСЧЕРПАНА
+                    elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                         _record_failure(api_key)
-                        if "search" in err_str or "grounding" in err_str:
-                            new_s_exh[model_name] = current_time + 60
+                        
+                        # Извлекаем время задержки из ошибки
+                        retry_delay = extract_retry_delay(err_str)
+                        ban_until = current_time + retry_delay
+                        
+                        if "search" in err_lower or "grounding" in err_lower:
+                            new_s_exh[model_name] = ban_until
                             await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
-                            logging.warning(_("log_model_banned_search", model=model_name, key=key_hidden))
+                            logging.warning(f"⛔️ Поиск для {model_name} на ключе {key_hidden} отложен на {retry_delay}с (429 Quota)")
                         else:
-                            new_exh[model_name] = current_time + 60
+                            new_exh[model_name] = ban_until
                             await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
-                            logging.warning(_("log_model_banned_local", model=model_name, key=key_hidden))
+                            logging.warning(f"⛔️ Модель {model_name} на ключе {key_hidden} отложена на {retry_delay}с (429 Quota)")
                             
                     elif "400" in err_str:
                         await repo.update_ai_key_state(api_key, unban_time=current_time + 10)
@@ -246,31 +266,38 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                         continue
                         
                 except Exception as e:
-                    err_str = str(e).lower()
+                    err_str = str(e)
+                    err_lower = err_str.lower()
                     new_exh = dict(state.exhausted_models or {})
                     new_s_exh = dict(state.search_exhausted_models or {})
                     key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
                     
-                    if any(x in err_str for x in ["500", "503", "502"]):
+                    # Обработка 5xx
+                    if any(x in err_lower for x in ["500", "503", "502"]):
                         _record_failure(api_key)
+                        ban_until = current_time + 180
                         for k in api_keys:
                             k_state = await repo.get_ai_key_state(k)
                             k_exh = dict(k_state.exhausted_models or {})
-                            k_exh[model_name] = current_time + 180
+                            k_exh[model_name] = ban_until
                             await repo.update_ai_key_state(k, exhausted_models=k_exh)
                         logging.warning(_("log_model_banned_global", model=model_name))
                         break 
-                        
-                    elif "429" in err_str:
+                    
+                    # ОБРАБОТКА 429 в стриме
+                    elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                         _record_failure(api_key)
-                        if "search" in err_str or "grounding" in err_str:
-                            new_s_exh[model_name] = current_time + 60
+                        retry_delay = extract_retry_delay(err_str)
+                        ban_until = current_time + retry_delay
+                        
+                        if "search" in err_lower or "grounding" in err_lower:
+                            new_s_exh[model_name] = ban_until
                             await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
-                            logging.warning(_("log_model_banned_search", model=model_name, key=key_hidden))
+                            logging.warning(f"⛔️ Поиск для {model_name} на ключе {key_hidden} отложен на {retry_delay}с (429)")
                         else:
-                            new_exh[model_name] = current_time + 60
+                            new_exh[model_name] = ban_until
                             await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
-                            logging.warning(_("log_model_banned_local", model=model_name, key=key_hidden))
+                            logging.warning(f"⛔️ Модель {model_name} на ключе {key_hidden} отложена на {retry_delay}с (429)")
                             
                     elif "400" in err_str:
                         await repo.update_ai_key_state(api_key, unban_time=current_time + 10)

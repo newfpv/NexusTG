@@ -3,12 +3,15 @@ import asyncio
 import random
 import logging
 import html
+import time
 from datetime import datetime, timedelta
 import aiosqlite
+
 from aiogram import Router, F, types, Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+
 from pyrogram import Client, filters
 from pyrogram.types import User, ChatPrivileges
 from pyrogram.enums import ChatType
@@ -24,7 +27,10 @@ CACHE_DIR = "data/spy_cache/"
 router = Router()
 userbot_app = None
 
+db_conn = None
 db_lock = asyncio.Lock()
+alert_queue = asyncio.Queue()
+background_tasks = set()
 
 class SaverStates(StatesGroup):
     wait_dump_chat = State()
@@ -33,31 +39,87 @@ class SaverStates(StatesGroup):
     wait_delay = State()
     wait_limits = State()
 
+async def cache_garbage_collector():
+    while True:
+        try:
+            if not os.path.exists(CACHE_DIR):
+                await asyncio.sleep(12 * 3600)
+                continue
+
+            valid_files = set()
+            async with db_lock:
+                if db_conn:
+                    async with db_conn.execute("SELECT file_path FROM msg_cache WHERE file_path IS NOT NULL AND file_path != ''") as cursor:
+                        async for row in cursor:
+                            if row[0]:
+                                valid_files.add(os.path.basename(row[0]))
+
+            cleaned = 0
+            for filename in os.listdir(CACHE_DIR):
+                if filename not in valid_files:
+                    file_path = os.path.join(CACHE_DIR, filename)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                            cleaned += 1
+                    except Exception:
+                        pass
+
+            if cleaned > 0:
+                logging.info(f"[Saver GC] Removed {cleaned} orphaned files.")
+        except Exception as e:
+            logging.error(f"[Saver GC] Error: {e}")
+        
+        await asyncio.sleep(12 * 3600)
+
+async def alert_worker(bot: Bot, app: Client):
+    while True:
+        try:
+            task_data = await alert_queue.get()
+            dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl = task_data
+            
+            await execute_alert(bot, app, dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl)
+            
+            alert_queue.task_done()
+            await asyncio.sleep(2.5) 
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.error(f"[Saver Worker] Error: {e}")
+
 async def on_startup():
+    global db_conn
     os.makedirs("data", exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+    db_conn = await aiosqlite.connect(DB_FILE, timeout=20.0)
+    await db_conn.execute("PRAGMA journal_mode=WAL;")
+    await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
     async with db_lock:
-        async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-            await db.execute("PRAGMA journal_mode=WAL;")
-            await db.execute("PRAGMA synchronous=NORMAL;")
-            await db.execute("""CREATE TABLE IF NOT EXISTS msg_cache (
-                                message_id INTEGER,
-                                chat_id INTEGER,
-                                user_id INTEGER,
-                                user_name TEXT,
-                                text TEXT,
-                                media_type TEXT,
-                                file_path TEXT,
-                                is_ttl INTEGER DEFAULT 0,
-                                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                                PRIMARY KEY (message_id, chat_id))""")
-            
-            await db.execute("""CREATE TABLE IF NOT EXISTS topics (
-                                user_id INTEGER PRIMARY KEY,
-                                topic_id INTEGER,
-                                user_name TEXT)""")
-            await db.commit()
+        await db_conn.execute("""CREATE TABLE IF NOT EXISTS msg_cache (
+                            message_id INTEGER,
+                            chat_id INTEGER,
+                            user_id INTEGER,
+                            user_name TEXT,
+                            text TEXT,
+                            media_type TEXT,
+                            file_path TEXT,
+                            is_ttl INTEGER DEFAULT 0,
+                            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (message_id, chat_id))""")
+        
+        await db_conn.execute("""CREATE TABLE IF NOT EXISTS topics (
+                            user_id INTEGER PRIMARY KEY,
+                            topic_id INTEGER,
+                            user_name TEXT)""")
+        await db_conn.commit()
+
+    gc_task = asyncio.create_task(cache_garbage_collector())
+    background_tasks.add(gc_task)
+    gc_task.add_done_callback(background_tasks.discard)
+
+    logging.info("[Saver] Database connection established.")
 
 async def _get_cfg():
     s = await CoreAPI.get_module_cfg("saver")
@@ -150,7 +212,11 @@ async def saver_auto_setup(call: types.CallbackQuery, state: FSMContext):
         bot_username = bot_info.username
         
         chat = await userbot_app.create_supergroup(_("saver_dump_title"), _("saver_dump_desc"))
+        await asyncio.sleep(2.0)
+        
         await userbot_app.add_chat_members(chat.id, bot_username)
+        await asyncio.sleep(2.0)
+        
         await userbot_app.promote_chat_member(
             chat.id, 
             bot_username, 
@@ -160,6 +226,7 @@ async def saver_auto_setup(call: types.CallbackQuery, state: FSMContext):
                 can_invite_users=True, can_pin_messages=True, can_manage_topics=True
             )
         )
+        await asyncio.sleep(2.0)
         
         try:
             peer = await userbot_app.resolve_peer(chat.id)
@@ -170,14 +237,16 @@ async def saver_auto_setup(call: types.CallbackQuery, state: FSMContext):
                 except TypeError:
                     await userbot_app.invoke(ToggleForum(channel=channel, enabled=True))
         except Exception as e:
-            logging.error(_("log_toggle_forum_error", e=e))
+            logging.error(f"[Saver] Error while toggling forum: {e}")
+            
+        await asyncio.sleep(3.0) 
             
         await _upd_cfg(dump_chat_id=str(chat.id))
         await call.answer(_("saver_auto_success"), show_alert=True)
         await saver_menu(call, state)
         
     except Exception as e:
-        logging.error(_("log_auto_setup_error", e=e))
+        logging.error(f"[Saver] Auto-setup error: {e}")
         await safe_edit(call.message, state, _("saver_auto_error", e=str(e)), get_back_kb("saver_edit_dump"), parse_mode="HTML")
 
 @router.callback_query(F.data == "saver_list_dumps")
@@ -197,7 +266,7 @@ async def saver_list_dumps(call: types.CallbackQuery, state: FSMContext):
                 count += 1
                 if count >= 15: break
     except Exception as e:
-        logging.error(_("log_dialog_fetch_error", e=e))
+        logging.error(f"[Saver] Error fetching dialogs: {e}")
         
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back"), callback_data="saver_edit_dump")])
     await safe_edit(call.message, state, _("saver_select_dump_title"), kb, parse_mode="HTML")
@@ -209,7 +278,9 @@ async def saver_set_dump(call: types.CallbackQuery, state: FSMContext):
     if userbot_app and userbot_app.is_connected:
         try:
             bot_info = await call.bot.get_me()
-            try: await userbot_app.add_chat_members(chat_id, bot_info.username)
+            try: 
+                await userbot_app.add_chat_members(chat_id, bot_info.username)
+                await asyncio.sleep(1.0)
             except Exception: pass
             
             try:
@@ -221,6 +292,7 @@ async def saver_set_dump(call: types.CallbackQuery, state: FSMContext):
                         can_invite_users=True, can_pin_messages=True, can_manage_topics=True
                     )
                 )
+                await asyncio.sleep(1.0)
             except Exception: pass
             
             try:
@@ -232,9 +304,10 @@ async def saver_set_dump(call: types.CallbackQuery, state: FSMContext):
                     except TypeError:
                         await userbot_app.invoke(ToggleForum(channel=channel, enabled=True))
             except Exception as e:
-                logging.error(_("log_set_dump_toggle_forum_error", e=e))
+                logging.error(f"[Saver] Forum toggle error: {e}")
         except Exception: pass
 
+    await asyncio.sleep(2.0)
     await _upd_cfg(dump_chat_id=str(chat_id))
     await call.answer(_("saver_auto_success"), show_alert=False)
     await saver_menu(call, state)
@@ -321,9 +394,11 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
     action_delay = 1.5 
     
     async with db_lock:
-        async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-            cursor = await db.execute("SELECT topic_id, user_name FROM topics WHERE user_id = ?", (user_id,))
+        if db_conn:
+            cursor = await db_conn.execute("SELECT topic_id, user_name FROM topics WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
+        else:
+            return None
 
     topic_id = row[0] if row else None
     db_user_name = row[1] if row and len(row) > 1 else ""
@@ -332,7 +407,8 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
         try:
             await asyncio.sleep(action_delay)
             user_obj = await app.get_users(user_id)
-        except Exception: pass
+        except Exception: 
+            pass
 
     full_name = _("status_unknown")
     if user_obj:
@@ -348,12 +424,11 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
                 await asyncio.sleep(action_delay)
                 await bot.edit_forum_topic(chat_id=dump_chat_id, message_thread_id=topic_id, name=topic_title)
                 async with db_lock:
-                    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-                        await db.execute("UPDATE topics SET user_name = ? WHERE user_id = ?", (full_name, user_id))
-                        await db.commit()
+                    await db_conn.execute("UPDATE topics SET user_name = ? WHERE user_id = ?", (full_name, user_id))
+                    await db_conn.commit()
             except Exception as e:
                 if "NOT_MODIFIED" not in str(e).upper():
-                    logging.error(_("log_topic_rename_error", e=e))
+                    logging.error(f"[Saver] Error renaming topic: {e}")
         return topic_id
 
     try:
@@ -362,9 +437,8 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
         topic_id = new_topic.message_thread_id
 
         async with db_lock:
-            async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-                await db.execute("INSERT INTO topics (user_id, topic_id, user_name) VALUES (?, ?, ?)", (user_id, topic_id, full_name))
-                await db.commit()
+            await db_conn.execute("INSERT INTO topics (user_id, topic_id, user_name) VALUES (?, ?, ?)", (user_id, topic_id, full_name))
+            await db_conn.commit()
 
         username = f"@{user_obj.username}" if user_obj and user_obj.username else _("info_hidden_none")
         phone = f"+{user_obj.phone_number}" if user_obj and getattr(user_obj, "phone_number", None) else _("info_hidden_none")
@@ -380,10 +454,11 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
                 photos = [p async for p in app.get_chat_photos(user_id, limit=1)]
                 if photos:
                     photo_path = await app.download_media(photos[0].file_id)
-                    msg = await bot.send_photo(chat_id=dump_chat_id, message_thread_id=topic_id, photo=FSInputFile(photo_path), caption=profile_text, parse_mode="HTML")
-                    os.remove(photo_path)
-            except Exception as e:
-                logging.warning(_("log_avatar_fetch_error", e=e))
+                    if photo_path and os.path.exists(photo_path):
+                        msg = await bot.send_photo(chat_id=dump_chat_id, message_thread_id=topic_id, photo=FSInputFile(photo_path), caption=profile_text, parse_mode="HTML")
+                        os.remove(photo_path)
+            except Exception:
+                pass
 
         if not msg:
             msg = await bot.send_message(chat_id=dump_chat_id, message_thread_id=topic_id, text=profile_text, parse_mode="HTML")
@@ -392,17 +467,15 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
             try:
                 await asyncio.sleep(action_delay)
                 await bot.pin_chat_message(chat_id=dump_chat_id, message_id=msg.message_id, disable_notification=True)
-            except Exception: pass
+            except Exception:
+                pass
 
         return topic_id
     except Exception as e:
-        logging.error(_("log_topic_create_error", e=e))
+        logging.error(f"[Saver] Error creating topic: {e}")
         return None
 
-async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, topic_id: int, text: str, file_path: str, media_type: str, d_min: float, d_max: float, delete_file_after=False, is_ttl=False, parse_mode=None):
-    delay_sec = random.randint(int(d_min * 60), int(d_max * 60))
-    await asyncio.sleep(delay_sec)
-    
+async def execute_alert(bot: Bot, app: Client, chat_id: int, user_id: int, topic_id: int, text: str, file_path: str, media_type: str, delete_file_after=False, is_ttl=False):
     async def _send(t_id):
         if file_path and os.path.exists(file_path):
             file_obj = FSInputFile(file_path)
@@ -411,12 +484,12 @@ async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, 
             if media_type == "video_note":
                 await bot.send_video_note(video_note=file_obj, **kwargs)
                 if text and text.strip():
-                    await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=text, parse_mode=parse_mode)
+                    await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=text, parse_mode="HTML")
                 return
             
             if text and text.strip():
                 kwargs["caption"] = text
-            if parse_mode: kwargs["parse_mode"] = parse_mode
+            kwargs["parse_mode"] = "HTML"
             
             if media_type == "photo":
                 if is_ttl: kwargs["has_spoiler"] = True
@@ -431,7 +504,7 @@ async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, 
             else:
                 msg_txt = text or ""
                 if msg_txt.strip():
-                    return await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=msg_txt, parse_mode=parse_mode)
+                    return await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=msg_txt, parse_mode="HTML")
         else:
             msg_txt = text or ""
             if media_type:
@@ -440,33 +513,39 @@ async def send_alert_delayed(bot: Bot, app: Client, chat_id: int, user_id: int, 
                 msg_txt += _("saver_alert_no_media")
                 
             if msg_txt.strip():
-                return await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=msg_txt, parse_mode=parse_mode)
+                return await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=msg_txt, parse_mode="HTML")
 
     try:
         await _send(topic_id)
     except Exception as e:
         if any(x in str(e).upper() for x in ["THREAD", "TOPIC", "PEER_ID_INVALID"]):
             async with db_lock:
-                async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-                    await db.execute("DELETE FROM topics WHERE user_id = ?", (user_id,))
-                    await db.commit()
+                await db_conn.execute("DELETE FROM topics WHERE user_id = ?", (user_id,))
+                await db_conn.commit()
             new_topic_id = await get_or_create_topic(app, bot, chat_id, user_id)
             if new_topic_id:
-                try: await _send(new_topic_id)
-                except Exception: pass
+                try: 
+                    await _send(new_topic_id)
+                except Exception as ex: 
+                    logging.error(f"[Saver] Failed to send even after recreating topic: {ex}")
         else:
-            logging.error(_("log_topic_create_error", e=str(e)))
+            logging.error(f"[Saver] Error sending alert to topic: {e}")
     finally:
         if delete_file_after and file_path and os.path.exists(file_path):
             try: 
                 os.remove(file_path)
                 dir_path = os.path.dirname(file_path)
                 if os.path.exists(dir_path) and not os.listdir(dir_path): os.rmdir(dir_path)
-            except Exception: pass
+            except Exception: 
+                pass
 
 def register_userbot(app: Client, bot: Bot):
     global userbot_app
     userbot_app = app
+    
+    worker_task = asyncio.create_task(alert_worker(bot, app))
+    background_tasks.add(worker_task)
+    worker_task.add_done_callback(background_tasks.discard)
     
     async def process_caching(client, message, cfg):
         user = message.from_user
@@ -481,40 +560,44 @@ def register_userbot(app: Client, bot: Bot):
                 if getattr(obj, "view_once", False) or getattr(message, "view_once", False): is_ttl = True
                 break
                 
-        size_mb = getattr(media_obj, "file_size", 0) / (1024 * 1024) if media_obj else 0
+        size_mb = 0
+        if media_obj and hasattr(media_obj, "file_size") and media_obj.file_size:
+            size_mb = media_obj.file_size / (1024 * 1024)
+            
         limit_mb = cfg["limit_ttl"] if is_ttl else cfg["limit_reg"]
         file_path = ""
         
         if media_obj and size_mb <= limit_mb:
-            try: file_path = await message.download(file_name=f"{CACHE_DIR}{message.chat.id}_{message.id}/")
-            except Exception: pass
+            try: 
+                target_path = os.path.join(CACHE_DIR, f"{message.chat.id}_{message.id}_{media_type}")
+                file_path = await message.download(file_name=target_path)
+            except Exception:
+                pass
             
         if not is_ttl:
             async with db_lock:
-                async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-                    await db.execute("INSERT OR REPLACE INTO msg_cache (message_id, chat_id, user_id, user_name, text, media_type, file_path, is_ttl) VALUES (?, ?, ?, ?, ?, ?, ?, 0)", 
-                                     (message.id, message.chat.id, user.id, user.first_name, text, media_type, file_path))
-                    
-                    if random.randint(1, 100) == 1:
-                        cutoff = datetime.now() - timedelta(days=180)
-                        async with db.execute("SELECT file_path FROM msg_cache WHERE timestamp < ?", (cutoff,)) as cursor:
-                            async for row in cursor:
-                                if row[0] and os.path.exists(row[0]):
-                                    try:
-                                        os.remove(row[0])
-                                        dir_p = os.path.dirname(row[0])
-                                        if os.path.exists(dir_p) and not os.listdir(dir_p): os.rmdir(dir_p)
-                                    except Exception: pass
-                        await db.execute("DELETE FROM msg_cache WHERE timestamp < ?", (cutoff,))
-                    await db.commit()
+                await db_conn.execute("INSERT OR REPLACE INTO msg_cache (message_id, chat_id, user_id, user_name, text, media_type, file_path, is_ttl) VALUES (?, ?, ?, ?, ?, ?, ?, 0)", 
+                                 (message.id, message.chat.id, user.id, user.first_name, text, media_type, file_path))
+                
+                if random.randint(1, 100) == 1:
+                    await db_conn.execute("DELETE FROM msg_cache WHERE timestamp < datetime('now', '-180 days')")
+                await db_conn.commit()
                 
         if is_ttl and cfg["save_ttl"]:
             try: dump_chat_id = int(cfg["dump_chat_id"])
             except Exception: return
             
+            async with db_lock:
+                await db_conn.execute("INSERT OR REPLACE INTO msg_cache (message_id, chat_id, user_id, user_name, text, media_type, file_path, is_ttl) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", 
+                                 (message.id, message.chat.id, user.id, user.first_name, text, media_type, file_path))
+                await db_conn.commit()
+
             if dump_chat_id:
                 topic_id = await get_or_create_topic(app, bot, dump_chat_id, user.id, user_obj=user)
-                asyncio.create_task(send_alert_delayed(bot, app, dump_chat_id, user.id, topic_id, text, file_path, media_type, cfg["delay_min"], cfg["delay_max"], delete_file_after=True, is_ttl=True, parse_mode=None))
+                if topic_id:
+                    safe_ttl_txt = html.escape(text) if text else ""
+                    await alert_queue.put((dump_chat_id, user.id, topic_id, safe_ttl_txt, file_path, media_type, True, is_ttl))
+                    logging.info(f"[Saver] Сохранено TTL-медиа {message.id} от пользователя {user.id}")
 
     @app.on_message(filters.private & ~filters.bot & ~filters.me, group=-5)
     async def incoming_messages_handler(client, message):
@@ -533,7 +616,9 @@ def register_userbot(app: Client, bot: Bot):
         targets = cfg["target_chats"]
         if targets and str(message.chat.id) not in [x.strip() for x in targets.split(",") if x.strip()]: return
         
-        asyncio.create_task(process_caching(client, message, cfg))
+        task = asyncio.create_task(process_caching(client, message, cfg))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     @app.on_deleted_messages()
     async def handle_deleted_messages(client, messages):
@@ -542,26 +627,36 @@ def register_userbot(app: Client, bot: Bot):
         try: dump_id = int(cfg["dump_chat_id"])
         except Exception: return
         
+        msgs_to_process = []
         async with db_lock:
-            async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-                for msg in messages:
-                    if msg.chat and msg.chat.type != ChatType.PRIVATE: continue
-                    if msg.chat: cursor = await db.execute("SELECT user_id, text, media_type, file_path, is_ttl FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, msg.chat.id))
-                    else: cursor = await db.execute("SELECT user_id, text, media_type, file_path, is_ttl FROM msg_cache WHERE message_id = ? ORDER BY timestamp DESC LIMIT 1", (msg.id,))
-                    
-                    row = await cursor.fetchone()
-                    if row and row[4] != 1:
-                        u_id, txt, m_type, f_path, db_is_ttl = row
-                        topic_id = await get_or_create_topic(app, bot, dump_id, u_id)
+            for msg in messages:
+                if msg.chat and msg.chat.type != ChatType.PRIVATE: continue
+                
+                if msg.chat: cursor = await db_conn.execute("SELECT user_id, text, media_type, file_path, is_ttl FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, msg.chat.id))
+                else: cursor = await db_conn.execute("SELECT user_id, text, media_type, file_path, is_ttl FROM msg_cache WHERE message_id = ? ORDER BY timestamp DESC LIMIT 1", (msg.id,))
+                
+                row = await cursor.fetchone()
+                if row:
+                    msgs_to_process.append((msg, row))
                         
-                        async def delayed_clean(m_id, c_id):
-                            await send_alert_delayed(bot, app, dump_id, u_id, topic_id, txt, f_path, m_type, cfg["delay_min"], cfg["delay_max"], delete_file_after=True, is_ttl=False, parse_mode=None)
-                            if c_id: 
-                                async with db_lock:
-                                    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db2: 
-                                        await db2.execute("DELETE FROM msg_cache WHERE message_id = ? AND chat_id = ?", (m_id, c_id))
-                                        await db2.commit()
-                        asyncio.create_task(delayed_clean(msg.id, getattr(msg.chat, 'id', None)))
+        for msg, row in msgs_to_process:
+            u_id, txt, m_type, f_path, db_is_ttl = row
+            
+            if db_is_ttl == 1:
+                continue
+                
+            topic_id = await get_or_create_topic(app, bot, dump_id, u_id)
+            
+            if topic_id:
+                safe_txt = html.escape(txt) if txt else ""
+                await alert_queue.put((dump_id, u_id, topic_id, safe_txt, f_path, m_type, True, False))
+                logging.info(f"[Saver] Сохранено удаленное сообщение {msg.id} от пользователя {u_id}")
+                
+                c_id = getattr(msg.chat, 'id', None)
+                if c_id: 
+                    async with db_lock:
+                        await db_conn.execute("DELETE FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, c_id))
+                        await db_conn.commit()
 
     @app.on_edited_message(filters.private & ~filters.bot & ~filters.me)
     async def handle_edited_messages(client, message):
@@ -575,18 +670,21 @@ def register_userbot(app: Client, bot: Bot):
         except Exception: return
         if message.chat.id == dump_id: return
         
+        row = None
         async with db_lock:
-            async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-                cursor = await db.execute("SELECT text, media_type, file_path FROM msg_cache WHERE message_id = ? AND chat_id = ?", (message.id, message.chat.id))
-                row = await cursor.fetchone()
-                if row:
-                    old_t, m_type, f_path = row
-                    new_t = message.text or message.caption or ""
-                    if old_t != new_t:
-                        topic_id = await get_or_create_topic(app, bot, dump_id, user.id, user_obj=user)
-                        alert_txt = _("saver_alert_edited", old=html.escape(old_t), new=html.escape(new_t))
-                        
-                        asyncio.create_task(send_alert_delayed(bot, app, dump_id, user.id, topic_id, alert_txt, f_path, m_type, cfg["delay_min"], cfg["delay_max"], delete_file_after=False, is_ttl=False, parse_mode="HTML"))
-                        
-                        await db.execute("UPDATE msg_cache SET text = ? WHERE message_id = ? AND chat_id = ?", (new_t, message.id, message.chat.id))
-                        await db.commit()
+            cursor = await db_conn.execute("SELECT text, media_type, file_path FROM msg_cache WHERE message_id = ? AND chat_id = ?", (message.id, message.chat.id))
+            row = await cursor.fetchone()
+                
+        if row:
+            old_t, m_type, f_path = row
+            new_t = message.text or message.caption or ""
+            if old_t != new_t:
+                topic_id = await get_or_create_topic(app, bot, dump_id, user.id, user_obj=user)
+                if topic_id:
+                    alert_txt = _("saver_alert_edited", old=html.escape(old_t), new=html.escape(new_t))
+                    await alert_queue.put((dump_id, user.id, topic_id, alert_txt, f_path, m_type, False, False))
+                    logging.info(f"[Saver] Сохранено измененное сообщение {message.id} от пользователя {user.id}")
+                    
+                async with db_lock:
+                    await db_conn.execute("UPDATE msg_cache SET text = ? WHERE message_id = ? AND chat_id = ?", (new_t, message.id, message.chat.id))
+                    await db_conn.commit()
