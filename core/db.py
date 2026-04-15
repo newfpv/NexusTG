@@ -1,4 +1,3 @@
-# core/db.py
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -8,7 +7,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.orm.attributes import flag_modified
 from core.config import DB_PATH
 
-engine = create_async_engine(DB_PATH, echo=False)
+engine = create_async_engine(
+    DB_PATH, 
+    echo=False,
+    connect_args={"timeout": 20.0, "check_same_thread": False}
+)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 class Base(DeclarativeBase): pass
@@ -233,7 +236,13 @@ class CoreRepository:
 async def init_db():
     os.makedirs("data", exist_ok=True)
     async with engine.begin() as conn:
+        await conn.execute(text("PRAGMA journal_mode=WAL;"))
+        await conn.execute(text("PRAGMA synchronous=NORMAL;"))
+        await conn.execute(text("PRAGMA cache_size=10000;"))
+        await conn.execute(text("PRAGMA temp_store=memory;"))
+        
         await conn.run_sync(Base.metadata.create_all)
+        
         try:
             await conn.execute(text("ALTER TABLE global_config ADD COLUMN admin_menu_id INTEGER"))
             await conn.commit()

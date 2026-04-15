@@ -227,6 +227,28 @@ async def stop_userbot():
         await userbot_app.stop()
         userbot_app = None
 
+async def userbot_health_monitor():
+    global userbot_app
+    fail_count = 0
+    while True:
+        await asyncio.sleep(30)
+        if userbot_app:
+            if not userbot_app.is_connected:
+                fail_count += 1
+                logging.error(_("log_userbot_disconnect_detected", fails=fail_count))
+                if fail_count >= 3:
+                    logging.critical(_("log_userbot_restarting"))
+                    try:
+                        await stop_userbot()
+                        config = await plugins.db.get_global_config()
+                        if config and config.session_string:
+                            await start_userbot(config.session_string)
+                        fail_count = 0
+                    except Exception as e:
+                        logging.critical(_("log_userbot_restart_failed", e=e))
+            else:
+                fail_count = 0
+
 async def main():
     await init_db()
     
@@ -254,6 +276,9 @@ async def main():
         logging.info(_("log_session_found"))
         await start_userbot(config.session_string)
         
+    asyncio.create_task(userbot_health_monitor())
+    asyncio.create_task(plugins.cleanup_media_cache())
+    
     logging.info(_("log_polling_start"))
     await dp.start_polling(bot)
 

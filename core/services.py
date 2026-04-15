@@ -13,6 +13,13 @@ from datetime import timezone
 from core.config import _
 from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache
 
+GEMINI_TIMEOUT = 25.0
+MAX_RETRIES_PER_KEY = 2
+CIRCUIT_BREAKER_THRESHOLD = 5
+
+circuit_failures = {}
+circuit_last_failure = {}
+
 def get_model_config(search_enabled=True):
     tools = [{"google_search": {}}] if search_enabled else None
     return genai_types.GenerateContentConfig(
@@ -24,6 +31,36 @@ def get_model_config(search_enabled=True):
         ],
         tools=tools
     )
+
+async def _call_gemini_with_timeout(client, model_name, contents, config):
+    try:
+        return await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            ),
+            timeout=GEMINI_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logging.warning(_("log_gemini_timeout", model_name=model_name))
+        return None
+
+def _check_circuit_breaker(api_key: str) -> bool:
+    now = time.time()
+    failures = circuit_failures.get(api_key, 0)
+    last_fail = circuit_last_failure.get(api_key, 0)
+    
+    if failures >= CIRCUIT_BREAKER_THRESHOLD:
+        if now - last_fail < 300:
+            return False
+        circuit_failures[api_key] = 0
+    
+    return True
+
+def _record_failure(api_key: str):
+    circuit_failures[api_key] = circuit_failures.get(api_key, 0) + 1
+    circuit_last_failure[api_key] = time.time()
 
 async def generate_ai_response(prompt_context: str, media_path: str = None, custom_prompt: str = None, search_enabled: bool = True) -> str:
     logging.info(_("log_generate_start"))
@@ -55,6 +92,9 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
 
     for model_name in model_fallback_list:
         for api_key in api_keys:
+            if not _check_circuit_breaker(api_key):
+                continue
+                
             async with AsyncSessionLocal() as session:
                 repo = CoreRepository(session)
                 state = await repo.get_ai_key_state(api_key)
@@ -71,19 +111,19 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
 
                 try:
                     client = genai.Client(api_key=api_key)
-                    response = await asyncio.wait_for(
-                        client.aio.models.generate_content(
-                            model=model_name,
-                            contents=contents,
-                            config=get_model_config(search_enabled=actual_search)
-                        ),
-                        timeout=35.0
-                    )
+                    response = await _call_gemini_with_timeout(client, model_name, contents, get_model_config(search_enabled=actual_search))
+                    
+                    if response is None:
+                        _record_failure(api_key)
+                        continue
+                        
                     if response.text and response.text.strip():
                         logging.info(_("log_ai_generated", model=model_name, search="on" if actual_search else "off"))
+                        circuit_failures[api_key] = 0
                         return response.text
                     else:
                         continue
+                        
                 except Exception as e:
                     err_str = str(e).lower()
                     new_exh = dict(state.exhausted_models or {})
@@ -91,6 +131,7 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                     key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
                     
                     if any(x in err_str for x in ["500", "503", "502"]):
+                        _record_failure(api_key)
                         for k in api_keys:
                             k_state = await repo.get_ai_key_state(k)
                             k_exh = dict(k_state.exhausted_models or {})
@@ -100,6 +141,7 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                         break 
                         
                     elif "429" in err_str:
+                        _record_failure(api_key)
                         if "search" in err_str or "grounding" in err_str:
                             new_s_exh[model_name] = current_time + 60
                             await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
@@ -113,7 +155,8 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
                         await repo.update_ai_key_state(api_key, unban_time=current_time + 10)
                         
                     continue
-    return "⏳"
+                    
+    return _("status_waiting")
 
 async def generate_ai_response_stream(prompt_context: str, media_path: str = None, custom_prompt: str = None, search_enabled: bool = True) -> AsyncIterable[str]:
     logging.info(_("log_generate_start"))
@@ -141,6 +184,9 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
 
     for model_name in model_fallback_list:
         for api_key in api_keys:
+            if not _check_circuit_breaker(api_key):
+                continue
+                
             async with AsyncSessionLocal() as session:
                 repo = CoreRepository(session)
                 state = await repo.get_ai_key_state(api_key)
@@ -158,17 +204,29 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                 try:
                     client = genai.Client(api_key=api_key)
                     got_response = False
-                    async for chunk in client.aio.models.generate_content_stream(
-                        model=model_name,
-                        contents=contents,
-                        config=get_model_config(search_enabled=actual_search)
-                    ):
-                        if chunk.text and chunk.text.strip():
-                            if not got_response:
-                                logging.info(_("log_ai_generated", model=model_name, search="on" if actual_search else "off"))
-                                got_response = True
-                            yield chunk.text
-                    if got_response: return
+                    
+                    async def _stream_with_timeout():
+                        async for chunk in client.aio.models.generate_content_stream(
+                            model=model_name,
+                            contents=contents,
+                            config=get_model_config(search_enabled=actual_search)
+                        ):
+                            yield chunk
+                    
+                    try:
+                        async for chunk in asyncio.wait_for(_stream_with_timeout(), timeout=GEMINI_TIMEOUT * 2):
+                            if chunk.text and chunk.text.strip():
+                                if not got_response:
+                                    logging.info(_("log_ai_generated", model=model_name, search="on" if actual_search else "off"))
+                                    got_response = True
+                                    circuit_failures[api_key] = 0
+                                yield chunk.text
+                        if got_response: return
+                    except asyncio.TimeoutError:
+                        _record_failure(api_key)
+                        if got_response: return
+                        continue
+                        
                 except Exception as e:
                     err_str = str(e).lower()
                     new_exh = dict(state.exhausted_models or {})
@@ -176,6 +234,7 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                     key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
                     
                     if any(x in err_str for x in ["500", "503", "502"]):
+                        _record_failure(api_key)
                         for k in api_keys:
                             k_state = await repo.get_ai_key_state(k)
                             k_exh = dict(k_state.exhausted_models or {})
@@ -185,6 +244,7 @@ async def generate_ai_response_stream(prompt_context: str, media_path: str = Non
                         break 
                         
                     elif "429" in err_str:
+                        _record_failure(api_key)
                         if "search" in err_str or "grounding" in err_str:
                             new_s_exh[model_name] = current_time + 60
                             await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
@@ -232,11 +292,13 @@ async def test_ai_credentials(progress_cb=None) -> str:
 
             try:
                 client = genai.Client(api_key=key)
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     client.aio.models.generate_content(model=model, contents=[_("ping_prompt")]),
-                    timeout=12.0
+                    timeout=15.0
                 )
                 res_text = _("test_ok")
+            except asyncio.TimeoutError:
+                res_text = _("test_error") + " (timeout)"
             except Exception as e:
                 res_text = f"{_('test_error')} ({str(e)[:15]}...)"
             
@@ -255,7 +317,7 @@ async def transcribe_media(media_path: str) -> str:
             media_path=media_path, 
             search_enabled=False
         )
-        return text if text != "⏳" else ""
+        return text if text != _("status_waiting") else ""
     except Exception as e:
         logging.error(_("log_transcribe_error", e=e))
         return ""
@@ -307,7 +369,7 @@ async def get_youtube_context(url: str) -> tuple[int, str]:
 async def generate_media_description(media_path: str) -> str:
     try:
         res = await generate_ai_response(_("ai_media_desc_prompt"), media_path, search_enabled=False)
-        if not res or res == "⏳": return _("ai_media_desc_unavailable")
+        if not res or res == _("status_waiting"): return _("ai_media_desc_unavailable")
         return res
     except Exception: return _("ai_media_desc_failed")
 
@@ -374,7 +436,7 @@ async def build_dialog_context(client, chat_id: int, limit: int, target_msg_id: 
                 if not (target_msg_id and msg.id == target_msg_id):
                     if not await repo.get_media_memory(msg.id, "description"): media_tasks.append(fetch_video(msg))
 
-        if media_tasks: await asyncio.gather(*media_tasks)
+        if media_tasks: await asyncio.gather(*media_tasks, return_exceptions=True)
 
         for msg in messages:
             is_ignored_msg = False

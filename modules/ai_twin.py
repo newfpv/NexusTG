@@ -22,7 +22,7 @@ from pyrogram.types import ReplyParameters
 
 from core.db import AsyncSessionLocal, CoreRepository
 from core.services import generate_ai_response, transcribe_media, get_youtube_context, build_dialog_context
-from core.utils import safe_edit, plugins, simulate_human_typing
+from core.utils import safe_edit, plugins, simulate_human_typing, introduce_typo
 from core.config import _
 
 router = Router()
