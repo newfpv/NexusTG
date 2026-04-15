@@ -60,9 +60,7 @@ async def _get_g_cfg():
         return {
             "is_active": getattr(c, "global_ai_active", False),
             "search_enabled": getattr(c, "google_search", True),
-            
             "prompt": getattr(c, "global_prompt", None) or _("default_prompt_env"),
-            
             "typing_speed": getattr(c, "typing_speed", 0.08),
             "sleep_start": s_start,
             "sleep_end": s_end,
@@ -81,6 +79,7 @@ async def _get_g_cfg():
             "pmax": a.get("pmax", 2.0),
             "ai_debug": a.get("ai_debug", True) 
         }
+
 async def _upd_g_cfg(db_fields=None, **kwargs):
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
@@ -161,7 +160,7 @@ async def get_settings_buttons():
 @router.callback_query(F.data == "ai_global_settings")
 async def global_settings_menu(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(menu_msg_id=call.message.message_id)
-    cfg = await _get_g_cfg()
+    cfg = await _get_g_cfg()    
     
     g_ai_status = _("status_on") if cfg["is_active"] else _("status_off")
     search_status = _("status_on") if cfg["search_enabled"] else _("status_off")
@@ -696,8 +695,10 @@ def register_userbot(app: Client, bot: Bot):
     async def process_reply(client, message):
         chat_id = message.chat.id
         start_time = time.time()
+        
         logging.info(f"[AI Twin] Начало обработки чата {chat_id}")
         media_paths_to_cleanup = []
+        
         try:
             g_cfg = await _get_g_cfg()
             c_cfg = await _get_c_cfg(chat_id)
@@ -749,14 +750,30 @@ def register_userbot(app: Client, bot: Bot):
 
             chat_name = message.from_user.first_name if message.from_user else (message.chat.title or _("other_sender"))
             
-            history_str, new_paths, latest_media_duration, video_too_long = await build_dialog_context(client, chat_id, limit=50, target_msg_id=message.id, chat_name=chat_name)
-            media_paths_to_cleanup.extend(new_paths)
+            # Сбор контекста с таймаутом 3 минуты (увеличено)
+            try:
+                history_str, new_paths, latest_media_duration, video_too_long = await asyncio.wait_for(
+                    build_dialog_context(client, chat_id, limit=50, target_msg_id=message.id, chat_name=chat_name),
+                    timeout=180.0
+                )
+                media_paths_to_cleanup.extend(new_paths)
+            except asyncio.TimeoutError:
+                logging.error(f"[AI Twin] Таймаут сбора контекста чата {chat_id}")
+                return
 
+            # Скачивание живого медиа с таймаутом 2 минуты
             live_media_path = None
             if message.photo or message.video:
-                ext = ".jpg" if message.photo else ".mp4"
-                live_media_path = await message.download(file_name=f"data/live_{message.id}{ext}")
-                if live_media_path: media_paths_to_cleanup.append(live_media_path)
+                try:
+                    ext = ".jpg" if message.photo else ".mp4"
+                    live_media_path = await asyncio.wait_for(
+                        message.download(file_name=f"data/live_{message.id}{ext}"),
+                        timeout=120.0
+                    )
+                    if live_media_path: 
+                        media_paths_to_cleanup.append(live_media_path)
+                except asyncio.TimeoutError:
+                    logging.warning(f"[AI Twin] Таймаут скачивания медиа {chat_id}")
 
             full_history_str = _("ai_dialog_context_header", me=_("me_sender"), other=chat_name) + history_str
             
@@ -778,61 +795,85 @@ def register_userbot(app: Client, bot: Bot):
             if g_cfg["ai_debug"]:
                 logging.info("="*50)
                 logging.info(_("log_llm_req_main_chat"))
-                logging.info(_("log_full_prompt", prompt=full_history_str))
+                logging.info(_("log_full_prompt", prompt=full_history_str[:1000] + "..."))
                 if live_media_path:
                     logging.info(_("log_attached_live_media", path=live_media_path))
                 logging.info("="*50)
 
-            ai_generate_task = asyncio.create_task(
-                asyncio.wait_for(
-                    generate_ai_response(full_history_str, live_media_path, custom_prompt="", search_enabled=search_enabled),
-                    timeout=180.0
+            # Генерация ИИ с таймаутом 5 минут (увеличено с 3)
+            try:
+                ai_generate_task = asyncio.create_task(
+                    generate_ai_response(full_history_str, live_media_path, custom_prompt="", search_enabled=search_enabled)
                 )
-            )
+                reply = await asyncio.wait_for(ai_generate_task, timeout=300.0)
+            except asyncio.TimeoutError:
+                logging.error(f"[AI Twin] Таймаут генерации ИИ для чата {chat_id} (300с)")
+                reply = None
+                if not ai_generate_task.done():
+                    ai_generate_task.cancel()
+                    try:
+                        await ai_generate_task
+                    except asyncio.CancelledError:
+                        pass
+            except Exception as e:
+                logging.error(f"[AI Twin] Ошибка генерации ИИ для чата {chat_id}: {e}")
+                reply = None
 
+            if not reply or reply == "⏳": 
+                return
+                
+            if g_cfg["ai_debug"]: 
+                logging.info(_("log_llm_res_main", reply=reply[:200] + "..."))
+
+            reply_upper = reply.upper().strip()
+            if reply_upper.startswith("[LIKE]"):
+                try: 
+                    await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
+                except Exception as e: 
+                    logging.debug(f"send reaction error: {e}")
+                return
+                
+            if "[LIKE]" in reply_upper:
+                try: 
+                    await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
+                except Exception as e: 
+                    logging.debug(f"send reaction error: {e}")
+                reply = re.sub(r'(?i)\[LIKE\]', '', reply).strip()
+
+            if not reply: 
+                return 
+
+            # Задержки ПЕРЕД отправкой (delay_before)
             c_db_min = c_cfg["db_min"] if c_cfg["db_min"] is not None else g_cfg["db_min"]
             c_db_max = c_cfg["db_max"] if c_cfg["db_max"] is not None else g_cfg["db_max"]
             c_da_min = c_cfg["da_min"] if c_cfg["da_min"] is not None else g_cfg["da_min"]
-            c_da_max = c_cfg["da_max"] if c_cfg["da_max"] is not None else g_cfg["da_max"]
+            c_da_max = cfg["da_max"] if c_cfg["da_max"] is not None else g_cfg["da_max"]
 
             delay_before = random.randint(c_db_min, c_db_max)
-            if delay_before > 0: await asyncio.sleep(delay_before)
+            if delay_before > 0: 
+                logging.info(f"[AI Twin] Чат {chat_id}: ожидание delay_before={delay_before}с")
+                await asyncio.sleep(delay_before)
 
             is_question = bool(re.search(_("ai_question_words_regex"), text_to_search.lower()))
             if not is_question and use_h_ignore > 0:
                 if random.randint(1, 100) <= use_h_ignore:
-                    ai_generate_task.cancel() 
-                    try: await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
-                    except Exception as e: logging.debug(f"cancel action error: {e}")
-                    await asyncio.sleep(1.0)
-                    try:
-                        await client.read_chat_history(chat_id)
-                        if message.voice or message.video_note or message.video:
-                            await client.invoke(functions.messages.ReadMessageContents(id=[message.id]))
-                    except Exception as e: logging.debug(f"read history error: {e}")
-                    if random.random() < 0.5:
-                        try: await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-                        except Exception as e: logging.debug(f"send reaction error: {e}")
-                    if g_cfg["ai_debug"]: logging.info(_("ai_log_ignored", chat_id=chat_id, chance=use_h_ignore))
+                    if g_cfg["ai_debug"]: 
+                        logging.info(_("ai_log_ignored", chat_id=chat_id, chance=use_h_ignore))
                     return
 
-            try: await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
-            except Exception as e: logging.debug(f"cancel action error: {e}")
-            await asyncio.sleep(1.0)
-            try:
-                await client.read_chat_history(chat_id)
-                if message.voice or message.video_note or message.video:
-                    await client.invoke(functions.messages.ReadMessageContents(id=[message.id]))
-            except Exception as e: logging.debug(f"read history error: {e}")
-
+            # "Умное чтение" - дополнительная задержка на основе длины текста/видео
             c_s_mul = c_cfg["s_mul"] if c_cfg["s_mul"] is not None else g_cfg["s_mul"]
             smart_delay = 0
             if use_h_smart:
-                if video_too_long: smart_delay = len(text_to_search) * c_s_mul
-                elif latest_media_duration > 0: smart_delay = latest_media_duration
-                else: smart_delay = len(text_to_search) * c_s_mul
+                if video_too_long: 
+                    smart_delay = len(text_to_search) * c_s_mul
+                elif latest_media_duration > 0: 
+                    smart_delay = latest_media_duration
+                else: 
+                    smart_delay = len(text_to_search) * c_s_mul
 
             if smart_delay > 0:
+                logging.info(f"[AI Twin] Чат {chat_id}: умное чтение {smart_delay:.1f}с")
                 current_time = time.time()
                 for cid in list(skip_video_timers.keys()):
                     if current_time - skip_video_timers[cid] > SKIP_VIDEO_TTL:
@@ -847,34 +888,7 @@ def register_userbot(app: Client, bot: Bot):
                     await asyncio.sleep(1)
                     elapsed_wait += 1
 
-            try: reply = await ai_generate_task
-            except asyncio.CancelledError: return
-            except asyncio.TimeoutError:
-                logging.error(f"[AI Twin] Таймаут генерации ИИ для чата {chat_id}")
-                reply = None
-            except Exception as e:
-                logging.error(f"[AI Twin] Ошибка генерации ИИ для чата {chat_id}: {e}")
-                reply = None
-
-            if not reply or reply == "⏳": return
-            if g_cfg["ai_debug"]: logging.info(_("log_llm_res_main", reply=reply))
-
-            reply_upper = reply.upper().strip()
-            if reply_upper.startswith("[LIKE]"):
-                try: await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-                except Exception as e: logging.debug(f"send reaction error: {e}")
-                return
-                
-            if "[LIKE]" in reply_upper:
-                try: await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-                except Exception as e: logging.debug(f"send reaction error: {e}")
-                reply = re.sub(r'(?i)\[LIKE\]', '', reply).strip()
-
-            if not reply: return 
-
-            delay_after = random.randint(c_da_min, c_da_max)
-            if delay_after > 0: await asyncio.sleep(delay_after)
-
+            # Отправка сообщений
             parts = []
             for p in reply.split('\n'):
                 p = p.strip()
@@ -882,7 +896,8 @@ def register_userbot(app: Client, bot: Bot):
                     while len(p) > 4000:
                         parts.append(p[:4000])
                         p = p[4000:]
-                    if p: parts.append(p)
+                    if p: 
+                        parts.append(p)
 
             use_reply = random.random() < 0.25 
             c_tmin = c_cfg["tmin"] if c_cfg["tmin"] is not None else g_cfg["tmin"]
@@ -903,44 +918,79 @@ def register_userbot(app: Client, bot: Bot):
                 reply_params = ReplyParameters(message_id=message.id) if (i == 0 and use_reply) else None
                 sent_msg = await client.send_message(chat_id, final_part, reply_parameters=reply_params)
                 
-                try: await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
-                except Exception as e: logging.debug(f"cancel action error: {e}")
+                try: 
+                    await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
+                except Exception as e: 
+                    logging.debug(f"cancel action error: {e}")
                 
                 if use_typo and final_part != part:
                     await asyncio.sleep(random.uniform(3, 10.0))
-                    try: await sent_msg.edit_text(part)
-                    except Exception as e: logging.debug(f"edit typo error: {e}")
+                    try: 
+                        await sent_msg.edit_text(part)
+                    except Exception as e: 
+                        logging.debug(f"edit typo error: {e}")
                 
                 if i < len(parts) - 1:
                     await asyncio.sleep(random.uniform(0.5, 2.0)) 
 
+            # Задержка ПОСЛЕ отправки (delay_after)
+            delay_after = random.randint(c_da_min, c_da_max)
+            if delay_after > 0:
+                logging.info(f"[AI Twin] Чат {chat_id}: ожидание delay_after={delay_after}с")
+                await asyncio.sleep(delay_after)
+
         except asyncio.CancelledError: 
+            logging.info(f"[AI Twin] Задача чата {chat_id} отменена")
             raise
         except Exception as e:
             logging.error(_("log_ai_critical_error", e=e))
             traceback.print_exc()
             try:
                 logging.error(_("ai_log_chat_error", chat_id=chat_id, e=str(e)))
-            except: pass
+            except: 
+                pass
         finally:
             elapsed = time.time() - start_time
             logging.info(f"[AI Twin] Завершение обработки чата {chat_id}, время: {elapsed:.1f}с")
+            
             for p in media_paths_to_cleanup:
                 if p and os.path.exists(p):
                     try: 
                         os.remove(p)
                     except Exception as e: 
                         logging.debug(f"cleanup media error: {e}")
+                        
             if active_reply_tasks.get(chat_id) == asyncio.current_task():
                 del active_reply_tasks[chat_id]
 
     @app.on_message(filters.private & ~filters.me)
     async def ai_auto_reply(client, message):
-        if message.chat.type != ChatType.PRIVATE: return
-        if message.from_user and message.from_user.is_bot: return
-        if message.from_user and message.from_user.id == 777000: return
+        if message.chat.type != ChatType.PRIVATE: 
+            return
+        if message.from_user and message.from_user.is_bot: 
+            return
+        if message.from_user and message.from_user.id == 777000: 
+            return
+            
         chat_id = message.chat.id
+        
+        # Отменяем предыдущую задачу для этого чата
         if chat_id in active_reply_tasks:
-            active_reply_tasks[chat_id].cancel()
+            old_task = active_reply_tasks[chat_id]
+            if not old_task.done():
+                old_task.cancel()
+                logging.info(f"[AI Twin] Отменена предыдущая задача для чата {chat_id}")
+                try:
+                    await asyncio.wait_for(old_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+        
+        # Создаем новую задачу БЕЗ общего таймаута (таймауты только внутри)
         task = asyncio.create_task(process_reply(client, message))
         active_reply_tasks[chat_id] = task
+        
+        def cleanup_task(t):
+            if active_reply_tasks.get(chat_id) == t:
+                del active_reply_tasks[chat_id]
+                
+        task.add_done_callback(cleanup_task)

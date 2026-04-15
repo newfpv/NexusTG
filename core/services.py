@@ -13,9 +13,10 @@ from datetime import timezone
 from core.config import _
 from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache
 
-GEMINI_TIMEOUT = 25.0
+GEMINI_TIMEOUT = 60.0
 MAX_RETRIES_PER_KEY = 2
 CIRCUIT_BREAKER_THRESHOLD = 5
+MEDIA_DOWNLOAD_TIMEOUT = 90.0
 
 circuit_failures = {}
 circuit_last_failure = {}
@@ -33,17 +34,27 @@ def get_model_config(search_enabled=True):
     )
 
 async def _call_gemini_with_timeout(client, model_name, contents, config):
+    """Улучшенная версия с принудительным закрытием при таймауте"""
     try:
-        return await asyncio.wait_for(
+        task = asyncio.create_task(
             client.aio.models.generate_content(
                 model=model_name,
                 contents=contents,
                 config=config
-            ),
-            timeout=GEMINI_TIMEOUT
+            )
         )
+        return await asyncio.wait_for(task, timeout=GEMINI_TIMEOUT)
     except asyncio.TimeoutError:
-        logging.warning(_("log_gemini_timeout", model_name=model_name))
+        logging.warning(f"⏱ Таймаут Gemini ({GEMINI_TIMEOUT}с) на модели {model_name}")
+        if 'task' in locals() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка Gemini: {e}")
         return None
 
 def _check_circuit_breaker(api_key: str) -> bool:
@@ -301,7 +312,7 @@ async def test_ai_credentials(progress_cb=None) -> str:
                 client = genai.Client(api_key=key)
                 response = await asyncio.wait_for(
                     client.aio.models.generate_content(model=model, contents=[_("ping_prompt")]),
-                    timeout=15.0
+                    timeout=30.0
                 )
                 res_text = _("test_ok")
             except asyncio.TimeoutError:
@@ -354,7 +365,7 @@ def _fetch_yt_sync(url: str, video_id: str) -> tuple[int, str]:
             subs = info.get('requested_subtitles', {})
             for lang in ['ru', 'en']:
                 if lang in subs and subs[lang].get('url'):
-                    resp = requests.get(subs[lang]['url'], timeout=10)
+                    resp = requests.get(subs[lang]['url'], timeout=15)
                     if resp.status_code == 200:
                         context += _("yt_subs_text", text=resp.text[:50000])
                         break
@@ -414,14 +425,14 @@ async def build_dialog_context(client, chat_id: int, limit: int, target_msg_id: 
                 m_ext = ".ogg" if msg.voice else ".mp4"
                 dl_path = await asyncio.wait_for(
                     client.download_media(msg, file_name=f"data/{msg.id}_audio{m_ext}"),
-                    timeout=30.0
+                    timeout=MEDIA_DOWNLOAD_TIMEOUT  
                 )
                 if dl_path:
                     media_paths_to_cleanup.append(dl_path)
                     transc = await transcribe_media(dl_path)
                     if transc: await repo.save_media_memory(msg.id, "transcript", transc)
             except asyncio.TimeoutError:
-                logging.warning(f"Таймаут скачивания аудио msg_id={msg.id}")
+                logging.warning(f"⏱ Таймаут скачивания аудио msg_id={msg.id} ({MEDIA_DOWNLOAD_TIMEOUT}с)")
             except Exception as e:
                 logging.error(f"Ошибка скачивания аудио: {e}")
 
@@ -430,14 +441,14 @@ async def build_dialog_context(client, chat_id: int, limit: int, target_msg_id: 
                 m_ext = ".jpg" if msg.photo else ".mp4"
                 dl_path = await asyncio.wait_for(
                     client.download_media(msg, file_name=f"data/{msg.id}_media{m_ext}"),
-                    timeout=30.0
+                    timeout=MEDIA_DOWNLOAD_TIMEOUT
                 )
                 if dl_path:
                     media_paths_to_cleanup.append(dl_path)
                     desc = await generate_media_description(dl_path)
                     if desc: await repo.save_media_memory(msg.id, "description", desc)
             except asyncio.TimeoutError:
-                logging.warning(f"Таймаут скачивания видео msg_id={msg.id}")
+                logging.warning(f"⏱ Таймаут скачивания видео msg_id={msg.id} ({MEDIA_DOWNLOAD_TIMEOUT}с)")
             except Exception as e:
                 logging.error(f"Ошибка скачивания видео: {e}")
 
@@ -459,7 +470,14 @@ async def build_dialog_context(client, chat_id: int, limit: int, target_msg_id: 
                 if not (target_msg_id and msg.id == target_msg_id):
                     if not await repo.get_media_memory(msg.id, "description"): media_tasks.append(fetch_video(msg))
 
-        if media_tasks: await asyncio.gather(*media_tasks, return_exceptions=True)
+        if media_tasks: 
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*media_tasks, return_exceptions=True),
+                    timeout=MEDIA_DOWNLOAD_TIMEOUT + 30
+                )
+            except asyncio.TimeoutError:
+                logging.warning("⏱ Глобальный таймаут на скачивание медиа")
 
         for msg in messages:
             is_ignored_msg = False

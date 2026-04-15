@@ -6,6 +6,7 @@ import inspect
 import zoneinfo
 from datetime import datetime
 from dotenv import load_dotenv
+import time
 
 logging.basicConfig(level=logging.INFO, force=True)
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
@@ -33,6 +34,12 @@ bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(auth_router)
 userbot_app = None
+
+try:
+    from modules.ai_twin import active_reply_tasks, MAX_TASK_LIFETIME
+except ImportError:
+    active_reply_tasks = {}
+    MAX_TASK_LIFETIME = 300
 
 def load_modules(dispatcher: Dispatcher):
     if not os.path.exists("modules"):
@@ -118,16 +125,21 @@ async def cb_chats_list(call: types.CallbackQuery, state: FSMContext):
         try:
             async for dialog in userbot_app.get_dialogs(limit=30):
                 chat = dialog.chat
-                if chat.type != ChatType.PRIVATE: continue
-                if chat.id == 777000: continue
+                if chat.type != ChatType.PRIVATE: 
+                    continue
+                if chat.id == 777000: 
+                    continue
                 
                 name_parts = []
-                if chat.first_name: name_parts.append(chat.first_name)
-                if chat.last_name: name_parts.append(chat.last_name)
+                if chat.first_name: 
+                    name_parts.append(chat.first_name)
+                if chat.last_name: 
+                    name_parts.append(chat.last_name)
                 name = " ".join(name_parts) if name_parts else _("no_name")
                 
                 kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_chat_name", name=name), callback_data=f"chat_{chat.id}")])
-        except: pass
+        except Exception as e:
+            logging.error(f"Ошибка получения диалогов: {e}")
         
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")])
     
@@ -140,10 +152,14 @@ async def get_generic_chat_menu_content(chat_id):
         try:
             chat = await userbot_app.get_chat(chat_id)
             name_parts = []
-            if chat.first_name: name_parts.append(chat.first_name)
-            if chat.last_name: name_parts.append(chat.last_name)
-            if name_parts: chat_name = f"<b>{' '.join(name_parts)}</b>"
-        except: pass
+            if chat.first_name: 
+                name_parts.append(chat.first_name)
+            if chat.last_name: 
+                name_parts.append(chat.last_name)
+            if name_parts: 
+                chat_name = f"<b>{' '.join(name_parts)}</b>"
+        except Exception as e:
+            logging.debug(f"Не удалось получить инфо о чате {chat_id}: {e}")
 
     text = _("menu_chat_title", chat_name=chat_name)
     kb = InlineKeyboardMarkup(inline_keyboard=[])
@@ -158,8 +174,10 @@ async def get_generic_chat_menu_content(chat_id):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    try: await message.delete()
-    except: pass
+    try: 
+        await message.delete()
+    except: 
+        pass
     await state.clear()
     
     config = await plugins.db.get_global_config()
@@ -228,10 +246,13 @@ async def stop_userbot():
         userbot_app = None
 
 async def userbot_health_monitor():
+    """Улучшенный мониторинг с отслеживанием зависших задач AI"""
     global userbot_app
     fail_count = 0
+    
     while True:
         await asyncio.sleep(30)
+        
         if userbot_app:
             if not userbot_app.is_connected:
                 fail_count += 1
@@ -248,6 +269,28 @@ async def userbot_health_monitor():
                         logging.critical(_("log_userbot_restart_failed", e=e))
             else:
                 fail_count = 0
+            
+            current_time = time.time()
+            stuck_tasks = []
+            
+            for chat_id, task in list(active_reply_tasks.items()):
+                if task.done():
+                    continue   
+                task_age = MAX_TASK_LIFETIME + 60
+                if task_age > MAX_TASK_LIFETIME + 60:
+                    stuck_tasks.append(chat_id)
+            
+            for chat_id in stuck_tasks:
+                task = active_reply_tasks.get(chat_id)
+                if task and not task.done():
+                    logging.critical(f"[Health Monitor] Отмена зависшей задачи чата {chat_id} (возраст > {MAX_TASK_LIFETIME}с)")
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                    except Exception as e:
+                        logging.error(f"Ошибка при отмене задачи {chat_id}: {e}")
 
 async def main():
     await init_db()

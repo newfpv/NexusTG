@@ -24,6 +24,8 @@ class AICmdFSM(StatesGroup):
     wait_command = State()
     wait_prompt = State()
 
+AI_CMD_TIMEOUT = 240
+
 async def _get_cfg():
     a = await CoreAPI.get_module_cfg("ai_command")
     return {
@@ -116,12 +118,15 @@ def register_userbot(app: Client):
                 from core.db import AICmdTracker
                 res = await session.execute(select(AICmdTracker).where(AICmdTracker.chat_id == m.chat.id, AICmdTracker.msg_id == m.reply_to_message.id))
                 if res.scalar_one_or_none() and m.text and not m.text.startswith(cfg['command']):
-                    if is_me or cfg["allow_others"]: return True
+                    if is_me or cfg["allow_others"]: 
+                        return True
         return False
 
     @app.on_message(filters.create(ai_filter))
     async def handle_ai_cmd(client, message):
         media_paths_to_cleanup = []
+        start_time = time.time()
+        
         try:
             cfg = await _get_cfg()
             is_me = bool(message.from_user and message.from_user.is_self)
@@ -134,7 +139,6 @@ def register_userbot(app: Client):
             else:
                 query = message.text or message.caption or ""
 
-            # Новый параметр для отключения превью ссылок
             no_preview = LinkPreviewOptions(is_disabled=True)
 
             status_msg = await message.edit(_("cmd_ai_thinking"), link_preview_options=no_preview) if is_me else await message.reply(_("cmd_ai_thinking"), link_preview_options=no_preview)
@@ -142,14 +146,34 @@ def register_userbot(app: Client):
             
             target_msg = message.reply_to_message if (is_cmd and message.reply_to_message) else message
             
-            hist_str, new_paths, dummy_dur, dummy_vid = await build_dialog_context(client, message.chat.id, limit=30, target_msg_id=target_msg.id)
-            media_paths_to_cleanup.extend(new_paths)
+            try:
+                hist_str, new_paths, dummy_dur, dummy_vid = await asyncio.wait_for(
+                    build_dialog_context(client, message.chat.id, limit=30, target_msg_id=target_msg.id),
+                    timeout=120.0
+                )
+                media_paths_to_cleanup.extend(new_paths)
+            except asyncio.TimeoutError:
+                logging.error(f"[AI Cmd] Таймаут сборки контекста")
+                await status_msg.edit("⏱ Таймаут сбора контекста", link_preview_options=no_preview)
+                return
+            
+            if time.time() - start_time > AI_CMD_TIMEOUT:
+                logging.warning(f"[AI Cmd] Превышен общий таймаут до скачивания медиа")
+                await status_msg.edit("⏱ Превышено время ожидания", link_preview_options=no_preview)
+                return
             
             live_media_path = None
             if target_msg.photo or target_msg.video:
-                ext = ".jpg" if target_msg.photo else ".mp4"
-                live_media_path = await target_msg.download(file_name=f"data/live_{target_msg.id}{ext}")
-                if live_media_path: media_paths_to_cleanup.append(live_media_path)
+                try:
+                    ext = ".jpg" if target_msg.photo else ".mp4"
+                    live_media_path = await asyncio.wait_for(
+                        target_msg.download(file_name=f"data/live_{target_msg.id}{ext}"),
+                        timeout=60.0
+                    )
+                    if live_media_path: 
+                        media_paths_to_cleanup.append(live_media_path)
+                except asyncio.TimeoutError:
+                    logging.warning(f"[AI Cmd] Таймаут скачивания медиа")
 
             full_query = _("cmd_ai_context_dialogue", hist_str=hist_str)
             if is_cmd and message.reply_to_message:
@@ -160,7 +184,8 @@ def register_userbot(app: Client):
             
             if cfg["show_debug"]:
                 print(_("log_debug_header"))
-                if live_media_path: print(_("log_attached_file", path=live_media_path))
+                if live_media_path: 
+                    print(_("log_attached_file", path=live_media_path))
                 print(_("log_full_prompt", prompt=full_query))
 
             full_reply = ""
@@ -171,49 +196,40 @@ def register_userbot(app: Client):
             prefix = f"<blockquote><i>{safe_q}</i></blockquote>\n"
             
             try:
-                async for chunk in generate_ai_response_stream(
-                    full_query, 
-                    media_path=live_media_path, 
-                    custom_prompt=cfg["global_prompt"], 
-                    search_enabled=cfg["use_search"]
-                ):
-                    full_reply += chunk
-                    
-                    if time.time() - last_ui_update > 0.8:
-                        html_p = md_to_html(full_reply)
-                        current_display = f"{prefix}<blockquote expandable>{html_p}</blockquote>"
-
-                        if current_display.strip() != last_sent_text.strip():
-                            try:
-                                await status_msg.edit(current_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                                last_sent_text = current_display
-                                last_ui_update = time.time()
-                            except FloodWait as e:
-                                await asyncio.sleep(e.value + 1)
-                            except Exception:
-                                pass
+                stream_task = asyncio.create_task(
+                    _consume_stream(
+                        generate_ai_response_stream(
+                            full_query, 
+                            media_path=live_media_path, 
+                            custom_prompt=cfg["global_prompt"], 
+                            search_enabled=cfg["use_search"]
+                        ),
+                        status_msg,
+                        prefix,
+                        no_preview,
+                        start_time,
+                        AI_CMD_TIMEOUT
+                    )
+                )
                 
-                if not typing_task.done(): typing_task.cancel()
+                full_reply = await asyncio.wait_for(stream_task, timeout=180.0)
                 
-                if full_reply:
-                    html_final = md_to_html(full_reply)
-                    final_display = f"{prefix}<blockquote expandable>{html_final}</blockquote>"
-                    
-                    if final_display.strip() != last_sent_text.strip():
-                        try: 
-                            await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                        except FloodWait as e:
-                            await asyncio.sleep(e.value + 1)
-                            await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                        except Exception:
-                            pass
-
+                if not typing_task.done(): 
+                    typing_task.cancel()
+                
+            except asyncio.TimeoutError:
+                logging.error(f"[AI Cmd] Таймаут стриминга ответа")
+                if not full_reply:
+                    await status_msg.edit("⏱ Таймаут генерации ответа", link_preview_options=no_preview)
+                    return
             except Exception as e:
                 if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
                     logging.error(_("cmd_ai_log_error", e=str(e)))
-                    if not last_sent_text: await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
+                    if not last_sent_text: 
+                        await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
             
-            if not typing_task.done(): typing_task.cancel()
+            if not typing_task.done(): 
+                typing_task.cancel()
             
             if not full_reply or full_reply == "⏳":
                 return await status_msg.edit(_("ai_cmd_error_empty"), link_preview_options=no_preview)
@@ -228,10 +244,62 @@ def register_userbot(app: Client):
         except Exception as e:
             logging.error(_("cmd_ai_log_error", e=str(e)))
             if 'status_msg' in locals() and status_msg: 
-                try: await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
-                except: pass
+                try: 
+                    await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
+                except: 
+                    pass
         finally:
             for p in media_paths_to_cleanup:
                 if os.path.exists(p):
-                    try: os.remove(p)
-                    except: pass
+                    try: 
+                        os.remove(p)
+                    except: 
+                        pass
+            elapsed = time.time() - start_time
+            logging.info(f"[AI Cmd] Обработка завершена за {elapsed:.1f}с")
+
+async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time, timeout):
+    """Вспомогательная функция для потребления стрима с проверкой таймаута"""
+    full_reply = ""
+    last_sent_text = ""
+    last_ui_update = time.time()
+    
+    try:
+        async for chunk in stream_gen:
+            if time.time() - start_time > timeout:
+                logging.warning("Превышен общий таймаут во время стриминга")
+                break
+                
+            full_reply += chunk
+            
+            if time.time() - last_ui_update > 0.8:
+                html_p = md_to_html(full_reply)
+                current_display = f"{prefix}<blockquote expandable>{html_p}</blockquote>"
+
+                if current_display.strip() != last_sent_text.strip():
+                    try:
+                        await status_msg.edit(current_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
+                        last_sent_text = current_display
+                        last_ui_update = time.time()
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                    except Exception:
+                        pass
+        
+        if full_reply:
+            html_final = md_to_html(full_reply)
+            final_display = f"{prefix}<blockquote expandable>{html_final}</blockquote>"
+            
+            if final_display.strip() != last_sent_text.strip():
+                try: 
+                    await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                    await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
+                except Exception:
+                    pass
+                    
+    except Exception as e:
+        logging.error(f"Ошибка в consume_stream: {e}")
+        
+    return full_reply

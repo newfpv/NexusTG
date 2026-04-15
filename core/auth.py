@@ -364,8 +364,6 @@ async def yt_cookies_delete(call: types.CallbackQuery, state: FSMContext):
     await call.answer(_("yt_cookies_deleted_alert"), show_alert=False)
     await yt_cookies_menu(call, state)
 
-# --- БЛОК ЛИМИТОВ И БАНОВ ---
-
 async def get_limits_text(repo: CoreRepository, api_keys: list[str]) -> str:
     if not api_keys:
         return _("limits_empty")

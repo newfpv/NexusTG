@@ -24,7 +24,6 @@ CACHE_DIR = "data/spy_cache/"
 router = Router()
 userbot_app = None
 
-# Async lock to prevent "database is locked" errors during high load
 db_lock = asyncio.Lock()
 
 class SaverStates(StatesGroup):
@@ -37,8 +36,7 @@ class SaverStates(StatesGroup):
 async def on_startup():
     os.makedirs("data", exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
-    
-    # Initialize DB with WAL mode for better concurrency
+
     async with db_lock:
         async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
             await db.execute("PRAGMA journal_mode=WAL;")
@@ -263,7 +261,6 @@ async def saver_sv_tg(message: types.Message, state: FSMContext):
     try: await message.delete()
     except: pass
     txt = message.text.strip()
-    # No hardcodes, checking localization key or standard generic commands
     await _upd_cfg(target_chats="" if txt.lower() in [_("cmd_reset").lower(), "reset"] else txt)
     await state.set_state(None)
     data = await state.get_data()
@@ -498,7 +495,6 @@ def register_userbot(app: Client, bot: Bot):
                     await db.execute("INSERT OR REPLACE INTO msg_cache (message_id, chat_id, user_id, user_name, text, media_type, file_path, is_ttl) VALUES (?, ?, ?, ?, ?, ?, ?, 0)", 
                                      (message.id, message.chat.id, user.id, user.first_name, text, media_type, file_path))
                     
-                    # Random cleanup check (1% chance per message to avoid heavy blocking)
                     if random.randint(1, 100) == 1:
                         cutoff = datetime.now() - timedelta(days=180)
                         async with db.execute("SELECT file_path FROM msg_cache WHERE timestamp < ?", (cutoff,)) as cursor:

@@ -114,7 +114,6 @@ Installs to `~/NexusTG` with systemd service support.
 git clone https://github.com/newfpv/NexusTG.git
 cd NexusTG
 cp .env.example .env
-# Edit .env with your TG_BOT_TOKEN and LANG_FILE
 docker compose up -d --build
 ```
 
@@ -123,7 +122,7 @@ docker compose up -d --build
 ```bash
 git clone https://github.com/newfpv/NexusTG.git
 cd NexusTG
-python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 python -m core.main
 ```

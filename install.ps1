@@ -120,7 +120,6 @@ try {
                 $BotUser = $Response.result.username
                 Write-Host "✅ Token is VALID! Connected to: $BotName (@$BotUser)" -ForegroundColor Green
                 
-                # Сохраняем .env файл СТРОГО без BOM
                 $EnvContent = "TG_BOT_TOKEN=$Token`r`nLANG_FILE=$SelectedLang"
                 Write-Utf8NoBom -FilePath $EnvPath -Content $EnvContent
                 
