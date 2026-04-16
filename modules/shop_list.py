@@ -155,7 +155,7 @@ def register_userbot(app: Client):
             logging.error(f"[Shop] Filter crash: {e}")
             return False
 
-    @app.on_message(filters.create(shop_filter), group=2)
+    @app.on_message(filters.create(shop_filter), group=-1)
     async def handle_shop(client, message):
         typing_task = None
         try:

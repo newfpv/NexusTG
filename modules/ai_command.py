@@ -122,7 +122,7 @@ def register_userbot(app: Client):
                         return True
         return False
 
-    @app.on_message(filters.create(ai_filter))
+    @app.on_message(filters.create(ai_filter), group=-3)
     async def handle_ai_cmd(client, message):
         media_paths_to_cleanup = []
         start_time = time.time()

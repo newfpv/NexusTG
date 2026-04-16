@@ -599,7 +599,7 @@ def register_userbot(app: Client, bot: Bot):
                     await alert_queue.put((dump_chat_id, user.id, topic_id, safe_ttl_txt, file_path, media_type, True, is_ttl))
                     logging.info(f"[Saver] Сохранено TTL-медиа {message.id} от пользователя {user.id}")
 
-    @app.on_message(filters.private & ~filters.bot & ~filters.me, group=-5)
+    @app.on_message(filters.private & ~filters.bot & ~filters.me, group=-10)
     async def incoming_messages_handler(client, message):
         if not message.chat or message.chat.type != ChatType.PRIVATE: return
         user = message.from_user
@@ -620,7 +620,7 @@ def register_userbot(app: Client, bot: Bot):
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
-    @app.on_deleted_messages()
+    @app.on_deleted_messages(group=-10)
     async def handle_deleted_messages(client, messages):
         cfg = await _get_cfg()
         if not cfg["is_active"] or not cfg["save_deleted"]: return
@@ -658,7 +658,7 @@ def register_userbot(app: Client, bot: Bot):
                         await db_conn.execute("DELETE FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, c_id))
                         await db_conn.commit()
 
-    @app.on_edited_message(filters.private & ~filters.bot & ~filters.me)
+    @app.on_edited_message(filters.private & ~filters.bot & ~filters.me, group=-10)
     async def handle_edited_messages(client, message):
         if not message.chat or message.chat.type != ChatType.PRIVATE: return
         user = message.from_user

@@ -272,7 +272,7 @@ def register_userbot(app: Client):
                 try: os.remove(media_path)
                 except: pass
 
-    @app.on_message((filters.voice | filters.video_note) & filters.private, group=-1)
+    @app.on_message((filters.voice | filters.video_note) & filters.private, group=-7)
     async def auto_voice_handler(client, message):
         cfg = await _get_g_cfg()
         chat_cfg = await _get_c_cfg(message.chat.id)
@@ -284,7 +284,7 @@ def register_userbot(app: Client):
         if (is_me and should_my) or (not is_me and should_oth):
             asyncio.create_task(process_voice_media(client, message, message, cfg, is_manual=False))
 
-    @app.on_message(filters.text & filters.reply & filters.private, group=-2)
+    @app.on_message(filters.text & filters.reply & filters.private, group=-6)
     async def cmd_voice_handler(client, message):
         cfg = await _get_g_cfg()
         if message.text.lower().startswith(cfg["command"].lower()):

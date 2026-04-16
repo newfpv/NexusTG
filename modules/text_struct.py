@@ -28,7 +28,9 @@ async def _get_cfg() -> dict:
     }
 
 async def _ret_menu(msg: types.Message, state: FSMContext):
-    if msg_id := (await state.get_data()).get("menu_msg_id"):
+    data = await state.get_data()
+    msg_id = data.get("menu_msg_id")
+    if msg_id:
         cfg = await _get_cfg()
         status = _("status_on") if cfg["is_active"] else _("status_off")
         
@@ -74,15 +76,40 @@ async def ts_save_input(message: types.Message, state: FSMContext):
     except Exception:
         pass
         
-    if await state.get_state() == TextStructFSM.wait_cmd.state:
+    curr_state = await state.get_state()
+    if curr_state == TextStructFSM.wait_cmd.state:
         await CoreAPI.update_module_cfg(MODULE_NAME, command=message.text.strip().split()[0])
     else:
         await CoreAPI.update_module_cfg(MODULE_NAME, prompt=message.text.strip())
     await state.set_state(None)
     await _ret_menu(message, state)
 
+async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
+    if not ai_text or ai_text == "⏳" or ai_text == _("status_waiting"):
+        html_text = f"{original_text}\n\n{_('ts_error')}"
+        fallback_text = html_text
+    else:
+        html_text = md_to_html(ai_text)
+        fallback_text = ai_text
+
+    no_preview = LinkPreviewOptions(is_disabled=True)
+
+    try:
+        if msg_to_edit.media:
+            await msg_to_edit.edit_caption(html_text, parse_mode=enums.ParseMode.HTML)
+        else:
+            await msg_to_edit.edit_text(html_text, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
+    except Exception:
+        try:
+            if msg_to_edit.media:
+                await msg_to_edit.edit_caption(fallback_text)
+            else:
+                await msg_to_edit.edit_text(fallback_text, link_preview_options=no_preview)
+        except Exception:
+            pass
+
 def register_userbot(app: Client):
-    @app.on_message(filters.me & filters.text)
+    @app.on_message(filters.me & (filters.text | filters.caption), group=-5)
     @safe_userbot_handler
     async def handle_struct_cmd(client: Client, message: Message):
         cfg = await _get_cfg()
@@ -90,77 +117,74 @@ def register_userbot(app: Client):
             return
             
         cmd = str(cfg.get("command")).strip()
-        if not message.text.startswith(cmd):
+        msg_text = message.text or message.caption or ""
+        
+        if not re.match(rf"^{re.escape(cmd)}(?:\s+|$)", msg_text):
             return
 
-        # ========================================================
-        # ЛОГИКА СТРОГО ИЗ ai_command.py
-        # ========================================================
-        match = re.match(rf"^{re.escape(cmd)}(?:\s+(.*))?", message.text or message.caption or "", flags=re.DOTALL)
-        query = match.group(1).strip() if match and match.group(1) else ""
-        
-        target_msg = message.reply_to_message if message.reply_to_message else message
+        query = msg_text[len(cmd):].strip()
         is_reply = bool(message.reply_to_message)
         
-        raw_text = ""
-
         if not is_reply:
-            raw_text = query
-            if not raw_text:
+            if not query:
                 return
-            # Сценарий 1: Прячем команду
+            
             try:
-                await message.edit_text(raw_text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+                if message.media:
+                    await message.edit_caption(query)
+                else:
+                    await message.edit_text(query, link_preview_options=LinkPreviewOptions(is_disabled=True))
             except Exception:
                 pass
-        else:
-            raw_text = target_msg.text or target_msg.caption or ""
-            if not raw_text.strip():
-                return
-            # Удаляем триггер .fix мгновенно
+
+            typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
+            try:
+                ai_text = await generate_ai_response(query, custom_prompt=cfg.get("prompt"), search_enabled=False)
+            finally:
+                typing_task.cancel()
+
+            await _apply_edit(message, query, ai_text)
+            return
+
+        target_msg = message.reply_to_message
+        text_to_process = target_msg.text or target_msg.caption or ""
+        
+        if not text_to_process.strip():
+            return
+            
+        is_ours = getattr(target_msg, "outgoing", False) or (getattr(target_msg, "from_user", None) and target_msg.from_user.is_self)
+        
+        prompt_to_use = cfg.get("prompt")
+        if query:
+            prompt_to_use += f"\n\n{query}"
+
+        if is_ours:
             try:
                 await message.delete()
             except Exception:
                 pass
 
-        typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
-        
-        try:
-            ai_text = await generate_ai_response(
-                raw_text, 
-                custom_prompt=cfg.get("prompt"), 
-                search_enabled=False
-            )
-        finally:
-            typing_task.cancel()
-
-        status_waiting = _("status_waiting")
-        if not ai_text or ai_text == status_waiting:
-            html_text = f"{raw_text}\n\n{_('ts_error')}"
-            fallback_text = html_text
-        else:
-            html_text = md_to_html(ai_text)
-            fallback_text = ai_text
-
-        no_preview = LinkPreviewOptions(is_disabled=True)
-
-        if not is_reply:
-            # СЦЕНАРИЙ 1
+            typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             try:
-                await message.edit_text(html_text, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-            except Exception:
-                await message.edit_text(fallback_text, link_preview_options=no_preview)
+                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+            finally:
+                typing_task.cancel()
+
+            await _apply_edit(target_msg, text_to_process, ai_text)
+            
         else:
-            is_ours = bool(getattr(target_msg, "outgoing", False) or (target_msg.from_user and target_msg.from_user.is_self))
-            if is_ours:
-                # СЦЕНАРИЙ 2
-                try:
-                    await target_msg.edit_text(html_text, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                except Exception:
-                    await target_msg.edit_text(fallback_text, link_preview_options=no_preview)
-            else:
-                # СЦЕНАРИЙ 3
-                try:
-                    await target_msg.reply_text(html_text, parse_mode=enums.ParseMode.HTML, quote=True, link_preview_options=no_preview)
-                except Exception:
-                    await target_msg.reply_text(fallback_text, quote=True, link_preview_options=no_preview)
+            try:
+                if message.media:
+                    await message.edit_caption(text_to_process)
+                else:
+                    await message.edit_text(text_to_process, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            except Exception:
+                pass
+
+            typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
+            try:
+                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+            finally:
+                typing_task.cancel()
+
+            await _apply_edit(message, text_to_process, ai_text)

@@ -106,7 +106,7 @@ async def fc_save_cmd(message: types.Message, state: FSMContext):
         except: pass
 
 def register_userbot(app: Client):
-    @app.on_message(filters.text & filters.me, group=-5)
+    @app.on_message(filters.text & filters.me, group=-4)
     async def fact_check_handler(client, message):
         cfg = await _get_cfg()
         if not cfg["is_active"]:
