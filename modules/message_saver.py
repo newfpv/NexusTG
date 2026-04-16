@@ -83,18 +83,18 @@ async def alert_worker(bot: Bot, app: Client):
                 delay = random.uniform(cfg.get("delay_min", 1.0), cfg.get("delay_max", 5.0))
                 
                 if delay > 0:
-                    logging.info(f"[Saver Worker] Task triggered for user {u_id}. Waiting {delay:.1f} seconds before sending.")
+                    logging.info(f"[Saver] Task triggered for user {u_id}. Waiting {delay:.1f} seconds before sending.")
                     await asyncio.sleep(delay)
                 
                 await execute_alert(bot, app, dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl)
             except Exception as e:
-                logging.error(f"[Saver Worker] Execution Error: {e}")
+                logging.error(f"[Saver] Execution Error: {e}")
             finally:
                 alert_queue.task_done()
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logging.error(f"[Saver Worker] Queue Error: {e}")
+            logging.error(f"[Saver] Queue Error: {e}")
 
 async def on_startup():
     global db_conn
