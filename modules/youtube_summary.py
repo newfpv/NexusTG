@@ -1,3 +1,4 @@
+import os
 import re
 import html
 import time
@@ -26,6 +27,7 @@ class YtSummaryFSM(StatesGroup):
 
 async def _get_cfg() -> dict:
     cfg = await CoreAPI.get_module_cfg(MODULE_NAME)
+    logging.debug("[YT Sum] Configuration loaded")
     return {
         "is_active": cfg.get("is_active", True),
         "command": cfg.get("command", ".sum"),
@@ -34,6 +36,7 @@ async def _get_cfg() -> dict:
     }
 
 async def _upd_cfg(**kwargs):
+    logging.info(f"[YT Sum] Updating configuration: {list(kwargs.keys())}")
     await CoreAPI.update_module_cfg(MODULE_NAME, **kwargs)
 
 async def get_settings_buttons() -> list:
@@ -55,6 +58,7 @@ async def build_ys_kb() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "ys_main_menu")
 async def ys_menu(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[YT Sum] User {call.from_user.id} accessed main menu")
     await state.clear()
     await state.update_data(menu_msg_id=call.message.message_id)
     await safe_edit(call.message, state, _("ys_menu_title"), await build_ys_kb(), parse_mode="HTML")
@@ -62,30 +66,38 @@ async def ys_menu(call: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "ys_toggle")
 async def ys_toggle(call: types.CallbackQuery, state: FSMContext):
     cfg = await _get_cfg()
-    await _upd_cfg(is_active=not cfg["is_active"])
+    new_val = not cfg["is_active"]
+    logging.info(f"[YT Sum] User {call.from_user.id} toggled activity to {new_val}")
+    await _upd_cfg(is_active=new_val)
     await ys_menu(call, state)
 
 @router.callback_query(F.data == "ys_toggle_debug")
 async def ys_toggle_debug(call: types.CallbackQuery, state: FSMContext):
     cfg = await _get_cfg()
-    await _upd_cfg(debug_mode=not cfg.get("debug_mode", False))
+    new_val = not cfg.get("debug_mode", False)
+    logging.info(f"[YT Sum] User {call.from_user.id} toggled debug mode to {new_val}")
+    await _upd_cfg(debug_mode=new_val)
     await ys_menu(call, state)
 
 @router.callback_query(F.data == "ys_clear_cache")
 async def ys_clear_cache(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[YT Sum] User {call.from_user.id} requested cache clear")
     async with AsyncSessionLocal() as session:
         await session.execute(delete(YoutubeCache))
         await session.commit()
+    logging.info("[YT Sum] Cache cleared successfully from database")
     await call.answer(_("ys_cache_cleared"), show_alert=True)
 
 @router.callback_query(F.data == "ys_edit_cmd")
 async def ys_edit_cmd(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[YT Sum] User {call.from_user.id} requested command edit")
     cfg = await _get_cfg()
     await safe_edit(call.message, state, _("ys_ask_cmd", cmd=cfg["command"]), get_cancel_kb("ys_main_menu"), parse_mode="HTML")
     await state.set_state(YtSummaryFSM.wait_command)
 
 @router.callback_query(F.data == "ys_edit_prompt")
 async def ys_edit_prompt(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[YT Sum] User {call.from_user.id} requested prompt edit")
     cfg = await _get_cfg()
     await safe_edit(call.message, state, _("ys_ask_prompt", prompt=html.escape(cfg["prompt"])), get_cancel_kb("ys_main_menu"), parse_mode="HTML")
     await state.set_state(YtSummaryFSM.wait_prompt)
@@ -94,12 +106,14 @@ async def ys_edit_prompt(call: types.CallbackQuery, state: FSMContext):
 async def ys_save_cmd(message: types.Message, state: FSMContext):
     await safe_delete(message)
     cmd = message.text.strip().split()[0]
+    logging.info(f"[YT Sum] User {message.from_user.id} saved new command: {cmd}")
     await _upd_cfg(command=cmd)
     await _return_to_menu(message, state)
 
 @router.message(YtSummaryFSM.wait_prompt)
 async def ys_save_prompt(message: types.Message, state: FSMContext):
     await safe_delete(message)
+    logging.info(f"[YT Sum] User {message.from_user.id} saved new global prompt")
     await _upd_cfg(prompt=message.text.strip())
     await _return_to_menu(message, state)
 
@@ -142,27 +156,36 @@ def register_userbot(app: Client):
         if not cfg["is_active"] or not message.text.startswith(cfg["command"]):
             return
 
+        logging.info(f"[YT Sum] Triggered in chat {message.chat.id}")
+
         target_text = message.text
         if message.reply_to_message:
             target_text += " " + (message.reply_to_message.text or message.reply_to_message.caption or "")
 
         yt_links = re.findall(r'(https?://(?:www\.)?(?:youtube\.com|youtu\.be|youtube\.com/shorts)/[^\s]+)', target_text)
         if not yt_links:
+            logging.warning("[YT Sum] No YouTube link found in target text")
             await message.edit(_("ys_error_no_link"))
             return
 
         target_url = yt_links[0]
+        logging.info(f"[YT Sum] Extracted URL: {target_url}")
+        
         no_preview = LinkPreviewOptions(is_disabled=True)
         active_msg = await message.edit(_("ys_processing"), link_preview_options=no_preview)
 
         try:
+            logging.info("[YT Sum] Fetching YouTube context and subtitles...")
             dur, ctx = await get_youtube_context(target_url)
             
             if cfg.get("debug_mode"):
                 print(f"\n--- YT DEBUG START ---\nURL: {target_url}\nCONTEXT SIZE: {len(ctx) if ctx else 0}\nCONTENT:\n{ctx}\n--- YT DEBUG END ---\n")
 
             if not ctx or ctx == _("yt_url_fallback"):
+                logging.error("[YT Sum] Failed to retrieve valid context from YouTube")
                 return await active_msg.edit(_("ys_error_no_context"), link_preview_options=no_preview)
+
+            logging.info(f"[YT Sum] Context retrieved successfully. Starting AI generation stream...")
 
             stream_gen = generate_ai_response_stream(
                 prompt_context=ctx,
@@ -172,7 +195,6 @@ def register_userbot(app: Client):
 
             full_reply = ""
             last_ui_update = time.time()
-            part_count = 1
             
             async for chunk in stream_gen:
                 full_reply += chunk
@@ -181,28 +203,28 @@ def register_userbot(app: Client):
                     formatted = _clean_formatting(full_reply)
                     
                     if len(formatted) > 3800:
+                        logging.info("[YT Sum] Message exceeds 3800 chars, splitting output into new message")
                         split_idx = full_reply.rfind("\n", 0, 3200)
                         if split_idx == -1: split_idx = 3200
                         
                         to_send = full_reply[:split_idx]
                         full_reply = full_reply[split_idx:].lstrip()
                         
-                        header = f"📺 <b>Summary (Part {part_count}):</b>\n\n"
-                        await active_msg.edit(f"{header}{_clean_formatting(to_send)}", parse_mode=enums.ParseMode.HTML)
+                        await active_msg.edit(_clean_formatting(to_send), parse_mode=enums.ParseMode.HTML)
                         
-                        part_count += 1
+                        logging.info("[YT Sum] Sending remaining chunk as a new message")
                         active_msg = await client.send_message(message.chat.id, "<i>...</i>", parse_mode=enums.ParseMode.HTML)
                     
                     try:
-                        header = f"📺 <b>Summary (Part {part_count}):</b>\n\n"
-                        await active_msg.edit(f"{header}{_clean_formatting(full_reply)} <i>...</i>", parse_mode=enums.ParseMode.HTML)
+                        await active_msg.edit(f"{_clean_formatting(full_reply)} <i>...</i>", parse_mode=enums.ParseMode.HTML)
                         last_ui_update = time.time()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
+                            logging.debug(f"[YT Sum] Stream edit suppressed: {e}")
 
-            header = f"📺 <b>Summary (Part {part_count}):</b>\n\n"
-            await active_msg.edit(f"{header}{_clean_formatting(full_reply)}", parse_mode=enums.ParseMode.HTML)
+            await active_msg.edit(_clean_formatting(full_reply), parse_mode=enums.ParseMode.HTML)
+            logging.info("[YT Sum] Processing completed successfully")
 
         except Exception as e:
-            logging.error(f"YT Summary Error: {e}")
+            logging.error(f"[YT Sum] Critical error during processing: {e}", exc_info=True)
             await active_msg.edit(_("ys_error_ai", e=str(e)[:200]))

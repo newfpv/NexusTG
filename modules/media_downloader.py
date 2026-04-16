@@ -29,6 +29,7 @@ async def _get_g_cfg():
         repo = CoreRepository(session)
         c = await repo.get_global_config()
         v = c.module_settings.get("media_downloader", {})
+        logging.debug("[Media Downloader] Global configuration loaded")
         return {
             "auto_my": v.get("auto_my", False),
             "auto_other": v.get("auto_other", False),
@@ -37,6 +38,7 @@ async def _get_g_cfg():
         }
 
 async def _upd_g_cfg(**kwargs):
+    logging.info(f"[Media Downloader] Updating global configuration: {list(kwargs.keys())}")
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
         c = await repo.get_global_config()
@@ -53,6 +55,7 @@ async def _get_c_cfg(chat_id):
         repo = CoreRepository(session)
         c = await repo.get_chat_config(chat_id)
         v = c.module_data.get("media_downloader", {})
+        logging.debug(f"[Media Downloader] Chat {chat_id} configuration loaded")
         return {
             "auto_my": v.get("auto_my", 2),
             "auto_other": v.get("auto_other", 2),
@@ -60,6 +63,7 @@ async def _get_c_cfg(chat_id):
         }
 
 async def _upd_c_cfg(chat_id, **kwargs):
+    logging.info(f"[Media Downloader] Updating chat {chat_id} configuration: {list(kwargs.keys())}")
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
         c = await repo.get_chat_config(chat_id)
@@ -80,7 +84,8 @@ def check_cookies_status():
                 if '.youtube.com' in content: status['yt'] = True
                 if '.instagram.com' in content: status['ig'] = True
                 if '.tiktok.com' in content: status['tt'] = True
-        except: pass
+        except Exception as e:
+            logging.error(f"[Media Downloader] Error reading cookies file: {e}")
     return status
 
 async def get_settings_buttons():
@@ -121,11 +126,13 @@ async def get_chat_md_kb(chat_id):
 
 @router.callback_query(F.data == "md_main")
 async def md_menu(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[Media Downloader] User {call.from_user.id} accessed main menu")
     await state.update_data(menu_msg_id=call.message.message_id)
     await safe_edit(call.message, state, _("menu_md_title"), await get_md_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data == "md_cookie_menu")
 async def md_cookie_menu(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[Media Downloader] User {call.from_user.id} accessed cookie menu")
     st = check_cookies_status()
     yt_st = _("md_cookie_loaded") if st["yt"] else _("md_cookie_missing")
     ig_st = _("md_cookie_loaded") if st["ig"] else _("md_cookie_missing")
@@ -141,6 +148,7 @@ async def md_cookie_menu(call: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "md_upload_cookie")
 async def md_upload_cookie_prompt(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[Media Downloader] User {call.from_user.id} initiated cookie upload")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="md_cookie_menu")]])
     await safe_edit(call.message, state, _("md_cookie_upload_prompt"), kb, parse_mode="HTML")
     await state.set_state(DownloadStates.waiting_for_cookie_file)
@@ -152,12 +160,14 @@ async def md_handle_cookie_doc(message: types.Message, state: FSMContext):
 
     doc = message.document
     if not doc.file_name.endswith('.txt'):
+        logging.warning(f"[Media Downloader] User {message.from_user.id} uploaded invalid cookie file format: {doc.file_name}")
         msg = await message.answer(_("md_cookie_err_format"), parse_mode="HTML")
         await asyncio.sleep(3)
         try: await msg.delete()
         except: pass
         return
 
+    logging.info(f"[Media Downloader] User {message.from_user.id} uploaded valid cookie file: {doc.file_name}")
     file = await message.bot.get_file(doc.file_id)
     temp_path = f"data/temp_{doc.file_id}.txt"
     await message.bot.download_file(file.file_path, temp_path)
@@ -167,6 +177,7 @@ async def md_handle_cookie_doc(message: types.Message, state: FSMContext):
             new_cookies = tf.read()
         with open(COOKIES_PATH, 'a', encoding='utf-8') as mf:
             mf.write("\n" + new_cookies)
+        logging.info("[Media Downloader] Cookies successfully appended to main database")
     except Exception as e:
         logging.error(_("log_md_cookie_append_err", e=e))
     finally:
@@ -195,20 +206,25 @@ async def md_handle_cookie_doc(message: types.Message, state: FSMContext):
 @router.callback_query(F.data == "md_clear_cookies")
 async def md_clear_cookies(call: types.CallbackQuery, state: FSMContext):
     if os.path.exists(COOKIES_PATH):
-        try: os.remove(COOKIES_PATH)
-        except: pass
+        try: 
+            os.remove(COOKIES_PATH)
+            logging.info(f"[Media Downloader] User {call.from_user.id} cleared the cookie database")
+        except Exception as e:
+            logging.error(f"[Media Downloader] Error clearing cookie database: {e}")
     await call.answer(_("md_cookie_cleared_alert"), show_alert=True)
     await md_cookie_menu(call, state)
 
 @router.callback_query(F.data.startswith("md_chat_main_"))
 async def md_chat_menu(call: types.CallbackQuery, state: FSMContext):
     chat_id = int(call.data.split("_")[3])
+    logging.info(f"[Media Downloader] User {call.from_user.id} accessed chat menu for {chat_id}")
     await state.update_data(menu_msg_id=call.message.message_id)
     await safe_edit(call.message, state, _("menu_md_chat_title", chat_id=chat_id), await get_chat_md_kb(chat_id), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("md_tgl_g_"))
 async def md_global_toggles(call: types.CallbackQuery, state: FSMContext):
     setting = "_".join(call.data.split("_")[3:])
+    logging.info(f"[Media Downloader] User {call.from_user.id} toggled global setting: {setting}")
     cfg = await _get_g_cfg()
     new_val = not cfg.get(setting, False)
     await _upd_g_cfg(**{setting: new_val})
@@ -220,6 +236,7 @@ async def md_chat_toggles(call: types.CallbackQuery, state: FSMContext):
     chat_id = int(parts[-1])
     setting = "_".join(parts[3:-1])
     
+    logging.info(f"[Media Downloader] User {call.from_user.id} toggled chat setting: {setting} for chat {chat_id}")
     chat_cfg = await _get_c_cfg(chat_id)
     curr = chat_cfg.get(setting, 2)
     nxt = 1 if curr == 2 else (0 if curr == 1 else 2)
@@ -229,6 +246,7 @@ async def md_chat_toggles(call: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "md_edit_cmd")
 async def md_edit_cmd(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[Media Downloader] User {call.from_user.id} requested command edit")
     cfg = await _get_g_cfg()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="md_main")]])
     await safe_edit(call.message, state, _("md_enter_command", cmd=cfg["command"]), kb, parse_mode="HTML")
@@ -240,6 +258,7 @@ async def md_save_cmd(message: types.Message, state: FSMContext):
     except: pass
     
     cmd = message.text.strip().split()[0]
+    logging.info(f"[Media Downloader] User {message.from_user.id} updated download command to: {cmd}")
     await _upd_g_cfg(command=cmd)
     
     await state.set_state(None)
@@ -257,6 +276,7 @@ async def md_save_cmd(message: types.Message, state: FSMContext):
         except: pass
 
 def _download_video_sync(url: str, output_template: str) -> str | None:
+    logging.info(f"[Media Downloader] Starting yt-dlp extraction for URL: {url}")
     ydl_opts = {
         'outtmpl': output_template,
         'format': 'best[ext=mp4]/best',
@@ -270,13 +290,16 @@ def _download_video_sync(url: str, output_template: str) -> str | None:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info)
+            filename = ydl.prepare_filename(info)
+            logging.info(f"[Media Downloader] yt-dlp extraction complete. Saved to: {filename}")
+            return filename
     except Exception as e:
         logging.error(_("log_md_ytdlp_err", e=e))
         return None
 
 def register_userbot(app: Client):
     async def process_media_download(client, message, target_msg, url: str, is_manual=False):
+        logging.info(f"[Media Downloader] Initiating download task for {url} in chat {message.chat.id}")
         status_msg = None
         is_me = (message.from_user and message.from_user.is_self)
         
@@ -290,12 +313,15 @@ def register_userbot(app: Client):
             downloaded_path = await asyncio.to_thread(_download_video_sync, url, temp_path)
             
             if downloaded_path and os.path.exists(downloaded_path):
+                logging.info(f"[Media Downloader] Uploading video to chat {message.chat.id}")
                 await client.send_video(
                     chat_id=message.chat.id,
                     video=downloaded_path,
                     reply_parameters=ReplyParameters(message_id=target_msg.id)
                 )
+                logging.info(f"[Media Downloader] Successfully sent video to chat {message.chat.id}")
             else:
+                logging.warning(f"[Media Downloader] File not found after download attempt for {url}")
                 raise ValueError(_("err_md_download_failed"))
                 
         except Exception as e:
@@ -309,11 +335,15 @@ def register_userbot(app: Client):
                     await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
         finally:
             if downloaded_path and os.path.exists(downloaded_path):
-                try: os.remove(downloaded_path)
-                except: pass
+                try: 
+                    os.remove(downloaded_path)
+                    logging.debug(f"[Media Downloader] Cleaned up temporary file: {downloaded_path}")
+                except Exception as cleanup_err: 
+                    logging.warning(f"[Media Downloader] Failed to clean up file {downloaded_path}: {cleanup_err}")
             if status_msg:
                 try: await status_msg.delete()
                 except: pass
+            logging.info(f"[Media Downloader] Task completed for chat {message.chat.id}")
 
     @app.on_message(filters.regex(URL_PATTERN) & filters.private, group=10)
     async def auto_download_handler(client, message):
@@ -329,6 +359,7 @@ def register_userbot(app: Client):
             match = URL_PATTERN.search(message.text or message.caption)
             if match:
                 url = match.group(1)
+                logging.info(f"[Media Downloader] Auto-download match found for URL: {url} in chat {message.chat.id}")
                 asyncio.create_task(process_media_download(client, message, message, url, is_manual=False))
 
     @app.on_message(filters.text & filters.reply & filters.private, group=22)
@@ -345,4 +376,5 @@ def register_userbot(app: Client):
                     match = URL_PATTERN.search(target.text or target.caption)
                     if match:
                         url = match.group(1)
+                        logging.info(f"[Media Downloader] Command trigger match found for URL: {url} in chat {message.chat.id}")
                         asyncio.create_task(process_media_download(client, message, target, url, is_manual=True))

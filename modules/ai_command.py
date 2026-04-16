@@ -28,6 +28,7 @@ AI_CMD_TIMEOUT = 240
 
 async def _get_cfg():
     a = await CoreAPI.get_module_cfg("ai_command")
+    logging.debug("[AI Cmd] Configuration loaded")
     return {
         "command": a.get("command", ".ai"),
         "use_search": a.get("use_search", True),
@@ -37,6 +38,7 @@ async def _get_cfg():
     }
 
 async def _upd_cfg(**kwargs):
+    logging.info(f"[AI Cmd] Updating configuration: {list(kwargs.keys())}")
     await CoreAPI.update_module_cfg("ai_command", **kwargs)
 
 async def get_settings_buttons():
@@ -59,6 +61,7 @@ async def get_aicmd_kb():
 
 @router.callback_query(F.data == "aicmd_main")
 async def aicmd_menu(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[AI Cmd] User {call.from_user.id} opened main menu")
     await state.update_data(menu_msg_id=call.message.message_id)
     cfg = await _get_cfg()
     text = _("menu_ai_cmd_title", prompt=html.escape(cfg["global_prompt"]))
@@ -67,12 +70,14 @@ async def aicmd_menu(call: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("aicmd_tgl_"))
 async def aicmd_toggles(call: types.CallbackQuery, state: FSMContext):
     setting = call.data.replace("aicmd_tgl_", "")
+    logging.info(f"[AI Cmd] User {call.from_user.id} toggled setting: {setting}")
     cfg = await _get_cfg()
     await _upd_cfg(**{setting: not cfg[setting]})
     await aicmd_menu(call, state)
 
 @router.callback_query(F.data == "aicmd_edit_cmd")
 async def aicmd_edit_cmd(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[AI Cmd] User {call.from_user.id} requested command edit")
     await safe_edit(call.message, state, _("ai_cmd_enter_cmd"), get_cancel_kb("aicmd_main"), parse_mode="HTML")
     await state.set_state(AICmdFSM.wait_command)
 
@@ -80,6 +85,7 @@ async def aicmd_edit_cmd(call: types.CallbackQuery, state: FSMContext):
 async def aicmd_save_cmd(message: types.Message, state: FSMContext):
     await safe_delete(message)
     cmd = message.text.strip().split()[0]
+    logging.info(f"[AI Cmd] User {message.from_user.id} saved new command: {cmd}")
     await _upd_cfg(command=cmd)
     await state.set_state(None)
     data = await state.get_data()
@@ -90,6 +96,7 @@ async def aicmd_save_cmd(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "aicmd_edit_prompt")
 async def aicmd_edit_prompt(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[AI Cmd] User {call.from_user.id} requested prompt edit")
     cfg = await _get_cfg()
     text = _("ai_cmd_enter_prompt", prompt=html.escape(cfg["global_prompt"]))
     await safe_edit(call.message, state, text, get_cancel_kb("aicmd_main"), parse_mode="HTML")
@@ -98,6 +105,7 @@ async def aicmd_edit_prompt(call: types.CallbackQuery, state: FSMContext):
 @router.message(AICmdFSM.wait_prompt)
 async def aicmd_save_prompt(message: types.Message, state: FSMContext):
     await safe_delete(message)
+    logging.info(f"[AI Cmd] User {message.from_user.id} saved new global prompt")
     await _upd_cfg(global_prompt=message.text.strip())
     await state.set_state(None)
     data = await state.get_data()
@@ -127,6 +135,8 @@ def register_userbot(app: Client):
         media_paths_to_cleanup = []
         start_time = time.time()
         
+        logging.info(f"[AI Cmd] Triggered in chat {message.chat.id} by user {message.from_user.id if message.from_user else 'Unknown'}")
+        
         try:
             cfg = await _get_cfg()
             is_me = bool(message.from_user and message.from_user.is_self)
@@ -136,8 +146,10 @@ def register_userbot(app: Client):
             if is_cmd:
                 match = re.match(rf"^{re.escape(cfg['command'])}(?:\s+(.*))?", message.text or message.caption or "", flags=re.DOTALL)
                 query = match.group(1).strip() if match and match.group(1) else ""
+                logging.debug(f"[AI Cmd] Extracted query: {query[:50]}...")
             else:
                 query = message.text or message.caption or ""
+                logging.debug(f"[AI Cmd] Processing reply context as query")
 
             no_preview = LinkPreviewOptions(is_disabled=True)
 
@@ -147,18 +159,20 @@ def register_userbot(app: Client):
             target_msg = message.reply_to_message if (is_cmd and message.reply_to_message) else message
             
             try:
+                logging.info(f"[AI Cmd] Building dialog context for target message {target_msg.id}")
                 hist_str, new_paths, dummy_dur, dummy_vid = await asyncio.wait_for(
                     build_dialog_context(client, message.chat.id, limit=30, target_msg_id=target_msg.id),
                     timeout=120.0
                 )
                 media_paths_to_cleanup.extend(new_paths)
+                logging.info(f"[AI Cmd] Context built successfully. History length: {len(hist_str)}")
             except asyncio.TimeoutError:
-                logging.error(f"[AI Cmd] Context Build Timeout")
+                logging.error(f"[AI Cmd] Context Build Timeout in chat {message.chat.id}")
                 await status_msg.edit("⏱ Context collection timeout", link_preview_options=no_preview)
                 return
             
             if time.time() - start_time > AI_CMD_TIMEOUT:
-                logging.warning(f"[AI Cmd] The total media download timeout has been exceeded")
+                logging.warning(f"[AI Cmd] Total execution timeout exceeded before media download in chat {message.chat.id}")
                 await status_msg.edit("⏱ Waiting time exceeded", link_preview_options=no_preview)
                 return
             
@@ -166,14 +180,16 @@ def register_userbot(app: Client):
             if target_msg.photo or target_msg.video:
                 try:
                     ext = ".jpg" if target_msg.photo else ".mp4"
+                    logging.info(f"[AI Cmd] Attempting to download media from message {target_msg.id}")
                     live_media_path = await asyncio.wait_for(
                         target_msg.download(file_name=f"data/live_{target_msg.id}{ext}"),
                         timeout=60.0
                     )
                     if live_media_path: 
                         media_paths_to_cleanup.append(live_media_path)
+                        logging.info(f"[AI Cmd] Media successfully downloaded to {live_media_path}")
                 except asyncio.TimeoutError:
-                    logging.warning(f"[AI Cmd] Media Download Timeout")
+                    logging.warning(f"[AI Cmd] Media Download Timeout for message {target_msg.id}")
 
             full_query = _("cmd_ai_context_dialogue", hist_str=hist_str)
             if is_cmd and message.reply_to_message:
@@ -183,6 +199,7 @@ def register_userbot(app: Client):
             full_query += _("cmd_ai_task_query", query=query or _("cmd_ai_default_query"))
             
             if cfg["show_debug"]:
+                logging.debug("[AI Cmd] Printing debug header to stdout")
                 print(_("log_debug_header"))
                 if live_media_path: 
                     print(_("log_attached_file", path=live_media_path))
@@ -196,6 +213,7 @@ def register_userbot(app: Client):
             prefix = f"<blockquote><i>{safe_q}</i></blockquote>\n"
             
             try:
+                logging.info(f"[AI Cmd] Initiating AI stream generation for chat {message.chat.id}")
                 stream_task = asyncio.create_task(
                     _consume_stream(
                         generate_ai_response_stream(
@@ -213,18 +231,19 @@ def register_userbot(app: Client):
                 )
                 
                 full_reply = await asyncio.wait_for(stream_task, timeout=180.0)
+                logging.info(f"[AI Cmd] Stream fully consumed for chat {message.chat.id}")
                 
                 if not typing_task.done(): 
                     typing_task.cancel()
                 
             except asyncio.TimeoutError:
-                logging.error(f"[AI Cmd] Response Streaming Timeout")
+                logging.error(f"[AI Cmd] Response Streaming Timeout in chat {message.chat.id}")
                 if not full_reply:
                     await status_msg.edit("⏱ Response generation timeout", link_preview_options=no_preview)
                     return
             except Exception as e:
                 if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
-                    logging.error(_("cmd_ai_log_error", e=str(e)))
+                    logging.error(f"[AI Cmd] Stream editing error: {e}")
                     if not last_sent_text: 
                         await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
             
@@ -232,41 +251,47 @@ def register_userbot(app: Client):
                 typing_task.cancel()
             
             if not full_reply or full_reply == "⏳":
+                logging.warning(f"[AI Cmd] Empty or timeout response received from AI in chat {message.chat.id}")
                 return await status_msg.edit(_("ai_cmd_error_empty"), link_preview_options=no_preview)
 
             if cfg["show_debug"]:
+                logging.debug("[AI Cmd] Printing debug output to stdout")
                 print(_("log_debug_output", reply=full_reply))
                 print(_("log_debug_footer"))
             
+            logging.info(f"[AI Cmd] Tracking AI message {status_msg.id} in DB")
             async with AsyncSessionLocal() as session:
                 await CoreRepository(session).track_ai_message(message.chat.id, status_msg.id)
 
         except Exception as e:
-            logging.error(_("cmd_ai_log_error", e=str(e)))
+            logging.error(f"[AI Cmd] Critical failure during AI command handling: {e}", exc_info=True)
             if 'status_msg' in locals() and status_msg: 
                 try: 
                     await status_msg.edit(_("cmd_ai_error_msg", e=str(e)), link_preview_options=no_preview)
                 except: 
                     pass
         finally:
+            logging.info(f"[AI Cmd] Cleaning up {len(media_paths_to_cleanup)} temporary media files")
             for p in media_paths_to_cleanup:
                 if os.path.exists(p):
                     try: 
                         os.remove(p)
-                    except: 
-                        pass
+                        logging.debug(f"[AI Cmd] Successfully removed {p}")
+                    except Exception as e:
+                        logging.warning(f"[AI Cmd] Failed to remove temporary file {p}: {e}")
             elapsed = time.time() - start_time
-            logging.info(f"[AI Cmd] Processing completed in {elapsed:.1f}s")
+            logging.info(f"[AI Cmd] Processing completed in {elapsed:.1f}s for chat {message.chat.id}")
 
 async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time, timeout):
     full_reply = ""
     last_sent_text = ""
     last_ui_update = time.time()
     
+    logging.debug(f"[AI Cmd] Stream consumer started. Timeout set to {timeout}s")
     try:
         async for chunk in stream_gen:
             if time.time() - start_time > timeout:
-                logging.warning("The total timeout during streaming has been exceeded")
+                logging.warning("[AI Cmd] Total timeout during streaming has been exceeded")
                 break
                 
             full_reply += chunk
@@ -281,11 +306,14 @@ async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time
                         last_sent_text = current_display
                         last_ui_update = time.time()
                     except FloodWait as e:
+                        logging.warning(f"[AI Cmd] FloodWait encountered ({e.value}s) during streaming")
                         await asyncio.sleep(e.value + 1)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
+                            logging.debug(f"[AI Cmd] Suppressed stream edit error: {e}")
         
         if full_reply:
+            logging.debug("[AI Cmd] Stream ended, processing final message state")
             html_final = md_to_html(full_reply)
             final_display = f"{prefix}<blockquote expandable>{html_final}</blockquote>"
             
@@ -293,12 +321,13 @@ async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time
                 try: 
                     await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
                 except FloodWait as e:
+                    logging.warning(f"[AI Cmd] Final message FloodWait ({e.value}s)")
                     await asyncio.sleep(e.value + 1)
                     await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.error(f"[AI Cmd] Failed to apply final edit: {e}")
                     
     except Exception as e:
-        logging.error(f"Error in consume_stream: {e}")
+        logging.error(f"[AI Cmd] Exception in stream consumer: {e}", exc_info=True)
         
     return full_reply
