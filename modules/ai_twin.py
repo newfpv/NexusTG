@@ -756,7 +756,6 @@ async def process_reply(client, message):
                         if g_cfg["ai_debug"]: logging.info(_("ai_log_skip_sleep", chat_id=chat_id))
                         return
             
-            # --- ИИ РЕАЛЬНО НАЧАЛ РАБОТУ ---
             is_processing_started = True
             logging.info(f"[AI Twin] Chat processing started: {chat_id}")
             
@@ -1003,32 +1002,32 @@ async def process_reply(client, message):
             if active_reply_tasks.get(chat_id) == asyncio.current_task():
                 del active_reply_tasks[chat_id]
 
-    @app.on_message(filters.private & ~filters.me, group=31)
-    async def ai_auto_reply(client, message):
-        if message.chat.type != ChatType.PRIVATE: 
-            return
-        if message.from_user and message.from_user.is_bot: 
-            return
-        if message.from_user and message.from_user.id == 777000: 
-            return
-            
-        chat_id = message.chat.id
-        
-        if chat_id in active_reply_tasks:
-            old_task = active_reply_tasks[chat_id]
-            if not old_task.done():
-                old_task.cancel()
-                logging.info(f"[AI Twin] The previous chat task was canceled {chat_id}")
-                try:
-                    await asyncio.wait_for(old_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-        
-        task = asyncio.create_task(process_reply(client, message))
-        active_reply_tasks[chat_id] = task
-        
-        def cleanup_task(t):
-            if active_reply_tasks.get(chat_id) == t:
-                del active_reply_tasks[chat_id]
+        @app.on_message(filters.private & ~filters.me, group=31)
+        async def ai_auto_reply(client, message):
+            if message.chat.type != ChatType.PRIVATE: 
+                return
+            if message.from_user and message.from_user.is_bot: 
+                return
+            if message.from_user and message.from_user.id == 777000: 
+                return
+                    
+            chat_id = message.chat.id
                 
-        task.add_done_callback(cleanup_task)
+            if chat_id in active_reply_tasks:
+                old_task = active_reply_tasks[chat_id]
+                if not old_task.done():
+                    old_task.cancel()
+                    logging.info(f"[AI Twin] The previous chat task was canceled {chat_id}")
+                    try:
+                        await asyncio.wait_for(old_task, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                
+            task = asyncio.create_task(process_reply(client, message))
+            active_reply_tasks[chat_id] = task
+                
+            def cleanup_task(t):
+                if active_reply_tasks.get(chat_id) == t:
+                    del active_reply_tasks[chat_id]
+                        
+            task.add_done_callback(cleanup_task)
