@@ -103,7 +103,7 @@ async def process_fsm_input(message: types.Message, state: FSMContext):
         await render_menu(mock_call, state)
 
 def register_userbot(app: Client):
-    @app.on_message(filters.me & filters.reply, group=-2)
+    @app.on_message(filters.me & filters.reply, group=20)
     async def command_trigger(client: Client, message):
         cfg = await _get_cfg()
         if not cfg["is_active"] or not message.text or not cfg["target_chat_id"]:

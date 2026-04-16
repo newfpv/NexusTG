@@ -315,7 +315,7 @@ def register_userbot(app: Client):
                 try: await status_msg.delete()
                 except: pass
 
-    @app.on_message(filters.regex(URL_PATTERN) & filters.private, group=-9)
+    @app.on_message(filters.regex(URL_PATTERN) & filters.private, group=10)
     async def auto_download_handler(client, message):
         cfg = await _get_g_cfg()
         chat_cfg = await _get_c_cfg(message.chat.id)
@@ -331,7 +331,7 @@ def register_userbot(app: Client):
                 url = match.group(1)
                 asyncio.create_task(process_media_download(client, message, message, url, is_manual=False))
 
-    @app.on_message(filters.text & filters.reply & filters.private, group=-9)
+    @app.on_message(filters.text & filters.reply & filters.private, group=22)
     async def cmd_download_handler(client, message):
         cfg = await _get_g_cfg()
         if message.text.lower().startswith(cfg["command"].lower()):

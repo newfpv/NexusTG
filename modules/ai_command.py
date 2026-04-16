@@ -122,7 +122,7 @@ def register_userbot(app: Client):
                         return True
         return False
 
-    @app.on_message(filters.create(ai_filter), group=-3)
+    @app.on_message(filters.create(ai_filter), group=32)
     async def handle_ai_cmd(client, message):
         media_paths_to_cleanup = []
         start_time = time.time()
@@ -153,13 +153,13 @@ def register_userbot(app: Client):
                 )
                 media_paths_to_cleanup.extend(new_paths)
             except asyncio.TimeoutError:
-                logging.error(f"[AI Cmd] Таймаут сборки контекста")
-                await status_msg.edit("⏱ Таймаут сбора контекста", link_preview_options=no_preview)
+                logging.error(f"[AI Cmd] Context Build Timeout")
+                await status_msg.edit("⏱ Context collection timeout", link_preview_options=no_preview)
                 return
             
             if time.time() - start_time > AI_CMD_TIMEOUT:
-                logging.warning(f"[AI Cmd] Превышен общий таймаут до скачивания медиа")
-                await status_msg.edit("⏱ Превышено время ожидания", link_preview_options=no_preview)
+                logging.warning(f"[AI Cmd] The total media download timeout has been exceeded")
+                await status_msg.edit("⏱ Waiting time exceeded", link_preview_options=no_preview)
                 return
             
             live_media_path = None
@@ -173,7 +173,7 @@ def register_userbot(app: Client):
                     if live_media_path: 
                         media_paths_to_cleanup.append(live_media_path)
                 except asyncio.TimeoutError:
-                    logging.warning(f"[AI Cmd] Таймаут скачивания медиа")
+                    logging.warning(f"[AI Cmd] Media Download Timeout")
 
             full_query = _("cmd_ai_context_dialogue", hist_str=hist_str)
             if is_cmd and message.reply_to_message:
@@ -218,9 +218,9 @@ def register_userbot(app: Client):
                     typing_task.cancel()
                 
             except asyncio.TimeoutError:
-                logging.error(f"[AI Cmd] Таймаут стриминга ответа")
+                logging.error(f"[AI Cmd] Response Streaming Timeout")
                 if not full_reply:
-                    await status_msg.edit("⏱ Таймаут генерации ответа", link_preview_options=no_preview)
+                    await status_msg.edit("⏱ Response generation timeout", link_preview_options=no_preview)
                     return
             except Exception as e:
                 if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
@@ -256,10 +256,9 @@ def register_userbot(app: Client):
                     except: 
                         pass
             elapsed = time.time() - start_time
-            logging.info(f"[AI Cmd] Обработка завершена за {elapsed:.1f}с")
+            logging.info(f"[AI Cmd] Processing completed in {elapsed:.1f}s")
 
 async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time, timeout):
-    """Вспомогательная функция для потребления стрима с проверкой таймаута"""
     full_reply = ""
     last_sent_text = ""
     last_ui_update = time.time()
@@ -267,7 +266,7 @@ async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time
     try:
         async for chunk in stream_gen:
             if time.time() - start_time > timeout:
-                logging.warning("Превышен общий таймаут во время стриминга")
+                logging.warning("The total timeout during streaming has been exceeded")
                 break
                 
             full_reply += chunk
@@ -300,6 +299,6 @@ async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time
                     pass
                     
     except Exception as e:
-        logging.error(f"Ошибка в consume_stream: {e}")
+        logging.error(f"Error in consume_stream: {e}")
         
     return full_reply

@@ -9,6 +9,7 @@ from google import genai
 from google.genai import types as genai_types
 from typing import AsyncIterable, Optional
 from datetime import timezone
+import json
 
 from core.config import _
 from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache
@@ -96,7 +97,11 @@ async def generate_ai_response(prompt_context: str, media_path: str = None, cust
     if not api_keys:
         return _("err_no_api_keys")
 
-    contents = [_("context_assembly", custom_prompt=custom_prompt or "", prompt_context=prompt_context)]
+    main_instruction = f"{custom_prompt or ''}\n\nIMPORTANT: ANSWER STRICTLY IN RUSSIAN LANGUAGE."
+    contents = [
+    f"CONTEXT DATA:\n{prompt_context}",
+    f"--- SYSTEM INSTRUCTION ---\n{main_instruction}"
+    ]
     
     if media_path and os.path.exists(media_path):
         try:
@@ -376,28 +381,69 @@ def extract_youtube_id(url: str) -> str | None:
         if match: return match.group(1)
     return None
 
+import json
+
+def _process_raw_subtitles(raw_text: str) -> str:
+    try:
+        data = json.loads(raw_text)
+        if "events" not in data:
+            return raw_text
+            
+        clean_parts = []
+        for event in data["events"]:
+            if "segs" in event:
+                for seg in event["segs"]:
+                    clean_parts.append(seg.get("utf8", ""))
+                    
+        text = "".join(clean_parts)
+        return " ".join(text.split())
+    except (json.JSONDecodeError, KeyError, TypeError):
+        lines = []
+        for line in raw_text.splitlines():
+            if '-->' in line or line.strip().isdigit() or not line.strip():
+                continue
+            lines.append(line.strip())
+        return " ".join(lines)
+
 def _fetch_yt_sync(url: str, video_id: str) -> tuple[int, str]:
     ydl_opts = {
-        'quiet': True, 'skip_download': True, 'writesubtitles': True,
-        'writeautomaticsub': True, 'subtitleslangs': ['ru', 'en'],
-        'subtitlesformat': 'json3/vtt/best', 'ignore_no_formats_error': True
+        'quiet': True,
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['ru', 'en'],
+        'subtitlesformat': 'json3/vtt/best',
+        'ignore_no_formats_error': True,
     }
-    if os.path.exists(COOKIES_PATH): ydl_opts['cookiefile'] = COOKIES_PATH
+    
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts['cookiefile'] = COOKIES_PATH
+        
     duration, context = 0, ""
+    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            context += _("yt_title_desc", title=info.get('title', ''), desc=info.get('description', ''))
+            if not info:
+                return 0, ""
+            
+            title = info.get('title', '')
+            desc = info.get('description', '')
+            context += _("yt_title_desc", title=title, desc=desc)
             duration = info.get('duration', 0)
+            
             subs = info.get('requested_subtitles', {})
             for lang in ['ru', 'en']:
                 if lang in subs and subs[lang].get('url'):
                     resp = requests.get(subs[lang]['url'], timeout=15)
                     if resp.status_code == 200:
-                        context += _("yt_subs_text", text=resp.text[:50000])
+                        clean_text = _process_raw_subtitles(resp.text)
+                        context += _("yt_subs_text", text=clean_text[:45000])
                         break
+                        
     except Exception as e:
-        logging.error(_("log_yt_parse_error", e=e))
+        logging.error(f"YT parsing error: {str(e)}")
+        
     return duration, context
 
 async def get_youtube_context(url: str) -> tuple[int, str]:

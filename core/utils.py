@@ -260,6 +260,7 @@ def md_to_html(text: str) -> str:
     text = re.sub(r'```(\w+)?\n?(.*?)```', r'<pre><code>\2</code></pre>', text, flags=re.DOTALL)
     text = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', text)
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'^[\*\-]\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
     text = re.sub(r'^#+\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     return text

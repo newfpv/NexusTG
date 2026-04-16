@@ -11,7 +11,7 @@ dependencies = [
     "python-dotenv==1.0.1",
     "sqlalchemy[asyncio]>=2.0.29",
     "aiosqlite>=0.20.0",
-    "yt-dlp>=2024.03.10",
+    "yt-dlp",
     "aiohttp>=3.9.3",
     "pydantic-settings>=2.2.1",
     "tzdata"

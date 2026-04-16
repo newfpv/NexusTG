@@ -76,16 +76,25 @@ async def alert_worker(bot: Bot, app: Client):
     while True:
         try:
             task_data = await alert_queue.get()
-            dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl = task_data
-            
-            await execute_alert(bot, app, dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl)
-            
-            alert_queue.task_done()
-            await asyncio.sleep(2.5) 
+            try:
+                dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl = task_data
+                
+                cfg = await _get_cfg()
+                delay = random.uniform(cfg.get("delay_min", 1.0), cfg.get("delay_max", 5.0))
+                
+                if delay > 0:
+                    logging.info(f"[Saver Worker] Task triggered for user {u_id}. Waiting {delay:.1f} seconds before sending.")
+                    await asyncio.sleep(delay)
+                
+                await execute_alert(bot, app, dump_id, u_id, topic_id, txt, f_path, m_type, del_after, is_ttl)
+            except Exception as e:
+                logging.error(f"[Saver Worker] Execution Error: {e}")
+            finally:
+                alert_queue.task_done()
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logging.error(f"[Saver Worker] Error: {e}")
+            logging.error(f"[Saver Worker] Queue Error: {e}")
 
 async def on_startup():
     global db_conn
@@ -597,9 +606,9 @@ def register_userbot(app: Client, bot: Bot):
                 if topic_id:
                     safe_ttl_txt = html.escape(text) if text else ""
                     await alert_queue.put((dump_chat_id, user.id, topic_id, safe_ttl_txt, file_path, media_type, True, is_ttl))
-                    logging.info(f"[Saver] Сохранено TTL-медиа {message.id} от пользователя {user.id}")
+                    logging.info(f"[Saver] Saved TTL media {message.id} from user {user.id}")
 
-    @app.on_message(filters.private & ~filters.bot & ~filters.me, group=-10)
+    @app.on_message(filters.private & ~filters.bot & ~filters.me, group=1)
     async def incoming_messages_handler(client, message):
         if not message.chat or message.chat.type != ChatType.PRIVATE: return
         user = message.from_user
@@ -620,7 +629,7 @@ def register_userbot(app: Client, bot: Bot):
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
-    @app.on_deleted_messages(group=-10)
+    @app.on_deleted_messages(group=2)
     async def handle_deleted_messages(client, messages):
         cfg = await _get_cfg()
         if not cfg["is_active"] or not cfg["save_deleted"]: return
@@ -650,7 +659,7 @@ def register_userbot(app: Client, bot: Bot):
             if topic_id:
                 safe_txt = html.escape(txt) if txt else ""
                 await alert_queue.put((dump_id, u_id, topic_id, safe_txt, f_path, m_type, True, False))
-                logging.info(f"[Saver] Сохранено удаленное сообщение {msg.id} от пользователя {u_id}")
+                logging.info(f"[Saver] Saved deleted message {msg.id} from user {u_id}")
                 
                 c_id = getattr(msg.chat, 'id', None)
                 if c_id: 
@@ -658,7 +667,7 @@ def register_userbot(app: Client, bot: Bot):
                         await db_conn.execute("DELETE FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, c_id))
                         await db_conn.commit()
 
-    @app.on_edited_message(filters.private & ~filters.bot & ~filters.me, group=-10)
+    @app.on_edited_message(filters.private & ~filters.bot & ~filters.me, group=3)
     async def handle_edited_messages(client, message):
         if not message.chat or message.chat.type != ChatType.PRIVATE: return
         user = message.from_user
@@ -683,7 +692,7 @@ def register_userbot(app: Client, bot: Bot):
                 if topic_id:
                     alert_txt = _("saver_alert_edited", old=html.escape(old_t), new=html.escape(new_t))
                     await alert_queue.put((dump_id, user.id, topic_id, alert_txt, f_path, m_type, False, False))
-                    logging.info(f"[Saver] Сохранено измененное сообщение {message.id} от пользователя {user.id}")
+                    logging.info(f"[Saver] Saved edited message {message.id} from user {user.id}")
                     
                 async with db_lock:
                     await db_conn.execute("UPDATE msg_cache SET text = ? WHERE message_id = ? AND chat_id = ?", (new_t, message.id, message.chat.id))

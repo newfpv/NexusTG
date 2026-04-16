@@ -696,7 +696,7 @@ def register_userbot(app: Client, bot: Bot):
         chat_id = message.chat.id
         start_time = time.time()
         
-        logging.info(f"[AI Twin] Начало обработки чата {chat_id}")
+        logging.info(f"[AI Twin] Chat processing started: {chat_id}")
         media_paths_to_cleanup = []
         
         try:
@@ -750,7 +750,6 @@ def register_userbot(app: Client, bot: Bot):
 
             chat_name = message.from_user.first_name if message.from_user else (message.chat.title or _("other_sender"))
             
-            # Сбор контекста с таймаутом 3 минуты (увеличено)
             try:
                 history_str, new_paths, latest_media_duration, video_too_long = await asyncio.wait_for(
                     build_dialog_context(client, chat_id, limit=50, target_msg_id=message.id, chat_name=chat_name),
@@ -758,10 +757,9 @@ def register_userbot(app: Client, bot: Bot):
                 )
                 media_paths_to_cleanup.extend(new_paths)
             except asyncio.TimeoutError:
-                logging.error(f"[AI Twin] Таймаут сбора контекста чата {chat_id}")
+                logging.error(f"[AI Twin] Chat context gathering timeout: {chat_id}")
                 return
 
-            # Скачивание живого медиа с таймаутом 2 минуты
             live_media_path = None
             if message.photo or message.video:
                 try:
@@ -773,7 +771,7 @@ def register_userbot(app: Client, bot: Bot):
                     if live_media_path: 
                         media_paths_to_cleanup.append(live_media_path)
                 except asyncio.TimeoutError:
-                    logging.warning(f"[AI Twin] Таймаут скачивания медиа {chat_id}")
+                    logging.warning(f"[AI Twin] Media download timeout {chat_id}")
 
             full_history_str = _("ai_dialog_context_header", me=_("me_sender"), other=chat_name) + history_str
             
@@ -800,14 +798,13 @@ def register_userbot(app: Client, bot: Bot):
                     logging.info(_("log_attached_live_media", path=live_media_path))
                 logging.info("="*50)
 
-            # Генерация ИИ с таймаутом 5 минут (увеличено с 3)
             try:
                 ai_generate_task = asyncio.create_task(
                     generate_ai_response(full_history_str, live_media_path, custom_prompt="", search_enabled=search_enabled)
                 )
                 reply = await asyncio.wait_for(ai_generate_task, timeout=300.0)
             except asyncio.TimeoutError:
-                logging.error(f"[AI Twin] Таймаут генерации ИИ для чата {chat_id} (300с)")
+                logging.error(f"[AI Twin] AI generation timeout for chat {chat_id} (300s)")
                 reply = None
                 if not ai_generate_task.done():
                     ai_generate_task.cancel()
@@ -816,7 +813,7 @@ def register_userbot(app: Client, bot: Bot):
                     except asyncio.CancelledError:
                         pass
             except Exception as e:
-                logging.error(f"[AI Twin] Ошибка генерации ИИ для чата {chat_id}: {e}")
+                logging.error(f"[AI Twin] Error generating AI for the chat {chat_id}: {e}")
                 reply = None
 
             if not reply or reply == "⏳": 
@@ -843,15 +840,14 @@ def register_userbot(app: Client, bot: Bot):
             if not reply: 
                 return 
 
-            # Задержки ПЕРЕД отправкой (delay_before)
             c_db_min = c_cfg["db_min"] if c_cfg["db_min"] is not None else g_cfg["db_min"]
             c_db_max = c_cfg["db_max"] if c_cfg["db_max"] is not None else g_cfg["db_max"]
             c_da_min = c_cfg["da_min"] if c_cfg["da_min"] is not None else g_cfg["da_min"]
-            c_da_max = cfg["da_max"] if c_cfg["da_max"] is not None else g_cfg["da_max"]
+            c_da_max = c_cfg["da_max"] if c_cfg["da_max"] is not None else g_cfg["da_max"]
 
             delay_before = random.randint(c_db_min, c_db_max)
             if delay_before > 0: 
-                logging.info(f"[AI Twin] Чат {chat_id}: ожидание delay_before={delay_before}с")
+                logging.info(f"[AI Twin] Chat {chat_id}: waiting for delay_before={delay_before}s")
                 await asyncio.sleep(delay_before)
 
             is_question = bool(re.search(_("ai_question_words_regex"), text_to_search.lower()))
@@ -861,7 +857,6 @@ def register_userbot(app: Client, bot: Bot):
                         logging.info(_("ai_log_ignored", chat_id=chat_id, chance=use_h_ignore))
                     return
 
-            # "Умное чтение" - дополнительная задержка на основе длины текста/видео
             c_s_mul = c_cfg["s_mul"] if c_cfg["s_mul"] is not None else g_cfg["s_mul"]
             smart_delay = 0
             if use_h_smart:
@@ -873,7 +868,7 @@ def register_userbot(app: Client, bot: Bot):
                     smart_delay = len(text_to_search) * c_s_mul
 
             if smart_delay > 0:
-                logging.info(f"[AI Twin] Чат {chat_id}: умное чтение {smart_delay:.1f}с")
+                logging.info(f"[AI Twin] Chat {chat_id}: smart reading {smart_delay:.1f}s")
                 current_time = time.time()
                 for cid in list(skip_video_timers.keys()):
                     if current_time - skip_video_timers[cid] > SKIP_VIDEO_TTL:
@@ -888,7 +883,6 @@ def register_userbot(app: Client, bot: Bot):
                     await asyncio.sleep(1)
                     elapsed_wait += 1
 
-            # Отправка сообщений
             parts = []
             for p in reply.split('\n'):
                 p = p.strip()
@@ -933,14 +927,13 @@ def register_userbot(app: Client, bot: Bot):
                 if i < len(parts) - 1:
                     await asyncio.sleep(random.uniform(0.5, 2.0)) 
 
-            # Задержка ПОСЛЕ отправки (delay_after)
             delay_after = random.randint(c_da_min, c_da_max)
             if delay_after > 0:
-                logging.info(f"[AI Twin] Чат {chat_id}: ожидание delay_after={delay_after}с")
+                logging.info(f"[AI Twin] Chat {chat_id}: waiting for delay_after={delay_after}s")
                 await asyncio.sleep(delay_after)
 
         except asyncio.CancelledError: 
-            logging.info(f"[AI Twin] Задача чата {chat_id} отменена")
+            logging.info(f"Task cancelled for chat {chat_id}")
             raise
         except Exception as e:
             logging.error(_("log_ai_critical_error", e=e))
@@ -951,7 +944,7 @@ def register_userbot(app: Client, bot: Bot):
                 pass
         finally:
             elapsed = time.time() - start_time
-            logging.info(f"[AI Twin] Завершение обработки чата {chat_id}, время: {elapsed:.1f}с")
+            logging.info(f"[AI Twin] Completion of chat processing {chat_id}, time: {elapsed:.1f}s")
             
             for p in media_paths_to_cleanup:
                 if p and os.path.exists(p):
@@ -963,7 +956,7 @@ def register_userbot(app: Client, bot: Bot):
             if active_reply_tasks.get(chat_id) == asyncio.current_task():
                 del active_reply_tasks[chat_id]
 
-    @app.on_message(filters.private & ~filters.me)
+    @app.on_message(filters.private & ~filters.me, group=31)
     async def ai_auto_reply(client, message):
         if message.chat.type != ChatType.PRIVATE: 
             return
@@ -974,18 +967,16 @@ def register_userbot(app: Client, bot: Bot):
             
         chat_id = message.chat.id
         
-        # Отменяем предыдущую задачу для этого чата
         if chat_id in active_reply_tasks:
             old_task = active_reply_tasks[chat_id]
             if not old_task.done():
                 old_task.cancel()
-                logging.info(f"[AI Twin] Отменена предыдущая задача для чата {chat_id}")
+                logging.info(f"[AI Twin] The previous chat task was canceled {chat_id}")
                 try:
                     await asyncio.wait_for(old_task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
         
-        # Создаем новую задачу БЕЗ общего таймаута (таймауты только внутри)
         task = asyncio.create_task(process_reply(client, message))
         active_reply_tasks[chat_id] = task
         
