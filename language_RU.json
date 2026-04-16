@@ -178,7 +178,8 @@
     "v_summary_prompt": "Сделай краткий пересказ этого ГС. Выдай ТОЛЬКО текст пересказа. НИКАКИХ вводных слов типа 'Вот выжимка', 'В этом тексте говорится' и прочего. СРАЗУ СУТЬ:\n\n",
     "v_summary_prefix": "📝 <b>Краткая выжимка:</b>\n<i>{summary}</i>",
     "v_voice_prefix": "",
-    "v_log_error_processing": "Ошибка расшифровки: {e}"
+    "v_log_error_processing": "Ошибка расшифровки: {e}",
+    "v_status_waiting": "⏳ <i>Ожидание аудио...</i>"
   },
   "fake_activity": {
     "btn_fake_activity": "🎭 Фейк активность",
@@ -495,7 +496,11 @@
     "md_cookie_missing": "🔴 Отсутствуют",
     "log_md_cookie_append_err": "Ошибка при добавлении cookies: {e}",
     "log_md_ytdlp_err": "Ошибка загрузки yt-dlp: {e}",
-    "err_md_download_failed": "Скачивание не удалось или файл не найден."
+    "err_md_download_failed": "Скачивание не удалось или файл не найден.",
+    "btn_md_verify_cookies": "✅ Проверить валидность",
+    "md_cookie_verify_text": "📊 <b>Результаты проверки куки-файлов:</b>\n\n<b>YouTube:</b> {yt}\n<b>Instagram:</b> {ig}\n<b>TikTok:</b> {tt}",
+    "md_cookie_valid": "✅ Живы (записей: {count})",
+    "md_cookie_expired": "❌ Истек срок действия"
   },
 "fact_checker": {
     "btn_fc_settings_main": "🔎 Проверка фактов",

@@ -29,6 +29,7 @@ router = Router()
 skip_video_timers = {}
 SKIP_VIDEO_TTL = 300
 active_reply_tasks = {}
+ai_is_answering = set()
 
 class AISettingsFSM(StatesGroup):
     custom_prompt = State()
@@ -100,6 +101,7 @@ async def _get_c_cfg(chat_id: int):
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
         c = await repo.get_chat_config(chat_id)
+        g = await repo.get_global_config()
         m = c.module_data or {}
         a = m.get("ai_engine", {})
         return {
@@ -118,7 +120,7 @@ async def _get_c_cfg(chat_id: int):
             "tmax": a.get("tmax", None),
             "pmin": a.get("pmin", None),
             "pmax": a.get("pmax", None),
-            "search_enabled": a.get("search_enabled", True)
+            "search_enabled": a.get("search_enabled", getattr(g, "google_search", True))
         }
 
 async def _upd_c_cfg(chat_id: int, db_fields=None, **kwargs):
@@ -243,7 +245,16 @@ async def toggle_search_global_cb(call: types.CallbackQuery, state: FSMContext):
 async def toggle_chat(call: types.CallbackQuery, state: FSMContext):
     chat_id = int(call.data.split("_")[2])
     cfg = await _get_c_cfg(chat_id)
-    await _upd_c_cfg(chat_id, db_fields={"is_active": not cfg["is_active"]})
+    new_state = not cfg["is_active"]
+    await _upd_c_cfg(chat_id, db_fields={"is_active": new_state})
+    
+    if not new_state and chat_id in active_reply_tasks:
+        task = active_reply_tasks[chat_id]
+        if not task.done():
+            task.cancel()
+            logging.info(f"[AI Twin] Chat toggle OFF: Cancelled task for chat {chat_id}")
+        del active_reply_tasks[chat_id]
+
     await chat_settings_menu(call, state, chat_id=chat_id)
     try: await call.answer()
     except Exception as e: logging.debug(f"toggle_chat answer error: {e}")
@@ -261,6 +272,7 @@ async def toggle_ignore(call: types.CallbackQuery, state: FSMContext):
 async def human_settings_global(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(menu_msg_id=call.message.message_id)
     cfg = await _get_g_cfg()
+    
     t_status = _("status_on") if cfg["h_typing"] else _("status_off")
     s_status = _("status_on") if cfg["h_smart"] else _("status_off")
     
@@ -294,7 +306,16 @@ async def human_settings_chat(call: types.CallbackQuery, state: FSMContext, chat
 @router.callback_query(F.data == "ai_toggle_global")
 async def toggle_global_ai_cb(call: types.CallbackQuery, state: FSMContext):
     cfg = await _get_g_cfg()
-    await _upd_g_cfg(db_fields={"global_ai_active": not cfg["is_active"]})
+    new_state = not cfg["is_active"]
+    await _upd_g_cfg(db_fields={"global_ai_active": new_state})
+    
+    if not new_state:
+        for cid, task in list(active_reply_tasks.items()):
+            if not task.done():
+                task.cancel()
+                logging.info(f"[AI Twin] Global toggle OFF: Cancelled task for chat {cid}")
+        active_reply_tasks.clear()
+
     await global_settings_menu(call, state)
     try: await call.answer()
     except Exception as e: logging.debug(f"toggle_global answer error: {e}")
@@ -692,12 +713,22 @@ async def save_delays(message: types.Message, state: FSMContext):
     finally: await state.set_state(None)
 
 def register_userbot(app: Client, bot: Bot):
-    async def process_reply(client, message):
+    @app.on_message(filters.private & filters.me, group=32)
+    async def cancel_on_my_reply(client, message):
+        chat_id = message.chat.id
+        if chat_id in ai_is_answering:
+            return
+        if chat_id in active_reply_tasks:
+            task = active_reply_tasks[chat_id]
+            if not task.done():
+                task.cancel()
+                logging.info(f"[AI Twin] Canceled pending AI task for chat {chat_id} due to manual user reply.")
+
+async def process_reply(client, message):
         chat_id = message.chat.id
         start_time = time.time()
-        
-        logging.info(f"[AI Twin] Chat processing started: {chat_id}")
         media_paths_to_cleanup = []
+        is_processing_started = False
         
         try:
             g_cfg = await _get_g_cfg()
@@ -724,6 +755,10 @@ def register_userbot(app: Client, bot: Bot):
                     if now_str >= sleep_start or now_str <= sleep_end: 
                         if g_cfg["ai_debug"]: logging.info(_("ai_log_skip_sleep", chat_id=chat_id))
                         return
+            
+            # --- ИИ РЕАЛЬНО НАЧАЛ РАБОТУ ---
+            is_processing_started = True
+            logging.info(f"[AI Twin] Chat processing started: {chat_id}")
             
             use_h_typing = g_cfg["h_typing"] if c_cfg["h_typing"] == 2 else bool(c_cfg["h_typing"])
             use_h_smart = g_cfg["h_smart"] if c_cfg["h_smart"] == 2 else bool(c_cfg["h_smart"])
@@ -840,6 +875,11 @@ def register_userbot(app: Client, bot: Bot):
             if not reply: 
                 return 
 
+            try:
+                await client.read_chat_history(chat_id)
+            except Exception as e:
+                logging.debug(f"read_chat_history error: {e}")
+
             c_db_min = c_cfg["db_min"] if c_cfg["db_min"] is not None else g_cfg["db_min"]
             c_db_max = c_cfg["db_max"] if c_cfg["db_max"] is not None else g_cfg["db_max"]
             c_da_min = c_cfg["da_min"] if c_cfg["da_min"] is not None else g_cfg["da_min"]
@@ -910,7 +950,13 @@ def register_userbot(app: Client, bot: Bot):
                     final_part = part
                 
                 reply_params = ReplyParameters(message_id=message.id) if (i == 0 and use_reply) else None
-                sent_msg = await client.send_message(chat_id, final_part, reply_parameters=reply_params)
+                
+                try:
+                    ai_is_answering.add(chat_id)
+                    sent_msg = await client.send_message(chat_id, final_part, reply_parameters=reply_params)
+                finally:
+                    await asyncio.sleep(0.5)
+                    ai_is_answering.discard(chat_id)
                 
                 try: 
                     await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
@@ -943,8 +989,9 @@ def register_userbot(app: Client, bot: Bot):
             except: 
                 pass
         finally:
-            elapsed = time.time() - start_time
-            logging.info(f"[AI Twin] Completion of chat processing {chat_id}, time: {elapsed:.1f}s")
+            if is_processing_started:
+                elapsed = time.time() - start_time
+                logging.info(f"[AI Twin] Completion of chat processing {chat_id}, time: {elapsed:.1f}s")
             
             for p in media_paths_to_cleanup:
                 if p and os.path.exists(p):

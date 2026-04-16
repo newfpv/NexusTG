@@ -217,61 +217,74 @@ def register_userbot(app: Client):
 
             if media_path and os.path.exists(media_path):
                 logging.info("[Voice Transcriber] Executing transcription API call")
-                raw_text = await transcribe_media(media_path)
                 
-                if raw_text and raw_text != "⏳":
-                    logging.info(f"[Voice Transcriber] Transcription successful. Length: {len(raw_text)}")
-                    summary_content = ""
-                    
-                    if cfg["summarize"] and duration >= 60:
-                        logging.info("[Voice Transcriber] Duration >= 60s, triggering summarization AI")
-                        summary_prompt = _("v_summary_prompt") + raw_text
-                        raw_summary = await generate_ai_response(summary_prompt, search_enabled=False)
-                        if raw_summary and raw_summary != "⏳":
-                            logging.info(f"[Voice Transcriber] Summarization successful. Length: {len(raw_summary)}")
-                            summary_content = _("v_summary_prefix", summary=raw_summary.strip()) + "\n\n"
-                        else:
-                            logging.warning("[Voice Transcriber] Summarization failed or timed out")
+                max_retries = 3
+                retry_delay = 60  
+                raw_text = None
 
-                    current_text = raw_text.strip()
-                    is_first = True
+                for attempt in range(max_retries):
+                    raw_text = await transcribe_media(media_path)
                     
-                    safe_tg_limit = 3800 
-                    
-                    while current_text or is_first:
-                        tags_wrapper = "<blockquote expandable>{}</blockquote>"
-                        prefix = summary_content if is_first else ""
+                    if raw_text and raw_text != "⏳":
+                        break 
                         
-                        overhead_length = len(prefix) + len(tags_wrapper.format(""))
-                        available_space = safe_tg_limit - overhead_length
-                        
-                        if len(current_text) > available_space:
-                            split_index = current_text.rfind(' ', 0, available_space)
-                            if split_index == -1: split_index = available_space
-                            chunk = current_text[:split_index]
-                            current_text = current_text[split_index:].strip()
-                            logging.debug(f"[Voice Transcriber] Splitting text chunk at index {split_index}")
-                        else:
-                            chunk = current_text
-                            current_text = ""
-                        
-                        formatted_msg = tags_wrapper.format(prefix + chunk)
-
-                        if is_first and is_manual and is_me:
+                    if attempt < max_retries - 1:
+                        logging.warning(f"[Voice Transcriber] API overloaded. Retrying in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
+                        if is_manual and is_me and status_msg:
                             try:
-                                await status_msg.edit(formatted_msg, parse_mode=enums.ParseMode.HTML)
-                                await _add_ignored(message.chat.id, status_msg.id)
-                                logging.info(f"[Voice Transcriber] Replaced status message with transcription result")
-                            except Exception as edit_err:
-                                logging.warning(f"[Voice Transcriber] Status edit failed: {edit_err}. Falling back to send_message.")
-                                sent_msg = await client.send_message(
-                                    chat_id=message.chat.id,
-                                    text=formatted_msg,
-                                    reply_parameters=ReplyParameters(message_id=target_msg.id),
-                                    parse_mode=enums.ParseMode.HTML
-                                )
-                                await _add_ignored(message.chat.id, sent_msg.id)
-                        else:
+                                await status_msg.edit(_("v_status_waiting"), parse_mode=enums.ParseMode.HTML)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(retry_delay)
+                
+                if not raw_text or raw_text == "⏳":
+                    logging.error(f"[Voice Transcriber] API returned empty or waiting status persistently for message {target_msg.id}")
+                    raise TimeoutError("API Overload") 
+
+                logging.info(f"[Voice Transcriber] Transcription successful. Length: {len(raw_text)}")
+                summary_content = ""
+                
+                if cfg["summarize"] and duration >= 60:
+                    logging.info("[Voice Transcriber] Duration >= 60s, triggering summarization AI")
+                    summary_prompt = _("v_summary_prompt") + raw_text
+                    
+                    raw_summary = await generate_ai_response(summary_prompt, search_enabled=False)
+                    if raw_summary and raw_summary != "⏳":
+                        logging.info(f"[Voice Transcriber] Summarization successful. Length: {len(raw_summary)}")
+                        summary_content = _("v_summary_prefix", summary=raw_summary.strip()) + "\n\n"
+                    else:
+                        logging.warning("[Voice Transcriber] Summarization failed or timed out")
+
+                current_text = raw_text.strip()
+                is_first = True
+                safe_tg_limit = 3800 
+                
+                while current_text or is_first:
+                    tags_wrapper = "<blockquote expandable>{}</blockquote>"
+                    prefix = summary_content if is_first else ""
+                    
+                    overhead_length = len(prefix) + len(tags_wrapper.format(""))
+                    available_space = safe_tg_limit - overhead_length
+                    
+                    if len(current_text) > available_space:
+                        split_index = current_text.rfind(' ', 0, available_space)
+                        if split_index == -1: split_index = available_space
+                        chunk = current_text[:split_index]
+                        current_text = current_text[split_index:].strip()
+                        logging.debug(f"[Voice Transcriber] Splitting text chunk at index {split_index}")
+                    else:
+                        chunk = current_text
+                        current_text = ""
+                    
+                    formatted_msg = tags_wrapper.format(prefix + chunk)
+
+                    if is_first and is_manual and is_me:
+                        try:
+                            await status_msg.edit(formatted_msg, parse_mode=enums.ParseMode.HTML)
+                            await _add_ignored(message.chat.id, status_msg.id)
+                            logging.info(f"[Voice Transcriber] Replaced status message with transcription result")
+                        except Exception as edit_err:
+                            logging.warning(f"[Voice Transcriber] Status edit failed: {edit_err}. Falling back to send_message.")
                             sent_msg = await client.send_message(
                                 chat_id=message.chat.id,
                                 text=formatted_msg,
@@ -279,13 +292,27 @@ def register_userbot(app: Client):
                                 parse_mode=enums.ParseMode.HTML
                             )
                             await _add_ignored(message.chat.id, sent_msg.id)
-                            logging.info(f"[Voice Transcriber] Sent transcription block as new message")
-                        
-                        is_first = False
-                        
-                else:
-                    logging.warning(f"[Voice Transcriber] API returned empty or waiting status for message {target_msg.id}")
-                    raise ValueError("Failed to transcribe")
+                    else:
+                        sent_msg = await client.send_message(
+                            chat_id=message.chat.id,
+                            text=formatted_msg,
+                            reply_parameters=ReplyParameters(message_id=target_msg.id),
+                            parse_mode=enums.ParseMode.HTML
+                        )
+                        await _add_ignored(message.chat.id, sent_msg.id)
+                        logging.info(f"[Voice Transcriber] Sent transcription block as new message")
+                    
+                    is_first = False
+
+        except TimeoutError as e:
+            logging.error(f"[Voice Transcriber] API Timeout/Overload: {e}. Silencing output to chat.")
+            if is_manual and is_me and status_msg:
+                try:
+                    await status_msg.delete()
+                    logging.info("[Voice Transcriber] Removed pending status message due to API overload.")
+                except Exception as del_err:
+                    logging.warning(f"[Voice Transcriber] Failed to delete status message: {del_err}")
+
         except Exception as e:
             logging.error(f"[Voice Transcriber] Error processing media: {e}", exc_info=True)
             err_txt = _("v_process_error")
@@ -294,6 +321,7 @@ def register_userbot(app: Client):
                     try: await status_msg.edit(err_txt)
                     except: await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
                 else: await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
+        
         finally:
             if media_path and os.path.exists(media_path):
                 try: 

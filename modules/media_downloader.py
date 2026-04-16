@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import asyncio
 import logging
 import yt_dlp
@@ -88,6 +89,47 @@ def check_cookies_status():
             logging.error(f"[Media Downloader] Error reading cookies file: {e}")
     return status
 
+def verify_cookies_file():
+    results = {"yt": {"present": False, "valid": False, "count": 0},
+               "ig": {"present": False, "valid": False, "count": 0},
+               "tt": {"present": False, "valid": False, "count": 0}}
+
+    if not os.path.exists(COOKIES_PATH):
+        return results
+
+    current_time = int(time.time())
+    try:
+        with open(COOKIES_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                
+                if line.startswith('#HttpOnly_'):
+                    line = line[10:]
+                elif line.startswith('#'):
+                    continue
+
+                parts = line.split('\t')
+                if len(parts) >= 7:
+                    domain = parts[0]
+                    try: exp = int(parts[4])
+                    except: exp = 0
+
+                    platform = None
+                    if '.youtube.com' in domain: platform = 'yt'
+                    elif '.instagram.com' in domain: platform = 'ig'
+                    elif '.tiktok.com' in domain: platform = 'tt'
+
+                    if platform:
+                        results[platform]["present"] = True
+                        results[platform]["count"] += 1
+                        if exp > current_time or exp == 0:
+                            results[platform]["valid"] = True
+    except Exception as e:
+        logging.error(f"[Media Downloader] Verification error: {e}")
+
+    return results
+
 async def get_settings_buttons():
     return [[InlineKeyboardButton(text=_("btn_md_settings_main"), callback_data="md_main")]]
 
@@ -141,8 +183,30 @@ async def md_cookie_menu(call: types.CallbackQuery, state: FSMContext):
     text = _("md_cookie_manager_text", yt=yt_st, ig=ig_st, tt=tt_st)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=_("btn_md_upload_cookie"), callback_data="md_upload_cookie")],
+        [InlineKeyboardButton(text=_("btn_md_verify_cookies"), callback_data="md_verify_cookies")],
         [InlineKeyboardButton(text=_("btn_md_clear_cookies"), callback_data="md_clear_cookies")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="md_main")]
+    ])
+    await safe_edit(call.message, state, text, kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "md_verify_cookies")
+async def md_verify_cookies(call: types.CallbackQuery, state: FSMContext):
+    logging.info(f"[Media Downloader] User {call.from_user.id} verifying cookies legitimacy")
+    stats = verify_cookies_file()
+
+    def get_text(p_data):
+        if not p_data["present"]: return _("md_cookie_missing")
+        if p_data["valid"]: return _("md_cookie_valid", count=p_data["count"])
+        return _("md_cookie_expired")
+
+    yt_st = get_text(stats["yt"])
+    ig_st = get_text(stats["ig"])
+    tt_st = get_text(stats["tt"])
+
+    text = _("md_cookie_verify_text", yt=yt_st, ig=ig_st, tt=tt_st)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=_("btn_back"), callback_data="md_cookie_menu")]
     ])
     await safe_edit(call.message, state, text, kb, parse_mode="HTML")
 
@@ -197,6 +261,7 @@ async def md_handle_cookie_doc(message: types.Message, state: FSMContext):
         text = _("md_cookie_manager_text", yt=yt_st, ig=ig_st, tt=tt_st)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=_("btn_md_upload_cookie"), callback_data="md_upload_cookie")],
+            [InlineKeyboardButton(text=_("btn_md_verify_cookies"), callback_data="md_verify_cookies")],
             [InlineKeyboardButton(text=_("btn_md_clear_cookies"), callback_data="md_clear_cookies")],
             [InlineKeyboardButton(text=_("btn_back"), callback_data="md_main")]
         ])
@@ -282,6 +347,12 @@ def _download_video_sync(url: str, output_template: str) -> str | None:
         'format': 'best[ext=mp4]/best',
         'quiet': True,
         'no_warnings': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Sec-Fetch-Mode': 'navigate',
+        }
     }
     
     if os.path.exists(COOKIES_PATH):
