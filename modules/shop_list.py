@@ -115,99 +115,126 @@ async def shop_save_chats(message: types.Message, state: FSMContext):
         except: pass
 
 def register_userbot(app: Client):
-    async def shop_filter(*args):
-        m = args[-1]
-        if getattr(m, "checklist", None): return False
-        text_to_check = m.text or m.caption or ""
-        
-        cfg = await _get_cfg()
-        if not cfg["active"]: return False
-        
-        is_me = (m.from_user and m.from_user.is_self)
-        if not is_me and not cfg["allow_others"]: return False
-
-        if text_to_check and re.match(rf"^{re.escape(cfg['command'])}(?:\s+|$)", text_to_check):
-            return True
-        
-        if m.reply_to_message:
-            target = m.reply_to_message
-            is_real_checklist = getattr(target, "checklist", None) is not None
-            target_text = target.text or target.caption or ""
-            has_md_items = "- [ ]" in target_text or "- [x]" in target_text
-            
-            check_title = _("checklist_title")
-            title_match = False
-            if is_real_checklist and target.checklist.title == check_title:
-                title_match = True
-            elif check_title in target_text and (is_real_checklist or has_md_items):
-                title_match = True
-                
-            if title_match: return True
-            
-        if cfg["auto_chats"]:
-            targets = [x.strip() for x in cfg["auto_chats"].split(",") if x.strip()]
-            curr_chat = str(m.chat.id)
-            thread_id = getattr(m, "message_thread_id", None)
-            curr_topic = str(thread_id) if thread_id else None
-            for t in targets:
-                if ":" in t:
-                    tc, tt = t.split(":", 1)
-                    if tc == curr_chat and tt == curr_topic: return True
-                elif t == curr_chat: return True
-        return False
-
-    @app.on_message(filters.create(shop_filter))
-    async def process_shop(client, message):
-        cfg = await _get_cfg()
-        cmd = cfg["command"]
-        sys_prompt = cfg.get("prompt", "")
-        
-        raw_text = (message.text or message.caption or "")
-        is_manual = raw_text.startswith(cmd)
-        if is_manual: raw_text = raw_text.replace(cmd, "", 1).strip()
-        
-        old_list = ""
-        should_delete_old = None
-        
-        if message.reply_to_message:
-            target = message.reply_to_message
-            is_real_checklist = getattr(target, "checklist", None) is not None
-            target_text = target.text or target.caption or ""
-            check_title = _("checklist_title")
-            
-            title_match = False
-            if is_real_checklist and target.checklist.title == check_title:
-                title_match = True
-            elif check_title in target_text:
-                title_match = True
-
-            if title_match:
-                should_delete_old = target
-                if is_real_checklist:
-                    old_list = "\n".join([t.text for t in target.checklist.tasks])
-                else:
-                    items = [l.replace("- [ ] ", "").replace("- [x] ", "").strip() for l in target_text.split("\n") if l.strip().startswith("- [")]
-                    old_list = "\n".join(items)
-
-        if is_manual and message.reply_to_message and not raw_text:
-            raw_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-
-        if not raw_text and not old_list: return
-        typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
-        
+    async def shop_filter(flt, cli, m):
         try:
-            if old_list:
-                query_body = _("shop_ai_query_template", existing=old_list, new=raw_text)
-            else:
-                query_body = _("shop_ai_query_new", text=raw_text)
+            text = m.text or m.caption or ""
+            if not text: 
+                return False
+                
+            cfg = await _get_cfg()
+            cmd = str(cfg.get("command", ".shop")).strip()
+            
+            is_cmd = text.startswith(cmd)
+            
+            is_reply_list = False
+            if m.reply_to_message:
+                t_text = m.reply_to_message.text or m.reply_to_message.caption or ""
+                if _("checklist_title") in t_text:
+                    is_reply_list = True
+
+            is_auto = False
+            if cfg.get("auto_chats"):
+                c_id = str(m.chat.id)
+                if c_id in cfg.get("auto_chats", ""):
+                    is_auto = True
+
+            if is_cmd or is_reply_list or is_auto:
+                if not cfg.get("active", True):
+                    logging.warning(f"[Shop] Module is OFF")
+                    return False
                     
+                is_me = bool(m.from_user and m.from_user.is_self)
+                if not is_me and not cfg.get("allow_others", True):
+                    logging.warning(f"[Shop] Blocked: allow_others is OFF")
+                    return False
+                    
+                return True
+                
+            return False
+        except Exception as e:
+            logging.error(f"[Shop] Filter crash: {e}")
+            return False
+
+    @app.on_message(filters.create(shop_filter), group=2)
+    async def handle_shop(client, message):
+        typing_task = None
+        try:
+            logging.info(f"[Shop] Triggered in chat {message.chat.id}")
+            cfg = await _get_cfg()
+            cmd = str(cfg.get("command", ".shop")).strip()
+            sys_prompt = cfg.get("prompt", "")
+
+            raw_text = message.text or message.caption or ""
+            is_manual = False
+            
+            if raw_text.startswith(cmd):
+                is_manual = True
+                raw_text = raw_text[len(cmd):].strip()
+
+            old_list = ""
+            should_delete_old = None
+
+            if message.reply_to_message:
+                target = message.reply_to_message
+                is_real_checklist = getattr(target, "checklist", None) is not None
+                target_text = target.text or target.caption or ""
+                check_title = _("checklist_title")
+
+                title_match = False
+                if is_real_checklist and getattr(target.checklist, "title", "") == check_title:
+                    title_match = True
+                elif check_title in target_text:
+                    title_match = True
+
+                if title_match:
+                    should_delete_old = target
+                    if is_real_checklist:
+                        old_list = "\n".join([t.text for t in getattr(target.checklist, "tasks", [])])
+                    else:
+                        items = [l.replace("- [ ] ", "").replace("- [x] ", "").strip() for l in target_text.split("\n") if l.strip().startswith("- [")]
+                        old_list = "\n".join(items)
+
+            if is_manual and message.reply_to_message and not raw_text:
+                raw_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+
+            if not raw_text and not old_list:
+                logging.warning("[Shop] Empty text, skipping")
+                return
+
+            typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
+
+            query_body = _("shop_ai_query_template", existing=old_list, new=raw_text) if old_list else _("shop_ai_query_new", text=raw_text)
             full_query = f"{sys_prompt}\n\n{query_body}"
             
+            logging.info("[Shop] Sending to AI...")
             res = await generate_ai_response(full_query, search_enabled=False)
-            match = re.search(r"\[.*\]", res, re.DOTALL)
-            if not match: return
             
-            tasks_list = json.loads(match.group(0))
+            if not res or res == "⏳" or res == _("status_waiting"):
+                logging.error("[Shop] AI timeout or wait status")
+                return
+
+            json_text = res.strip()
+            if "```json" in json_text:
+                json_text = json_text.split("```json")[1].split("```")[0]
+            elif "```" in json_text:
+                json_text = json_text.split("```")[1].split("```")[0]
+
+            start_idx = json_text.find('[')
+            end_idx = json_text.rfind(']')
+
+            if start_idx == -1 or end_idx == -1:
+                logging.error(f"[Shop] JSON not found in AI reply: {res}")
+                return
+
+            json_str = json_text[start_idx:end_idx+1]
+            json_str = re.sub(r',\s*\]', ']', json_str)
+
+            try:
+                tasks_list = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logging.error(f"[Shop] JSON Parse error: {e}")
+                return
+
             clean_tasks = [str(t).split(":", 1)[-1].strip() if ":" in str(t) else str(t) for t in tasks_list]
             reply_id = getattr(message, "message_thread_id", None)
 
@@ -215,24 +242,28 @@ def register_userbot(app: Client):
                 chunk = clean_tasks[i:i+30]
                 tasks_objs = [InputChecklistTask(id=idx+1, text=txt) for idx, txt in enumerate(chunk)]
                 checklist = InputChecklist(
-                    title=_("checklist_title"), 
-                    tasks=tasks_objs, 
-                    others_can_mark_tasks_as_done=True, 
+                    title=_("checklist_title"),
+                    tasks=tasks_objs,
+                    others_can_mark_tasks_as_done=True,
                     others_can_add_tasks=True
                 )
                 try:
                     await client.send_checklist(chat_id=message.chat.id, checklist=checklist, message_thread_id=reply_id)
-                except Exception:
+                except Exception as list_err:
+                    logging.warning(f"[Shop] send_checklist failed: {list_err}")
                     fmt = _("markdown_title") + "\n".join([f"- [ ] {t}" for t in chunk])
                     await client.send_message(message.chat.id, fmt, message_thread_id=reply_id)
 
             if should_delete_old:
                 try: await should_delete_old.delete()
                 except: pass
-            if cfg["delete_orig"]:
+
+            if cfg.get("delete_orig", True):
                 try: await message.delete()
                 except: pass
-        except Exception as e: 
-            logging.error(_("log_shop_error", e=e))
+
+        except Exception as e:
+            logging.error(f"[Shop] Critical error: {e}")
         finally:
-            typing_task.cancel()
+            if typing_task and not typing_task.done():
+                typing_task.cancel()
