@@ -223,6 +223,19 @@ async def saver_auto_setup(call: types.CallbackQuery, state: FSMContext):
         chat = await userbot_app.create_supergroup(_("saver_dump_title"), _("saver_dump_desc"))
         await asyncio.sleep(2.0)
         
+        try:
+            peer = await userbot_app.resolve_peer(chat.id)
+            if hasattr(peer, 'channel_id'):
+                channel = InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
+                try:
+                    await userbot_app.invoke(ToggleForum(channel=channel, enabled=True, tabs=False))
+                except TypeError:
+                    await userbot_app.invoke(ToggleForum(channel=channel, enabled=True))
+        except Exception as e:
+            logging.error(f"[Saver] Error while toggling forum: {e}")
+            
+        await asyncio.sleep(2.0) 
+        
         await userbot_app.add_chat_members(chat.id, bot_username)
         await asyncio.sleep(2.0)
         
@@ -235,20 +248,6 @@ async def saver_auto_setup(call: types.CallbackQuery, state: FSMContext):
                 can_invite_users=True, can_pin_messages=True, can_manage_topics=True
             )
         )
-        await asyncio.sleep(2.0)
-        
-        try:
-            peer = await userbot_app.resolve_peer(chat.id)
-            if hasattr(peer, 'channel_id'):
-                channel = InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
-                try:
-                    await userbot_app.invoke(ToggleForum(channel=channel, enabled=True, tabs=False))
-                except TypeError:
-                    await userbot_app.invoke(ToggleForum(channel=channel, enabled=True))
-        except Exception as e:
-            logging.error(f"[Saver] Error while toggling forum: {e}")
-            
-        await asyncio.sleep(3.0) 
             
         await _upd_cfg(dump_chat_id=str(chat.id))
         await call.answer(_("saver_auto_success"), show_alert=True)
@@ -287,6 +286,20 @@ async def saver_set_dump(call: types.CallbackQuery, state: FSMContext):
     if userbot_app and userbot_app.is_connected:
         try:
             bot_info = await call.bot.get_me()
+            
+            try:
+                peer = await userbot_app.resolve_peer(chat_id)
+                if hasattr(peer, 'channel_id'):
+                    channel = InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
+                    try:
+                        await userbot_app.invoke(ToggleForum(channel=channel, enabled=True, tabs=False))
+                    except TypeError:
+                        await userbot_app.invoke(ToggleForum(channel=channel, enabled=True))
+            except Exception as e:
+                logging.error(f"[Saver] Forum toggle error: {e}")
+
+            await asyncio.sleep(1.0)
+            
             try: 
                 await userbot_app.add_chat_members(chat_id, bot_info.username)
                 await asyncio.sleep(1.0)
@@ -301,19 +314,8 @@ async def saver_set_dump(call: types.CallbackQuery, state: FSMContext):
                         can_invite_users=True, can_pin_messages=True, can_manage_topics=True
                     )
                 )
-                await asyncio.sleep(1.0)
             except Exception: pass
             
-            try:
-                peer = await userbot_app.resolve_peer(chat_id)
-                if hasattr(peer, 'channel_id'):
-                    channel = InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
-                    try:
-                        await userbot_app.invoke(ToggleForum(channel=channel, enabled=True, tabs=False))
-                    except TypeError:
-                        await userbot_app.invoke(ToggleForum(channel=channel, enabled=True))
-            except Exception as e:
-                logging.error(f"[Saver] Forum toggle error: {e}")
         except Exception: pass
 
     await asyncio.sleep(2.0)
@@ -329,10 +331,27 @@ async def saver_manual_dump(call: types.CallbackQuery, state: FSMContext):
 async def saver_sv_dump(message: types.Message, state: FSMContext):
     try: await message.delete()
     except: pass
-    await _upd_cfg(dump_chat_id=message.text.strip())
+    
+    chat_id_str = message.text.strip()
+    
+    if chat_id_str.isdigit():
+        chat_id_str = f"-100{chat_id_str}"
+    elif chat_id_str.startswith("-") and not chat_id_str.startswith("-100"):
+        if len(chat_id_str) < 13: 
+            chat_id_str = chat_id_str.replace("-", "-100", 1)
+            
+    await _upd_cfg(dump_chat_id=chat_id_str)
+    
     await state.set_state(None)
     data = await state.get_data()
-    if data.get("menu_msg_id"): await message.bot.edit_message_text(_("menu_saver_title"), message.chat.id, data["menu_msg_id"], reply_markup=await get_saver_kb(), parse_mode="HTML")
+    if data.get("menu_msg_id"): 
+        await message.bot.edit_message_text(
+            _("menu_saver_title"), 
+            message.chat.id, 
+            data["menu_msg_id"], 
+            reply_markup=await get_saver_kb(), 
+            parse_mode="HTML"
+        )
 
 @router.callback_query(F.data == "saver_edit_targets")
 async def saver_ed_tg(call: types.CallbackQuery, state: FSMContext):
@@ -481,6 +500,13 @@ async def get_or_create_topic(app: Client, bot: Bot, dump_chat_id: int, user_id:
 
         return topic_id
     except Exception as e:
+        error_msg = str(e).lower()
+        if "not a forum" in error_msg:
+            try:
+                await bot.get_chat(dump_chat_id)
+            except Exception:
+                pass
+                
         logging.error(f"[Saver] Error creating topic: {e}")
         return None
 

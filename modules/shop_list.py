@@ -20,6 +20,32 @@ class ShopStates(StatesGroup):
     waiting_for_chats = State()
     waiting_for_command = State()
 
+def _parse_auto_chat_entries(raw_value: str) -> list[tuple[str, str | None]]:
+    entries = []
+    for part in (raw_value or "").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if ":" in token:
+            chat_id, topic_id = token.split(":", 1)
+            entries.append((chat_id, topic_id))
+        else:
+            entries.append((token, None))
+    return entries
+
+def _matches_auto_chat(raw_value: str, chat_id: int, topic_id: int | None) -> bool:
+    current_chat_id = str(chat_id)
+    current_topic_id = str(topic_id) if topic_id is not None else None
+
+    for entry_chat_id, entry_topic_id in _parse_auto_chat_entries(raw_value):
+        if entry_chat_id != current_chat_id:
+            continue
+        if entry_topic_id is None:
+            return True
+        if current_topic_id == entry_topic_id:
+            return True
+    return False
+
 async def _get_cfg():
     s = await CoreAPI.get_module_cfg("shop")
     return {
@@ -134,9 +160,11 @@ def register_userbot(app: Client):
 
             is_auto = False
             if cfg.get("auto_chats"):
-                c_id = str(m.chat.id)
-                if c_id in cfg.get("auto_chats", ""):
-                    is_auto = True
+                is_auto = _matches_auto_chat(
+                    cfg.get("auto_chats", ""),
+                    m.chat.id,
+                    getattr(m, "message_thread_id", None)
+                )
 
             if is_cmd or is_reply_list or is_auto:
                 if not cfg.get("active", True):
