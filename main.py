@@ -64,9 +64,9 @@ def load_modules(dispatcher: Dispatcher):
                 if hasattr(mod, "on_startup"):
                     plugins.startup_tasks.append(mod.on_startup)
                     
-                logging.info(_("log_module_loaded", module_name=module_name))
+                logging.info("[Core] Module loaded: %s", module_name)
             except Exception as e:
-                logging.error(_("log_module_error", module_name=module_name, e=e))
+                logging.error("[Core] Module load failed: %s | %s", module_name, e)
 
 async def generate_main_menu_content():
     if not userbot_app or not userbot_app.is_connected:
@@ -139,7 +139,7 @@ async def cb_chats_list(call: types.CallbackQuery, state: FSMContext):
                 
                 kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_chat_name", name=name), callback_data=f"chat_{chat.id}")])
         except Exception as e:
-            logging.error(f"Ошибка получения диалогов: {e}")
+            logging.error("[Core] Failed to fetch dialogs: %s", e)
         
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")])
     
@@ -159,7 +159,7 @@ async def get_generic_chat_menu_content(chat_id):
             if name_parts: 
                 chat_name = f"<b>{' '.join(name_parts)}</b>"
         except Exception as e:
-            logging.debug(f"Не удалось получить инфо о чате {chat_id}: {e}")
+            logging.debug("[Core] Failed to fetch chat info %s: %s", chat_id, e)
 
     text = _("menu_chat_title", chat_name=chat_name)
     kb = InlineKeyboardMarkup(inline_keyboard=[])
@@ -185,7 +185,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if not config.admin_id:
         await plugins.db.update_global_config(admin_id=message.from_user.id)
         config.admin_id = message.from_user.id
-        logging.info(_("log_admin_claimed", admin_id=message.from_user.id))
+        logging.info("[Auth] Admin claimed: %s", message.from_user.id)
         
     if message.from_user.id != config.admin_id:
         return await message.answer(_("auth_not_authorized"))
@@ -234,10 +234,10 @@ async def start_userbot(session_string):
             else:
                 handler_func(userbot_app)
         except Exception as e:
-            logging.error(_("log_module_start_error", e=e))
+            logging.error("[Core] Module startup failed: %s", e)
 
     await userbot_app.start()
-    logging.info(_("log_pyrogram_started"))
+    logging.info("[Core] Userbot started")
 
 async def stop_userbot():
     global userbot_app
@@ -256,9 +256,9 @@ async def userbot_health_monitor():
         if userbot_app:
             if not userbot_app.is_connected:
                 fail_count += 1
-                logging.error(_("log_userbot_disconnect_detected", fails=fail_count))
+                logging.error("[Health] Userbot disconnected | fails=%s", fail_count)
                 if fail_count >= 3:
-                    logging.critical(_("log_userbot_restarting"))
+                    logging.critical("[Health] Restarting userbot")
                     try:
                         await stop_userbot()
                         config = await plugins.db.get_global_config()
@@ -266,7 +266,7 @@ async def userbot_health_monitor():
                             await start_userbot(config.session_string)
                         fail_count = 0
                     except Exception as e:
-                        logging.critical(_("log_userbot_restart_failed", e=e))
+                        logging.critical("[Health] Userbot restart failed: %s", e)
             else:
                 fail_count = 0
             
@@ -283,14 +283,14 @@ async def userbot_health_monitor():
             for chat_id in stuck_tasks:
                 task = active_reply_tasks.get(chat_id)
                 if task and not task.done():
-                    logging.critical(f"[Health Monitor] Отмена зависшей задачи чата {chat_id} (возраст > {MAX_TASK_LIFETIME}с)")
+                    logging.critical("[Health] Cancelling stuck chat task %s | age>%ss", chat_id, MAX_TASK_LIFETIME)
                     task.cancel()
                     try:
                         await asyncio.wait_for(task, timeout=5.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         pass
                     except Exception as e:
-                        logging.error(f"Ошибка при отмене задачи {chat_id}: {e}")
+                        logging.error("[Health] Failed to cancel task %s: %s", chat_id, e)
 
 async def main():
     await init_db()
@@ -307,22 +307,22 @@ async def main():
     load_modules(dp)
     
     if plugins.startup_tasks:
-        logging.info(_("log_startup_tasks"))
+        logging.info("[Core] Running startup tasks")
         for task in plugins.startup_tasks:
             try:
                 await task()
             except Exception as e:
-                logging.error(_("log_module_start_error", e=e))
+                logging.error("[Core] Module startup failed: %s", e)
     
     config = await plugins.db.get_global_config()
     if config and config.session_string:
-        logging.info(_("log_session_found"))
+        logging.info("[Core] Existing session found")
         await start_userbot(config.session_string)
         
     asyncio.create_task(userbot_health_monitor())
     asyncio.create_task(plugins.cleanup_media_cache())
     
-    logging.info(_("log_polling_start"))
+    logging.info("[Core] Polling started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

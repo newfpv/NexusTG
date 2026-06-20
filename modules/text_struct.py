@@ -1,3 +1,4 @@
+import os
 import re
 import asyncio
 import logging
@@ -9,9 +10,9 @@ from aiogram.fsm.state import StatesGroup, State
 from pyrogram import Client, filters, enums
 from pyrogram.types import LinkPreviewOptions, Message
 
-from core.utils import safe_edit, safe_delete, get_cancel_kb, CoreAPI, md_to_html, simulate_typing, safe_userbot_handler
+from core.utils import safe_edit, safe_delete, get_cancel_kb, CoreAPI, md_to_html, simulate_typing, safe_userbot_handler, download_media_checked
 from core.config import _
-from core.services import generate_ai_response
+from core.services import generate_ai_response, transcribe_media
 
 router = Router()
 MODULE_NAME = "text_struct"
@@ -19,6 +20,78 @@ MODULE_NAME = "text_struct"
 class TextStructFSM(StatesGroup):
     wait_cmd = State()
     wait_prompt = State()
+
+def _clean_text(value) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    return text.strip()
+
+def _extract_message_text(message: Message) -> str:
+    return _clean_text(getattr(message, "text", None)) or _clean_text(getattr(message, "caption", None))
+
+def _extract_reply_quote_text(message: Message) -> str:
+    for attr in ("quote_text", "quoteText", "reply_quote_text"):
+        quote_text = _clean_text(getattr(message, attr, None))
+        if quote_text:
+            return quote_text
+
+    holders = []
+    for attr in ("quote", "reply_quote", "text_quote", "reply_to", "reply_to_header", "reply_parameters", "reply_markup"):
+        holder = getattr(message, attr, None)
+        if holder:
+            holders.append(holder)
+
+    raw = getattr(message, "_raw", None) or getattr(message, "raw", None)
+    if raw:
+        holders.append(raw)
+        raw_reply = getattr(raw, "reply_to", None)
+        if raw_reply:
+            holders.append(raw_reply)
+
+    for holder in holders:
+        if isinstance(holder, str):
+            quote_text = _clean_text(holder)
+            if quote_text:
+                return quote_text
+
+        for attr in ("quote_text", "quoteText", "reply_quote_text", "text"):
+            quote_text = _clean_text(getattr(holder, attr, None))
+            if quote_text:
+                return quote_text
+
+    return ""
+
+def _is_transcribable_media(message: Message) -> bool:
+    return any(getattr(message, attr, None) for attr in ("voice", "audio", "video_note"))
+
+def _media_ext(message: Message) -> str:
+    if getattr(message, "audio", None):
+        return ".mp3"
+    if getattr(message, "video_note", None):
+        return ".mp4"
+    return ".ogg"
+
+async def _transcribe_struct_media(client: Client, message: Message) -> str:
+    media_path = None
+    try:
+        os.makedirs("data", exist_ok=True)
+        media_path = await download_media_checked(
+            client,
+            message,
+            file_name=f"data/ts_fix_{message.id}{_media_ext(message)}",
+            timeout=90.0,
+        )
+        text = await transcribe_media(media_path)
+        if not text or text == _("status_waiting"):
+            return ""
+        return text.strip()
+    finally:
+        if media_path and os.path.exists(media_path):
+            try:
+                os.remove(media_path)
+            except OSError as exc:
+                logging.debug("[Struct] Failed to remove temporary media file %s: %s", media_path, exc)
 
 async def _get_cfg() -> dict:
     cfg = await CoreAPI.get_module_cfg(MODULE_NAME)
@@ -101,7 +174,8 @@ async def ts_save_input(message: types.Message, state: FSMContext):
     await _ret_menu(message, state)
 
 async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
-    if not ai_text or ai_text == "⏳" or ai_text == _("status_waiting"):
+    ai_ok = bool(ai_text and ai_text != "⏳" and ai_text != _("status_waiting"))
+    if not ai_ok:
         logging.warning("[Struct] AI returned empty or waiting status, applying fallback error text")
         html_text = f"{original_text}\n\n{_('ts_error')}"
         fallback_text = html_text
@@ -118,6 +192,7 @@ async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
         else:
             await msg_to_edit.edit_text(html_text, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
         logging.info(f"[Struct] Successfully applied edit to message {msg_to_edit.id}")
+        return ai_ok
     except Exception as e:
         logging.warning(f"[Struct] Failed to edit message with HTML parse mode: {e}. Attempting fallback.")
         try:
@@ -126,8 +201,10 @@ async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
             else:
                 await msg_to_edit.edit_text(fallback_text, link_preview_options=no_preview)
             logging.info(f"[Struct] Successfully applied fallback edit to message {msg_to_edit.id}")
+            return ai_ok
         except Exception as fallback_e:
             logging.error(f"[Struct] Critical failure during message editing: {fallback_e}")
+            return False
 
 def register_userbot(app: Client):
     @app.on_message(filters.me & (filters.text | filters.caption), group=-5)
@@ -138,7 +215,7 @@ def register_userbot(app: Client):
             return
             
         cmd = str(cfg.get("command")).strip()
-        msg_text = message.text or message.caption or ""
+        msg_text = _extract_message_text(message)
         
         if not re.match(rf"^{re.escape(cmd)}(?:\s+|$)", msg_text):
             return
@@ -175,17 +252,54 @@ def register_userbot(app: Client):
             return
 
         target_msg = message.reply_to_message
-        text_to_process = target_msg.text or target_msg.caption or ""
-        
-        if not text_to_process.strip():
-            logging.debug("[Struct] Target message contains no processable text. Ignoring.")
-            return
-            
-        is_ours = getattr(target_msg, "outgoing", False) or (getattr(target_msg, "from_user", None) and target_msg.from_user.is_self)
-        
-        prompt_to_use = cfg.get("prompt")
+
+        prompt_to_use = cfg.get("prompt") or ""
         if query:
             prompt_to_use += f"\n\n{query}"
+
+        if _is_transcribable_media(target_msg):
+            logging.info(f"[Struct] Generating structured response from media message {target_msg.id}")
+            try:
+                await message.edit_text(
+                    _("v_status_processing"),
+                    parse_mode=enums.ParseMode.HTML,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception as e:
+                logging.debug(f"[Struct] Failed to edit trigger message to media status: {e}")
+
+            typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
+            text_to_process = ""
+            try:
+                text_to_process = await _transcribe_struct_media(client, target_msg)
+                if not text_to_process:
+                    raise ValueError("media transcription returned empty text")
+                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+            except Exception as e:
+                logging.error(f"[Struct] AI Generation failed for media message: {e}")
+                ai_text = None
+            finally:
+                typing_task.cancel()
+
+            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text)
+            if edit_success:
+                try:
+                    await target_msg.delete()
+                    logging.info(f"[Struct] Deleted source media message {target_msg.id} after successful structuring")
+                except Exception as e:
+                    logging.warning(f"[Struct] Structured text was created, but source media delete failed: {e}")
+            return
+
+        quote_text = _extract_reply_quote_text(message)
+        text_to_process = quote_text or _extract_message_text(target_msg)
+        if quote_text:
+            logging.debug("[Struct] Using reply quote text as source")
+
+        if not text_to_process.strip():
+            logging.debug("[Struct] Target message and reply quote contain no processable text. Ignoring.")
+            return
+
+        is_ours = getattr(target_msg, "outgoing", False) or (getattr(target_msg, "from_user", None) and target_msg.from_user.is_self)
 
         logging.info(f"[Struct] Generating structured response for target message {target_msg.id}")
 

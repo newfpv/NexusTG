@@ -1,8 +1,38 @@
 
+# Runtime data and secrets
 data/
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
 venv/
 env/
-.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Temporary files and logs
+*.log
+*.tmp
+*.temp
+*.bak
+*~
+
+# Editors, OS, and local tooling
+.idea/
+.vscode/
+.sixth/
+.DS_Store
+Thumbs.db

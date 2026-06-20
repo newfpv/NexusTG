@@ -1,594 +1,530 @@
+import asyncio
+import inspect
+import logging
+import mimetypes
 import os
 import re
 import time
-import asyncio
-import logging
-import requests
-import yt_dlp
+from datetime import datetime, timedelta
+from typing import AsyncIterator
+
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
-from typing import AsyncIterable, Optional
-from datetime import timezone
-import json
 
 from core.config import _
 from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache
+from core.utils import download_media_checked, is_bot_dialog
 
 GEMINI_TIMEOUT = 60.0
-MAX_RETRIES_PER_KEY = 2
-CIRCUIT_BREAKER_THRESHOLD = 5
 MEDIA_DOWNLOAD_TIMEOUT = 90.0
+KEY_COOLDOWN = 60.0
+SERVER_COOLDOWN = 180.0
+AUTH_COOLDOWN = 1800.0
+YOUTUBE_CACHE_TTL_DAYS = 7
+MAX_CONTEXT_MEDIA = 3
 
-circuit_failures = {}
-circuit_last_failure = {}
 
-def get_model_config(search_enabled=True):
-    tools = [{"google_search": {}}] if search_enabled else None
-    return genai_types.GenerateContentConfig(
-        safety_settings=[
-            genai_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-            genai_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-            genai_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-            genai_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-        ],
-        tools=tools
-    )
+def _split_csv(value: str | None) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
 
-def extract_retry_delay(error_message: str) -> int:
-    """Извлекает время задержки из ошибки 429"""
-    # Формат: 'retryDelay': '50s' или "retryDelay": "50s"
-    match = re.search(r"['\"]retryDelay['\"]:\s*['\"](\d+)s['\"]", error_message)
-    if match:
-        return int(match.group(1))
-    # Формат: retry in 50.7s или Please retry in 50s
-    match = re.search(r"retry\s+in\s+(\d+\.?\d*)s", error_message, re.IGNORECASE)
-    if match:
-        return int(float(match.group(1)))
-    # Стандартное значение по документации Gemini (обычно 60с для 429)
-    return 60
 
-async def _call_gemini_with_timeout(client, model_name, contents, config):
-    """Улучшенная версия с пробросом исключений для обработки вне"""
-    try:
-        task = asyncio.create_task(
-            client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config
-            )
-        )
-        return await asyncio.wait_for(task, timeout=GEMINI_TIMEOUT)
-    except asyncio.TimeoutError:
-        logging.warning(f"⏱ Таймаут Gemini ({GEMINI_TIMEOUT}с) на модели {model_name}")
-        if 'task' in locals() and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        return None
-    # НЕ ловим здесь другие исключения - пусть летят вверх для обработки 429!
+async def _get_ai_config() -> tuple[list[str], list[str]]:
+    async with AsyncSessionLocal() as session:
+        cfg = await CoreRepository(session).get_global_config()
+        return _split_csv(cfg.api_keys), _split_csv(cfg.model_fallback_list)
 
-def _check_circuit_breaker(api_key: str) -> bool:
+
+def _error_code(exc: Exception) -> int | None:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _cooldown_for(exc: Exception) -> float:
+    code = _error_code(exc)
+    if code in {401, 403}:
+        return AUTH_COOLDOWN
+    if code == 429:
+        return KEY_COOLDOWN
+    if code and code >= 500:
+        return SERVER_COOLDOWN
+    return 0.0
+
+
+async def _is_available(repo: CoreRepository, api_key: str, model: str, search_enabled: bool) -> bool:
+    state = await repo.get_ai_key_state(api_key)
     now = time.time()
-    failures = circuit_failures.get(api_key, 0)
-    last_fail = circuit_last_failure.get(api_key, 0)
-    
-    if failures >= CIRCUIT_BREAKER_THRESHOLD:
-        if now - last_fail < 300:
-            return False
-        circuit_failures[api_key] = 0
-    
-    return True
+    if search_enabled and state.search_unban_time > now:
+        return False
+    if not search_enabled and state.unban_time > now:
+        return False
+    exhausted = state.search_exhausted_models if search_enabled else state.exhausted_models
+    return exhausted.get(model, 0) <= now
 
-def _record_failure(api_key: str):
-    circuit_failures[api_key] = circuit_failures.get(api_key, 0) + 1
-    circuit_last_failure[api_key] = time.time()
 
-async def generate_ai_response(prompt_context: str, media_path: str = None, custom_prompt: str = None, search_enabled: bool = True) -> str:
-    logging.info(_("log_generate_start"))
+async def _mark_failure(api_key: str, model: str, search_enabled: bool, exc: Exception) -> None:
+    cooldown = _cooldown_for(exc)
+    if cooldown <= 0:
+        return
+    until = time.time() + cooldown
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
-        config = await repo.get_global_config()
-        
-    api_keys = [k.strip() for k in (config.api_keys or "").split(",") if k.strip()]
-    model_fallback_list = [m.strip() for m in (config.model_fallback_list or "gemini-2.5-flash-lite").split(",") if m.strip()]
-    
+        state = await repo.get_ai_key_state(api_key)
+        if search_enabled:
+            exhausted = dict(state.search_exhausted_models or {})
+            exhausted[model] = until
+            state.search_exhausted_models = exhausted
+            if _error_code(exc) in {401, 403, 429}:
+                state.search_unban_time = until
+        else:
+            exhausted = dict(state.exhausted_models or {})
+            exhausted[model] = until
+            state.exhausted_models = exhausted
+            if _error_code(exc) in {401, 403, 429}:
+                state.unban_time = until
+        await session.commit()
+
+
+def _guess_mime(path: str) -> str:
+    mime, _ = mimetypes.guess_type(path)
+    if mime:
+        return mime
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".oga", ".ogg", ".opus"}:
+        return "audio/ogg"
+    if ext in {".mp3"}:
+        return "audio/mpeg"
+    if ext in {".mp4", ".m4v"}:
+        return "video/mp4"
+    return "application/octet-stream"
+
+
+def _build_contents(prompt_context: str, media_path: str | None = None) -> list:
+    prompt_context = (prompt_context or "").strip()
+    contents: list = [prompt_context] if prompt_context else []
+    if media_path and os.path.isfile(media_path) and os.path.getsize(media_path) > 0:
+        with open(media_path, "rb") as media_file:
+            contents.append(genai_types.Part.from_bytes(data=media_file.read(), mime_type=_guess_mime(media_path)))
+    return contents
+
+
+def _build_config(custom_prompt: str | None, search_enabled: bool) -> genai_types.GenerateContentConfig:
+    kwargs = {"system_instruction": custom_prompt or None}
+    if search_enabled:
+        kwargs["tools"] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+    return genai_types.GenerateContentConfig(**kwargs)
+
+
+def _response_text(response) -> str:
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    parts: list[str] = []
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            value = getattr(part, "text", None)
+            if value:
+                parts.append(value)
+    return "".join(parts).strip()
+
+
+async def _run_with_fallbacks(prompt_context: str, media_path: str | None, custom_prompt: str | None, search_enabled: bool) -> str:
+    if not (prompt_context or "").strip() and not (media_path and os.path.isfile(media_path) and os.path.getsize(media_path) > 0):
+        logging.warning("[Services] Gemini request skipped: empty prompt and no media")
+        return _("status_waiting")
+
+    api_keys, models = await _get_ai_config()
     if not api_keys:
+        logging.error("[Services] Gemini API keys are not configured")
         return _("err_no_api_keys")
+    if not models:
+        models = ["gemini-2.5-flash"]
 
-    main_instruction = f"{custom_prompt or ''}\n\nIMPORTANT: ANSWER STRICTLY IN RUSSIAN LANGUAGE."
-    contents = [
-    f"CONTEXT DATA:\n{prompt_context}",
-    f"--- SYSTEM INSTRUCTION ---\n{main_instruction}"
-    ]
-    
-    if media_path and os.path.exists(media_path):
-        try:
-            ext = media_path.lower()
-            mime_type = "image/jpeg"
-            if ext.endswith((".ogg", ".oga")): mime_type = "audio/ogg"
-            elif ext.endswith(".mp3"): mime_type = "audio/mp3"
-            elif ext.endswith(".wav"): mime_type = "audio/wav"
-            elif ext.endswith((".mp4", ".mov", ".avi")): mime_type = "video/mp4"
+    last_error: Exception | None = None
+    for api_key in api_keys:
+        async with AsyncSessionLocal() as session:
+            repo = CoreRepository(session)
+            usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
+        if not usable_models:
+            continue
 
-            with open(media_path, "rb") as f:
-                contents.append(genai_types.Part.from_bytes(data=f.read(), mime_type=mime_type))
-        except Exception as e:
-            logging.error(_("log_media_attach_error", e=e))
+        client = genai.Client(api_key=api_key)
+        for model in usable_models:
+            try:
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model,
+                        contents=_build_contents(prompt_context, media_path),
+                        config=_build_config(custom_prompt, search_enabled),
+                    ),
+                    timeout=GEMINI_TIMEOUT,
+                )
+                text = _response_text(response)
+                if text:
+                    return text
+            except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                logging.warning("[Services] Gemini request failed on %s: %s", model, exc)
+                await _mark_failure(api_key, model, search_enabled, exc)
+            except Exception as exc:
+                last_error = exc
+                logging.exception("[Services] Unexpected Gemini request failure on %s", model)
 
-    for model_name in model_fallback_list:
-        for api_key in api_keys:
-            if not _check_circuit_breaker(api_key):
-                continue
-                
-            async with AsyncSessionLocal() as session:
-                repo = CoreRepository(session)
-                state = await repo.get_ai_key_state(api_key)
-                current_time = time.time()
-                
-                if current_time < state.unban_time: continue
-                if model_name in (state.exhausted_models or {}) and current_time < state.exhausted_models[model_name]:
-                    continue
-                
-                actual_search = search_enabled
-                if search_enabled:
-                    if current_time < state.search_unban_time or (model_name in (state.search_exhausted_models or {}) and current_time < state.search_exhausted_models[model_name]):
-                        actual_search = False
-
-                try:
-                    client = genai.Client(api_key=api_key)
-                    response = await _call_gemini_with_timeout(client, model_name, contents, get_model_config(search_enabled=actual_search))
-                    
-                    if response is None:
-                        _record_failure(api_key)
-                        continue
-                        
-                    if response.text and response.text.strip():
-                        logging.info(_("log_ai_generated", model=model_name, search="on" if actual_search else "off"))
-                        circuit_failures[api_key] = 0
-                        return response.text
-                    else:
-                        continue
-                        
-                except Exception as e:
-                    err_str = str(e)
-                    err_lower = err_str.lower()
-                    new_exh = dict(state.exhausted_models or {})
-                    new_s_exh = dict(state.search_exhausted_models or {})
-                    key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
-                    
-                    # Обработка ошибок 5xx - бан модели на всех ключах
-                    if any(x in err_lower for x in ["500", "503", "502"]):
-                        _record_failure(api_key)
-                        ban_until = current_time + 180  # 3 минуты на перегрузку
-                        for k in api_keys:
-                            k_state = await repo.get_ai_key_state(k)
-                            k_exh = dict(k_state.exhausted_models or {})
-                            k_exh[model_name] = ban_until
-                            await repo.update_ai_key_state(k, exhausted_models=k_exh)
-                        logging.warning(_("log_model_banned_global", model=model_name))
-                        break 
-                    
-                    # ОБРАБОТКА 429 - КВОТА ИСЧЕРПАНА
-                    elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        _record_failure(api_key)
-                        
-                        # Извлекаем время задержки из ошибки
-                        retry_delay = extract_retry_delay(err_str)
-                        ban_until = current_time + retry_delay
-                        
-                        if "search" in err_lower or "grounding" in err_lower:
-                            new_s_exh[model_name] = ban_until
-                            await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
-                            logging.warning(f"⛔️ Поиск для {model_name} на ключе {key_hidden} отложен на {retry_delay}с (429 Quota)")
-                        else:
-                            new_exh[model_name] = ban_until
-                            await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
-                            logging.warning(f"⛔️ Модель {model_name} на ключе {key_hidden} отложена на {retry_delay}с (429 Quota)")
-                            
-                    elif "400" in err_str:
-                        await repo.update_ai_key_state(api_key, unban_time=current_time + 10)
-                        
-                    continue
-                    
+    if last_error:
+        logging.error("[Services] All Gemini fallbacks failed: %s", last_error)
     return _("status_waiting")
 
-async def generate_ai_response_stream(prompt_context: str, media_path: str = None, custom_prompt: str = None, search_enabled: bool = True) -> AsyncIterable[str]:
-    logging.info(_("log_generate_start"))
-    async with AsyncSessionLocal() as session:
-        repo = CoreRepository(session)
-        config = await repo.get_global_config()
-        
-    api_keys = [k.strip() for k in (config.api_keys or "").split(",") if k.strip()]
-    model_fallback_list = [m.strip() for m in (config.model_fallback_list or "gemini-2.5-flash-lite").split(",") if m.strip()]
-    
+
+async def generate_ai_response(
+    prompt_context: str,
+    media_path: str | None = None,
+    custom_prompt: str | None = None,
+    search_enabled: bool = True,
+) -> str:
+    return await _run_with_fallbacks(prompt_context, media_path, custom_prompt, search_enabled)
+
+
+async def generate_ai_response_stream(
+    prompt_context: str,
+    media_path: str | None = None,
+    custom_prompt: str | None = None,
+    search_enabled: bool = True,
+) -> AsyncIterator[str]:
+    api_keys, models = await _get_ai_config()
     if not api_keys:
+        logging.error("[Services] Gemini API keys are not configured")
         yield _("err_no_api_keys")
         return
+    if not models:
+        models = ["gemini-2.5-flash"]
 
-    contents = [_("context_assembly", custom_prompt=custom_prompt or "", prompt_context=prompt_context)]
-    
-    if media_path and os.path.exists(media_path):
-        try:
-            mime_type = "image/jpeg"
-            if media_path.lower().endswith((".mp4", ".mov")): mime_type = "video/mp4"
-            elif media_path.lower().endswith((".ogg", ".mp3")): mime_type = "audio/mpeg"
-            with open(media_path, "rb") as f:
-                contents.append(genai_types.Part.from_bytes(data=f.read(), mime_type=mime_type))
-        except Exception: pass
+    for api_key in api_keys:
+        async with AsyncSessionLocal() as session:
+            repo = CoreRepository(session)
+            usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
+        if not usable_models:
+            continue
 
-    for model_name in model_fallback_list:
-        for api_key in api_keys:
-            if not _check_circuit_breaker(api_key):
-                continue
-                
-            async with AsyncSessionLocal() as session:
-                repo = CoreRepository(session)
-                state = await repo.get_ai_key_state(api_key)
-                current_time = time.time()
+        client = genai.Client(api_key=api_key)
+        for model in usable_models:
+            try:
+                stream = client.aio.models.generate_content_stream(
+                    model=model,
+                    contents=_build_contents(prompt_context, media_path),
+                    config=_build_config(custom_prompt, search_enabled),
+                )
+                if inspect.isawaitable(stream):
+                    stream = await asyncio.wait_for(stream, timeout=GEMINI_TIMEOUT)
 
-                if current_time < state.unban_time: continue
-                if model_name in (state.exhausted_models or {}) and current_time < state.exhausted_models[model_name]:
-                    continue
-                
-                actual_search = search_enabled
-                if search_enabled:
-                    if current_time < state.search_unban_time or (model_name in (state.search_exhausted_models or {}) and current_time < state.search_exhausted_models[model_name]):
-                        actual_search = False
-
-                try:
-                    client = genai.Client(api_key=api_key)
-                    got_response = False
-                    
-                    stream = client.aio.models.generate_content_stream(
-                        model=model_name,
-                        contents=contents,
-                        config=get_model_config(search_enabled=actual_search)
-                    )
-                    
+                got_response = False
+                while True:
                     try:
-                        while True:
-                            try:
-                                chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
-                            except StopAsyncIteration:
-                                break
-                                
-                            if chunk.text and chunk.text.strip():
-                                if not got_response:
-                                    logging.info(_("log_ai_generated", model=model_name, search="on" if actual_search else "off"))
-                                    got_response = True
-                                    circuit_failures[api_key] = 0
-                                yield chunk.text
-                                
-                        if got_response: 
-                            return
-                            
-                    except asyncio.TimeoutError:
-                        _record_failure(api_key)
-                        if got_response: 
-                            return
-                        continue
-                        
-                except Exception as e:
-                    err_str = str(e)
-                    err_lower = err_str.lower()
-                    new_exh = dict(state.exhausted_models or {})
-                    new_s_exh = dict(state.search_exhausted_models or {})
-                    key_hidden = f"{api_key[:4]}***{api_key[-4:]}"
-                    
-                    # Обработка 5xx
-                    if any(x in err_lower for x in ["500", "503", "502"]):
-                        _record_failure(api_key)
-                        ban_until = current_time + 180
-                        for k in api_keys:
-                            k_state = await repo.get_ai_key_state(k)
-                            k_exh = dict(k_state.exhausted_models or {})
-                            k_exh[model_name] = ban_until
-                            await repo.update_ai_key_state(k, exhausted_models=k_exh)
-                        logging.warning(_("log_model_banned_global", model=model_name))
-                        break 
-                    
-                    # ОБРАБОТКА 429 в стриме
-                    elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        _record_failure(api_key)
-                        retry_delay = extract_retry_delay(err_str)
-                        ban_until = current_time + retry_delay
-                        
-                        if "search" in err_lower or "grounding" in err_lower:
-                            new_s_exh[model_name] = ban_until
-                            await repo.update_ai_key_state(api_key, search_exhausted_models=new_s_exh)
-                            logging.warning(f"⛔️ Поиск для {model_name} на ключе {key_hidden} отложен на {retry_delay}с (429)")
-                        else:
-                            new_exh[model_name] = ban_until
-                            await repo.update_ai_key_state(api_key, exhausted_models=new_exh)
-                            logging.warning(f"⛔️ Модель {model_name} на ключе {key_hidden} отложена на {retry_delay}с (429)")
-                            
-                    elif "400" in err_str:
-                        await repo.update_ai_key_state(api_key, unban_time=current_time + 10)
-                        
-                    continue
+                        chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
+                    except StopAsyncIteration:
+                        break
+
+                    text = _response_text(chunk)
+                    if text:
+                        got_response = True
+                        yield text
+                if got_response:
+                    return
+            except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
+                logging.warning("[Services] Gemini stream failed on %s: %s", model, exc)
+                await _mark_failure(api_key, model, search_enabled, exc)
+            except Exception:
+                logging.exception("[Services] Unexpected Gemini stream failure on %s", model)
+    yield _("status_waiting")
+
+
+async def transcribe_media(media_path: str) -> str:
+    if not media_path or not os.path.isfile(media_path) or os.path.getsize(media_path) <= 0:
+        raise ValueError("Cannot transcribe missing or empty media file")
+    prompt = _("prompt_transcribe")
+    result = await generate_ai_response(prompt, media_path=media_path, custom_prompt="", search_enabled=False)
+    return "" if result == _("status_waiting") else result
+
 
 async def test_ai_credentials(progress_cb=None) -> str:
-    logging.info(_("log_test_start"))
-    async with AsyncSessionLocal() as session:
-        repo = CoreRepository(session)
-        config = await repo.get_global_config()
-        
-    if not config.api_keys or not config.model_fallback_list:
+    api_keys, models = await _get_ai_config()
+    if not api_keys or not models:
         return _("test_no_data")
 
-    api_keys = [k.strip() for k in config.api_keys.split(",") if k.strip()]
-    models = [m.strip() for m in config.model_fallback_list.split(",") if m.strip()]
-    
     total_steps = len(api_keys) * len(models)
     current_step = 0
     final_report = _("test_result_title")
-    is_cancelled = False
-    
-    for key in api_keys:
-        if is_cancelled: break
-        key_hidden = f"{key[:4]}***{key[-4:]}"
+    cancelled = False
+
+    for api_key in api_keys:
+        if cancelled:
+            break
+        key_hidden = f"{api_key[:4]}***{api_key[-4:]}" if len(api_key) >= 8 else "***"
         final_report += _("test_key_status", key_hidden=key_hidden, status="")
-        
+        client = genai.Client(api_key=api_key)
+
         for model in models:
             current_step += 1
             if progress_cb:
-                should_continue = await progress_cb(_("test_progress", key_hidden=key_hidden, model=model, current=current_step, total=total_steps))
+                should_continue = await progress_cb(
+                    _("test_progress", key_hidden=key_hidden, model=model, current=current_step, total=total_steps)
+                )
                 if should_continue is False:
-                    is_cancelled = True
+                    cancelled = True
                     break
                 await asyncio.sleep(0.1)
 
             try:
-                client = genai.Client(api_key=key)
                 response = await asyncio.wait_for(
                     client.aio.models.generate_content(model=model, contents=[_("ping_prompt")]),
-                    timeout=30.0
+                    timeout=30.0,
                 )
-                res_text = _("test_ok")
+                result = _("test_ok") if _response_text(response) else _("test_error")
             except asyncio.TimeoutError:
-                res_text = _("test_error") + " (timeout)"
-            except Exception as e:
-                res_text = f"{_('test_error')} ({str(e)[:15]}...)"
-            
-            final_report += _("test_model_status", model=model, res=res_text)
+                result = _("test_error_timeout")
+            except Exception as exc:
+                result = f"{_('test_error')} ({str(exc)[:60]})"
+
+            final_report += _("test_model_status", model=model, res=result)
         final_report += "\n"
-        
-    if is_cancelled: final_report += "\n" + _("test_cancelled_msg")
-    logging.info(_("log_test_complete"))
+
+    if cancelled:
+        final_report += "\n" + _("test_cancelled_msg")
     return final_report
 
-async def transcribe_media(media_path: str) -> str:
-    if not os.path.exists(media_path): return ""
+
+def _extract_video_id(url: str) -> str:
+    patterns = [
+        r"(?:v=)([A-Za-z0-9_-]{6,})",
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"/shorts/([A-Za-z0-9_-]{6,})",
+        r"/embed/([A-Za-z0-9_-]{6,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return re.sub(r"\W+", "_", url)[:120]
+
+
+def _download_youtube_context_sync(url: str) -> tuple[int, str]:
     try:
-        text = await generate_ai_response(
-            prompt_context=_("prompt_transcribe"), 
-            media_path=media_path, 
-            search_enabled=False
-        )
-        return text if text != _("status_waiting") else ""
-    except Exception as e:
-        logging.error(_("log_transcribe_error", e=e))
-        return ""
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("yt-dlp is not installed") from exc
 
-COOKIES_PATH = "data/cookies.txt"
-
-def extract_youtube_id(url: str) -> str | None:
-    patterns = [r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", r"youtu\.be\/([0-9A-Za-z_-]{11})", r"shorts\/([0-9A-Za-z_-]{11})"]
-    for p in patterns:
-        match = re.search(p, url)
-        if match: return match.group(1)
-    return None
-
-import json
-
-def _process_raw_subtitles(raw_text: str) -> str:
-    try:
-        data = json.loads(raw_text)
-        if "events" not in data:
-            return raw_text
-            
-        clean_parts = []
-        for event in data["events"]:
-            if "segs" in event:
-                for seg in event["segs"]:
-                    clean_parts.append(seg.get("utf8", ""))
-                    
-        text = "".join(clean_parts)
-        return " ".join(text.split())
-    except (json.JSONDecodeError, KeyError, TypeError):
-        lines = []
-        for line in raw_text.splitlines():
-            if '-->' in line or line.strip().isdigit() or not line.strip():
-                continue
-            lines.append(line.strip())
-        return " ".join(lines)
-
-def _fetch_yt_sync(url: str, video_id: str) -> tuple[int, str]:
     ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'subtitleslangs': ['ru', 'en'],
-        'subtitlesformat': 'json3/vtt/best',
-        'ignore_no_formats_error': True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "extract_flat": False,
     }
-    
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts['cookiefile'] = COOKIES_PATH
-        
-    duration, context = 0, ""
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return 0, ""
-            
-            title = info.get('title', '')
-            desc = info.get('description', '')
-            context += _("yt_title_desc", title=title, desc=desc)
-            duration = info.get('duration', 0)
-            
-            subs = info.get('requested_subtitles', {})
-            for lang in ['ru', 'en']:
-                if lang in subs and subs[lang].get('url'):
-                    resp = requests.get(subs[lang]['url'], timeout=15)
-                    if resp.status_code == 200:
-                        clean_text = _process_raw_subtitles(resp.text)
-                        context += _("yt_subs_text", text=clean_text[:45000])
-                        break
-                        
-    except Exception as e:
-        logging.error(f"YT parsing error: {str(e)}")
-        
-    return duration, context
+    if os.path.exists("data/cookies.txt"):
+        ydl_opts["cookiefile"] = "data/cookies.txt"
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    title = info.get("title") or ""
+    duration = int(info.get("duration") or 0)
+    description = info.get("description") or ""
+    subtitles = info.get("subtitles") or {}
+    auto_subtitles = info.get("automatic_captions") or {}
+
+    transcript = ""
+    for source in (subtitles, auto_subtitles):
+        if transcript:
+            break
+        for lang in ("ru", "en", "uk", "be"):
+            entries = source.get(lang) or []
+            for entry in entries:
+                sub_url = entry.get("url")
+                if not sub_url:
+                    continue
+                try:
+                    import requests
+
+                    response = requests.get(sub_url, timeout=20)
+                    response.raise_for_status()
+                    raw = response.text
+                    raw = re.sub(r"<[^>]+>", " ", raw)
+                    raw = re.sub(r"\s+", " ", raw)
+                    transcript = raw.strip()
+                    break
+                except Exception as exc:
+                    logging.debug("[Services] Failed to fetch subtitles: %s", exc)
+            if transcript:
+                break
+
+    context_parts = [part for part in [f"Title: {title}" if title else "", f"Duration: {duration}s", transcript] if part]
+    if not transcript and description:
+        context_parts.append(f"Description: {description[:6000]}")
+    return duration, "\n\n".join(context_parts).strip()
+
 
 async def get_youtube_context(url: str) -> tuple[int, str]:
-    video_id = extract_youtube_id(url)
-    if not video_id: return 0, _("yt_url_fallback")
+    video_id = _extract_video_id(url)
+    cutoff = datetime.utcnow() - timedelta(days=YOUTUBE_CACHE_TTL_DAYS)
+
     async with AsyncSessionLocal() as session:
         cached = await session.get(YoutubeCache, video_id)
-        if cached: return cached.duration, cached.context
-        duration, context = await asyncio.to_thread(_fetch_yt_sync, url, video_id)
-        session.add(YoutubeCache(video_id=video_id, duration=duration, context=context))
-        await session.commit()
-        return duration, context
+        if cached and cached.timestamp >= cutoff:
+            return cached.duration, cached.context
 
-async def generate_media_description(media_path: str) -> str:
     try:
-        res = await generate_ai_response(_("ai_media_desc_prompt"), media_path, search_enabled=False)
-        if not res or res == _("status_waiting"): return _("ai_media_desc_unavailable")
-        return res
-    except Exception: return _("ai_media_desc_failed")
+        duration, context = await asyncio.wait_for(
+            asyncio.to_thread(_download_youtube_context_sync, url),
+            timeout=MEDIA_DOWNLOAD_TIMEOUT,
+        )
+    except Exception as exc:
+        logging.error("[Services] YouTube context failed: %s", exc)
+        return 0, _("yt_url_fallback")
 
-async def enrich_text_with_links(text: str) -> tuple[str, bool]:
-    search_needed = False
-    enriched_text = text
-    yt_links = re.findall(r'(https?://(?:www\.)?(?:youtube\.com|youtu\.be|youtube\.com/shorts)/[^\s]+)', text)
-    all_links = re.findall(r'(?:https?://)?(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)', text)
-    non_yt_links = [l for l in all_links if not any(yt in l for yt in yt_links)]
-    if non_yt_links: search_needed = True
-    yt_context_str = ""
-    if yt_links:
-        for y_url in yt_links:
-            try:
-                dur, y_ctx = await get_youtube_context(y_url)
-                if y_ctx: yt_context_str += _("ai_yt_context_inline", ctx=y_ctx)
-            except: pass
-    if yt_context_str: enriched_text = f"{text}{yt_context_str}"
-    return enriched_text, search_needed
+    if not context:
+        context = _("yt_url_fallback")
 
-async def build_dialog_context(client, chat_id: int, limit: int, target_msg_id: int = None, chat_name: str = None) -> tuple[str, list, int, bool]:
-    history_lines = []
-    media_paths_to_cleanup = []
-    last_date_str = None
-    latest_media_duration = 0
-    video_too_long = False
+    async with AsyncSessionLocal() as session:
+        existing = await session.get(YoutubeCache, video_id)
+        if existing:
+            existing.duration = duration
+            existing.context = context
+            existing.timestamp = datetime.utcnow()
+        else:
+            session.add(YoutubeCache(video_id=video_id, duration=duration, context=context))
+        await session.commit()
+
+    return duration, context
+
+
+def _message_sender(message, fallback_name: str | None) -> str:
+    if message.from_user and getattr(message.from_user, "is_self", False):
+        return _("me_sender")
+    if fallback_name:
+        return fallback_name
+    user = getattr(message, "from_user", None)
+    return getattr(user, "first_name", None) or getattr(getattr(message, "chat", None), "title", None) or _("other_sender")
+
+
+async def _describe_message_media(client, message, media_paths: list[str]) -> tuple[str, int, bool]:
+    media_type = None
+    duration = 0
+    too_long = False
+    ext = ".bin"
+
+    if getattr(message, "photo", None):
+        media_type, ext = "photo", ".jpg"
+    elif getattr(message, "video", None):
+        media_type, ext = "video", ".mp4"
+        duration = getattr(message.video, "duration", 0) or 0
+    elif getattr(message, "voice", None):
+        media_type, ext = "voice", ".ogg"
+        duration = getattr(message.voice, "duration", 0) or 0
+    elif getattr(message, "video_note", None):
+        media_type, ext = "video_note", ".mp4"
+        duration = getattr(message.video_note, "duration", 0) or 0
+    elif getattr(message, "audio", None):
+        media_type, ext = "audio", ".mp3"
+        duration = getattr(message.audio, "duration", 0) or 0
+
+    if not media_type:
+        return "", duration, too_long
 
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
-        messages = [msg async for msg in client.get_chat_history(chat_id, limit=limit)]
-        media_tasks = []
+        cached = await repo.get_media_memory(message.id, media_type)
+        if cached:
+            return cached, duration, duration > 600
 
-        async def fetch_audio(msg):
-            try:
-                m_ext = ".ogg" if msg.voice else ".mp4"
-                dl_path = await asyncio.wait_for(
-                    client.download_media(msg, file_name=f"data/{msg.id}_audio{m_ext}"),
-                    timeout=MEDIA_DOWNLOAD_TIMEOUT  
-                )
-                if dl_path:
-                    media_paths_to_cleanup.append(dl_path)
-                    transc = await transcribe_media(dl_path)
-                    if transc: await repo.save_media_memory(msg.id, "transcript", transc)
-            except asyncio.TimeoutError:
-                logging.warning(f"⏱ Таймаут скачивания аудио msg_id={msg.id} ({MEDIA_DOWNLOAD_TIMEOUT}с)")
-            except Exception as e:
-                logging.error(f"Ошибка скачивания аудио: {e}")
+    if duration > 600 and media_type in {"video", "video_note", "audio", "voice"}:
+        too_long = True
+        return _("ai_msg_file"), duration, too_long
 
-        async def fetch_video(msg):
-            try:
-                m_ext = ".jpg" if msg.photo else ".mp4"
-                dl_path = await asyncio.wait_for(
-                    client.download_media(msg, file_name=f"data/{msg.id}_media{m_ext}"),
-                    timeout=MEDIA_DOWNLOAD_TIMEOUT
-                )
-                if dl_path:
-                    media_paths_to_cleanup.append(dl_path)
-                    desc = await generate_media_description(dl_path)
-                    if desc: await repo.save_media_memory(msg.id, "description", desc)
-            except asyncio.TimeoutError:
-                logging.warning(f"⏱ Таймаут скачивания видео msg_id={msg.id} ({MEDIA_DOWNLOAD_TIMEOUT}с)")
-            except Exception as e:
-                logging.error(f"Ошибка скачивания видео: {e}")
+    if len(media_paths) >= MAX_CONTEXT_MEDIA:
+        return _("ai_msg_file"), duration, too_long
 
-        for msg in messages:
-            is_ignored_msg = False
-            try: is_ignored_msg = await repo.is_msg_ignored(chat_id, msg.id)
-            except Exception: pass
-            if is_ignored_msg: continue
+    path = None
+    try:
+        path = await download_media_checked(
+            client,
+            message,
+            file_name=f"data/context_{message.id}{ext}",
+            timeout=MEDIA_DOWNLOAD_TIMEOUT,
+        )
+        if path:
+            media_paths.append(path)
+        if media_type in {"voice", "video_note", "audio"}:
+            description = await transcribe_media(path)
+        else:
+            prompt = _("ai_media_desc_prompt") if _("ai_media_desc_prompt") != "ai_media_desc_prompt" else "Describe this media briefly."
+            description = await generate_ai_response(prompt, media_path=path, custom_prompt="", search_enabled=False)
+        if not description or description == _("status_waiting"):
+            return _("ai_msg_file"), duration, too_long
+        async with AsyncSessionLocal() as session:
+            await CoreRepository(session).save_media_memory(message.id, media_type, description)
+        return description, duration, too_long
+    except Exception as exc:
+        logging.warning("[Services] Failed to describe media message %s: %s", getattr(message, "id", "?"), exc)
+        return _("ai_msg_file"), duration, too_long
 
-            if msg.voice or msg.video_note:
-                if latest_media_duration == 0 and not (msg.from_user and msg.from_user.is_self):
-                    latest_media_duration = getattr(msg.voice, 'duration', getattr(msg.video_note, 'duration', 5))
-                    if latest_media_duration > 1800: video_too_long = True
-                if not await repo.get_media_memory(msg.id, "transcript"): media_tasks.append(fetch_audio(msg))
-            elif msg.photo or msg.video:
-                if msg.video and latest_media_duration == 0 and not (msg.from_user and msg.from_user.is_self):
-                    latest_media_duration = getattr(msg.video, 'duration', 5)
-                    if latest_media_duration > 1800: video_too_long = True
-                if not (target_msg_id and msg.id == target_msg_id):
-                    if not await repo.get_media_memory(msg.id, "description"): media_tasks.append(fetch_video(msg))
 
-        if media_tasks: 
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*media_tasks, return_exceptions=True),
-                    timeout=MEDIA_DOWNLOAD_TIMEOUT + 30
-                )
-            except asyncio.TimeoutError:
-                logging.warning("⏱ Глобальный таймаут на скачивание медиа")
+async def build_dialog_context(
+    client,
+    chat_id: int,
+    limit: int = 30,
+    target_msg_id: int | None = None,
+    chat_name: str | None = None,
+) -> tuple[str, list[str], int, bool]:
+    messages = []
+    history_kwargs = {"limit": limit}
+    if target_msg_id is not None:
+        history_kwargs["max_id"] = target_msg_id + 1
+    try:
+        history_iter = client.get_chat_history(chat_id, **history_kwargs)
+    except TypeError:
+        fallback_kwargs = {"limit": limit}
+        if target_msg_id is not None:
+            fallback_kwargs["offset_id"] = target_msg_id + 1
+        history_iter = client.get_chat_history(chat_id, **fallback_kwargs)
 
-        for msg in messages:
-            is_ignored_msg = False
-            try: is_ignored_msg = await repo.is_msg_ignored(chat_id, msg.id)
-            except Exception: pass
-            if is_ignored_msg: continue
+    async for msg in history_iter:
+        if target_msg_id is not None and msg.id > target_msg_id:
+            continue
+        if is_bot_dialog(msg):
+            continue
+        messages.append(msg)
 
-            msg_date = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
-            current_date_str = msg_date.strftime("%d %B %Y")
-            time_str = msg_date.strftime("%H:%M")
-            if current_date_str != last_date_str:
-                history_lines.insert(0, _("ai_date_divider", date=current_date_str))
-                last_date_str = current_date_str
+    messages.sort(key=lambda item: item.id)
+    media_paths: list[str] = []
+    latest_media_duration = 0
+    video_too_long = False
+    lines: list[str] = []
 
-            sender = _("me_sender") if (msg.from_user and msg.from_user.is_self) else (chat_name or _("other_sender"))
-            text = msg.text or msg.caption or ""
-            forward_prefix = ""
-            if getattr(msg, 'forward_origin', None):
-                origin = msg.forward_origin
-                f_name = _("someone")
-                if getattr(origin, 'sender_user', None) and origin.sender_user: f_name = origin.sender_user.first_name
-                elif getattr(origin, 'sender_user_name', None): f_name = origin.sender_user_name
-                elif getattr(origin, 'chat', None) and origin.chat: f_name = origin.chat.title or origin.chat.first_name
-                forward_prefix = _("ai_forwarded_from", name=f_name) + " "
+    for msg in messages:
+        try:
+            async with AsyncSessionLocal() as session:
+                if await CoreRepository(session).is_msg_ignored(chat_id, msg.id):
+                    continue
+        except Exception:
+            pass
 
-            if msg.voice or msg.video_note:
-                cached_audio = await repo.get_media_memory(msg.id, "transcript")
-                text = _("ai_voice_memory", text=cached_audio) if cached_audio else _("ai_msg_voice")
-            elif msg.photo or msg.video:
-                m_tag = _("ai_tag_photo") if msg.photo else _("ai_tag_video")
-                if target_msg_id and msg.id == target_msg_id: text = _("ai_media_current", type=m_tag, id=msg.id, text=text)
-                else:
-                    cached_desc = await repo.get_media_memory(msg.id, "description")
-                    text = _("ai_media_memory_desc", type=m_tag, id=msg.id, desc=cached_desc, text=text) if cached_desc else text
-            elif msg.sticker: text = _("ai_msg_sticker", emoji=msg.sticker.emoji if hasattr(msg.sticker, 'emoji') else "")
+        sender = _message_sender(msg, chat_name)
+        text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
 
-            full_msg_text = f"[{time_str}] {sender}: {forward_prefix}{text}"
-            if target_msg_id and msg.id == target_msg_id: full_msg_text = _("ai_current_msg_prefix", text=full_msg_text)
-            history_lines.insert(0, full_msg_text)
+        media_text, duration, too_long = await _describe_message_media(client, msg, media_paths)
+        if duration:
+            latest_media_duration = duration
+        video_too_long = video_too_long or too_long
+        if media_text:
+            text = f"{text}\n[{media_text}]" if text else f"[{media_text}]"
 
-    return "\n".join(history_lines), media_paths_to_cleanup, latest_media_duration, video_too_long
+        if not text:
+            continue
+        lines.append(f"{sender}: {text}")
+
+    return "\n".join(lines), media_paths, latest_media_duration, video_too_long

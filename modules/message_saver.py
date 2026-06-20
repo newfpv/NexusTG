@@ -101,8 +101,9 @@ async def on_startup():
     os.makedirs("data", exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    db_conn = await aiosqlite.connect(DB_FILE, timeout=20.0)
-    await db_conn.execute("PRAGMA journal_mode=WAL;")
+    db_conn = await aiosqlite.connect(DB_FILE, timeout=30.0)
+    await db_conn.execute("PRAGMA busy_timeout=30000;")
+    await db_conn.execute("PRAGMA journal_mode=DELETE;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
     
     async with db_lock:

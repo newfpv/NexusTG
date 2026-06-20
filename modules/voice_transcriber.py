@@ -11,7 +11,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import AsyncSessionLocal, CoreRepository
 from core.services import transcribe_media, generate_ai_response
-from core.utils import safe_edit
+from core.utils import download_media_checked, is_bot_dialog, safe_edit
 from core.config import _
 
 router = Router()
@@ -202,9 +202,14 @@ def register_userbot(app: Client):
             m_ext = ".ogg"
             if target_msg.video_note or target_msg.video: m_ext = ".mp4"
             elif target_msg.audio: m_ext = ".mp3"
-            
+
             logging.info(f"[Voice Transcriber] Downloading media from message {target_msg.id}")
-            media_path = await target_msg.download(file_name=f"data/v_{target_msg.id}{m_ext}")
+            media_path = await download_media_checked(
+                client,
+                target_msg,
+                file_name=f"data/v_{target_msg.id}{m_ext}",
+                timeout=90.0,
+            )
             
             duration = 0
             for attr in ["voice", "video_note", "video", "audio"]:
@@ -225,7 +230,7 @@ def register_userbot(app: Client):
                 for attempt in range(max_retries):
                     raw_text = await transcribe_media(media_path)
                     
-                    if raw_text and raw_text != "⏳":
+                    if raw_text and raw_text != _("status_waiting"):
                         break 
                         
                     if attempt < max_retries - 1:
@@ -237,7 +242,7 @@ def register_userbot(app: Client):
                                 pass
                         await asyncio.sleep(retry_delay)
                 
-                if not raw_text or raw_text == "⏳":
+                if not raw_text or raw_text == _("status_waiting"):
                     logging.error(f"[Voice Transcriber] API returned empty or waiting status persistently for message {target_msg.id}")
                     raise TimeoutError("API Overload") 
 
@@ -249,7 +254,7 @@ def register_userbot(app: Client):
                     summary_prompt = _("v_summary_prompt") + raw_text
                     
                     raw_summary = await generate_ai_response(summary_prompt, search_enabled=False)
-                    if raw_summary and raw_summary != "⏳":
+                    if raw_summary and raw_summary != _("status_waiting"):
                         logging.info(f"[Voice Transcriber] Summarization successful. Length: {len(raw_summary)}")
                         summary_content = _("v_summary_prefix", summary=raw_summary.strip()) + "\n\n"
                     else:
@@ -332,6 +337,10 @@ def register_userbot(app: Client):
 
     @app.on_message((filters.voice | filters.video_note) & filters.private, group=11)
     async def auto_voice_handler(client, message):
+        if is_bot_dialog(message):
+            logging.info(f"[Voice Transcriber] Skipping bot dialog message {message.id} in chat {message.chat.id}")
+            return
+
         cfg = await _get_g_cfg()
         chat_cfg = await _get_c_cfg(message.chat.id)
         is_me = (message.from_user and message.from_user.is_self)
@@ -345,6 +354,10 @@ def register_userbot(app: Client):
 
     @app.on_message(filters.text & filters.reply & filters.private, group=23)
     async def cmd_voice_handler(client, message):
+        if is_bot_dialog(message):
+            logging.info(f"[Voice Transcriber] Skipping bot dialog command in chat {message.chat.id}")
+            return
+
         cfg = await _get_g_cfg()
         if message.text.lower().startswith(cfg["command"].lower()):
             chat_cfg = await _get_c_cfg(message.chat.id)

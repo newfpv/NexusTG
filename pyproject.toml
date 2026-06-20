@@ -5,7 +5,7 @@ description = "High-load Telegram bot + userbot"
 requires-python = ">=3.11, <3.13"
 dependencies = [
     "aiogram==3.4.1",
-    "Kurigram",
+    "Kurigram==2.2.23",
     "tgcrypto==1.2.5",
     "google-genai==0.3.0",
     "python-dotenv==1.0.1",

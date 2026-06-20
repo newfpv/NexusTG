@@ -88,9 +88,9 @@ async def fake_action_worker(app: Client, chat_id: int, action: str, minutes: fl
             await app.send_chat_action(chat_id, action_enum)
             await asyncio.sleep(min(4, end_time - time.time()))
     except asyncio.CancelledError:
-        pass 
+        pass
     except Exception as e:
-        logging.error(_("log_fake_action_error", e=e))
+        logging.error("[Fake Activity] Action failed: %s", e)
     finally:
         try:
             await app.send_chat_action(chat_id, ChatAction.CANCEL)

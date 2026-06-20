@@ -243,7 +243,7 @@ async def md_handle_cookie_doc(message: types.Message, state: FSMContext):
             mf.write("\n" + new_cookies)
         logging.info("[Media Downloader] Cookies successfully appended to main database")
     except Exception as e:
-        logging.error(_("log_md_cookie_append_err", e=e))
+        logging.error("[Media Downloader] Failed to append cookies: %s", e)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -365,7 +365,7 @@ def _download_video_sync(url: str, output_template: str) -> str | None:
             logging.info(f"[Media Downloader] yt-dlp extraction complete. Saved to: {filename}")
             return filename
     except Exception as e:
-        logging.error(_("log_md_ytdlp_err", e=e))
+        logging.error("[Media Downloader] yt-dlp failed: %s", e)
         return None
 
 def register_userbot(app: Client):
@@ -396,7 +396,7 @@ def register_userbot(app: Client):
                 raise ValueError(_("err_md_download_failed"))
                 
         except Exception as e:
-            logging.error(_("log_md_error", e=str(e)))
+            logging.error("[Media Downloader] Download task failed: %s", e)
             err_txt = _("md_process_error")
             if is_manual:
                 if is_me and status_msg: 

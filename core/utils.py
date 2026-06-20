@@ -2,6 +2,7 @@ import time
 import asyncio
 import traceback
 import logging
+import os
 import re
 import html
 import random
@@ -182,10 +183,85 @@ class PluginManager:
                     await session.execute(delete(MediaMemoryCache).where(MediaMemoryCache.timestamp < threshold))
                     await session.commit()
             except Exception as e:
-                logging.error(_("log_cache_cleanup_error", e=e))
+                logging.error("[Cache] Cleanup failed: %s", e)
             await asyncio.sleep(3600 * 24)
 
 plugins = PluginManager()
+
+def is_bot_dialog(message_or_chat) -> bool:
+    chat = getattr(message_or_chat, "chat", message_or_chat)
+    user = getattr(message_or_chat, "from_user", None)
+
+    if user and getattr(user, "is_bot", False):
+        return True
+    if getattr(chat, "is_bot", False):
+        return True
+
+    chat_type = getattr(chat, "type", None)
+    return getattr(chat_type, "name", "") == "BOT" or str(chat_type).lower().endswith(".bot")
+
+
+def _media_file_size(message) -> int:
+    for attr in ("voice", "video_note", "video", "audio", "photo", "document", "animation", "sticker"):
+        media = getattr(message, attr, None)
+        if isinstance(media, list):
+            media = media[-1] if media else None
+        size = getattr(media, "file_size", 0) if media else 0
+        if size:
+            return int(size)
+    return 0
+
+
+async def download_media_checked(client, message, file_name: str, timeout: float = 90.0, retries: int = 2) -> str:
+    """Download media and reject the zero-byte files Kurigram can return after MTProto errors."""
+    current_message = message
+    expected_size = _media_file_size(message)
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        for candidate in (file_name, f"{file_name}.temp"):
+            try:
+                if os.path.exists(candidate):
+                    os.remove(candidate)
+            except OSError:
+                pass
+
+        try:
+            path = await asyncio.wait_for(current_message.download(file_name=file_name), timeout=timeout)
+            actual_size = os.path.getsize(path) if path and os.path.isfile(path) else 0
+            if actual_size > 0 and (not expected_size or actual_size == expected_size):
+                return path
+
+            last_error = IOError(
+                f"incomplete media download: expected={expected_size or 'unknown'}, actual={actual_size}"
+            )
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        except Exception as exc:
+            last_error = exc
+
+        logging.warning(
+            "[Media] Download attempt %s/%s failed for message %s: %s",
+            attempt,
+            retries,
+            getattr(message, "id", "?"),
+            last_error,
+        )
+
+        if attempt < retries:
+            try:
+                refreshed = await client.get_messages(message.chat.id, message.id)
+                if refreshed:
+                    current_message = refreshed
+            except Exception as exc:
+                logging.debug("[Media] Failed to refresh message %s: %s", getattr(message, "id", "?"), exc)
+            await asyncio.sleep(1)
+
+    raise IOError(f"media download failed after {retries} attempts: {last_error}")
+
 
 def safe_userbot_handler(func):
     @wraps(func)
@@ -195,7 +271,7 @@ def safe_userbot_handler(func):
         except Exception as e:
             error_msg = str(e)
             trace = traceback.format_exc()
-            logging.error(_("log_unhandled_exception", error=error_msg, trace=trace))
+            logging.error("[Unhandled] %s | trace=%s", error_msg, trace)
             try:
                 config = await plugins.db.get_global_config()
                 if config and config.admin_id:
