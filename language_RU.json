@@ -169,6 +169,7 @@
     "btn_v_cmd_allow_others": "Команда для других: {status}",
     "btn_v_c_cmd_allow": "Команда для него: {status}",
     "btn_v_summarize": "Саммари (>1м): {status}",
+    "btn_v_summary_only": "Только выжимка: {status}",
     "btn_v_command": "Команда: {cmd}",
     "v_enter_command": "✅ <b>Триггер Голос в текст</b>\n\n<b>Текущая команда:</b>\n<code>{cmd}</code>\n\nЖду <code>новую команду</code> (напр. .text):\n\n<blockquote><i>Сообщение будет удалено.</i></blockquote>",
     "v_command_changed": "✅ Команда изменена на <code>{cmd}</code>",

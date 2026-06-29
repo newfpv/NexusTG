@@ -16,6 +16,8 @@ from core.services import generate_ai_response, transcribe_media
 
 router = Router()
 MODULE_NAME = "text_struct"
+BATCH_FIX_MAX_MESSAGES = 20
+BATCH_FIX_FETCH_LIMIT = 100
 
 class TextStructFSM(StatesGroup):
     wait_cmd = State()
@@ -72,14 +74,35 @@ def _media_ext(message: Message) -> str:
         return ".mp4"
     return ".ogg"
 
-async def _transcribe_struct_media(client: Client, message: Message) -> str:
+def _media_label(message: Message) -> str:
+    if getattr(message, "voice", None):
+        return "voice"
+    if getattr(message, "audio", None):
+        return "audio"
+    if getattr(message, "video_note", None):
+        return "video_note"
+    return "media"
+
+def _parse_batch_modifier(query: str) -> tuple[int, str] | None:
+    match = re.match(r"^(\d{1,3})(?:\s+(.*))?$", query.strip(), flags=re.S)
+    if not match:
+        return None
+
+    count = int(match.group(1))
+    if count <= 0:
+        return None
+
+    return min(count, BATCH_FIX_MAX_MESSAGES), (match.group(2) or "").strip()
+
+async def _transcribe_struct_media(client: Client, message: Message, file_stem: str | None = None) -> str:
     media_path = None
     try:
         os.makedirs("data", exist_ok=True)
+        safe_stem = file_stem or f"ts_fix_{message.id}"
         media_path = await download_media_checked(
             client,
             message,
-            file_name=f"data/ts_fix_{message.id}{_media_ext(message)}",
+            file_name=f"data/{safe_stem}{_media_ext(message)}",
             timeout=90.0,
         )
         text = await transcribe_media(media_path)
@@ -92,6 +115,80 @@ async def _transcribe_struct_media(client: Client, message: Message) -> str:
                 os.remove(media_path)
             except OSError as exc:
                 logging.debug("[Struct] Failed to remove temporary media file %s: %s", media_path, exc)
+
+async def _collect_batch_messages(client: Client, command_message: Message, count: int) -> list[Message]:
+    fetch_limit = min(BATCH_FIX_FETCH_LIMIT, max(count * 4, count + 10))
+    history_kwargs = {"limit": fetch_limit, "offset_id": command_message.id}
+    try:
+        history_iter = client.get_chat_history(command_message.chat.id, **history_kwargs)
+    except TypeError:
+        history_iter = client.get_chat_history(command_message.chat.id, limit=fetch_limit, max_id=command_message.id)
+
+    messages: list[Message] = []
+    async for history_message in history_iter:
+        if history_message.id >= command_message.id:
+            continue
+        if not (_extract_message_text(history_message) or _is_transcribable_media(history_message)):
+            continue
+
+        messages.append(history_message)
+        if len(messages) >= count:
+            break
+
+    messages.sort(key=lambda item: item.id)
+    return messages
+
+async def _build_batch_source_text(
+    client: Client,
+    command_message: Message,
+    source_messages: list[Message],
+) -> tuple[str, list[Message]]:
+    entries: list[tuple[Message, str, str]] = []
+
+    for index, source_message in enumerate(source_messages, start=1):
+        text = _extract_message_text(source_message)
+        media_label = ""
+
+        if _is_transcribable_media(source_message):
+            media_label = f" | {_media_label(source_message)}"
+            logging.info("[Struct] Transcribing batch media message %s as item %s", source_message.id, index)
+            transcribed_text = await _transcribe_struct_media(
+                client,
+                source_message,
+                file_stem=f"ts_fix_batch_{command_message.id}_{index:03d}_{source_message.id}",
+            )
+            if transcribed_text:
+                text = f"{text}\n{transcribed_text}".strip() if text else transcribed_text
+
+        text = text.strip()
+        if text:
+            entries.append((source_message, media_label, text))
+
+    total = len(entries)
+    parts = [
+        f"[MESSAGE {index} OF {total} | id={source_message.id}{media_label}]\n{text}"
+        for index, (source_message, media_label, text) in enumerate(entries, start=1)
+    ]
+    return "\n\n".join(parts), [source_message for source_message, _, _ in entries]
+
+def _build_batch_prompt(base_prompt: str | None, modifier_prompt: str) -> str:
+    batch_instruction = (
+        "The source text contains several Telegram messages in chronological order, from oldest to newest. "
+        "Merge them into one coherent structured text without losing meaning. Preserve the semantic order of the "
+        "messages, do not treat the newest message as the beginning, and remove technical message labels from the final answer."
+    )
+    parts = [(base_prompt or "").strip(), batch_instruction]
+    if modifier_prompt:
+        parts.append(modifier_prompt.strip())
+    return "\n\n".join(part for part in parts if part)
+
+async def _delete_source_messages(source_messages: list[Message]):
+    for source_message in source_messages:
+        try:
+            await source_message.delete()
+            logging.debug("[Struct] Deleted batch source message %s", source_message.id)
+        except Exception as exc:
+            logging.warning("[Struct] Failed to delete batch source message %s: %s", source_message.id, exc)
 
 async def _get_cfg() -> dict:
     cfg = await CoreAPI.get_module_cfg(MODULE_NAME)
@@ -223,6 +320,48 @@ def register_userbot(app: Client):
         logging.info(f"[Struct] Command '{cmd}' triggered in chat {message.chat.id}")
 
         query = msg_text[len(cmd):].strip()
+        batch_modifier = _parse_batch_modifier(query)
+        if batch_modifier:
+            batch_count, modifier_prompt = batch_modifier
+            logging.info("[Struct] Batch fix requested for %s messages in chat %s", batch_count, message.chat.id)
+
+            try:
+                if message.media:
+                    await message.edit_caption(_("ts_processing"), parse_mode=enums.ParseMode.HTML)
+                else:
+                    await message.edit_text(
+                        _("ts_processing"),
+                        parse_mode=enums.ParseMode.HTML,
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+            except Exception as e:
+                logging.debug(f"[Struct] Failed to edit trigger message to batch status: {e}")
+
+            typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
+            text_to_process = ""
+            source_messages: list[Message] = []
+            try:
+                candidates = await _collect_batch_messages(client, message, batch_count)
+                if not candidates:
+                    raise ValueError("no processable messages found for batch fix")
+
+                text_to_process, source_messages = await _build_batch_source_text(client, message, candidates)
+                if not text_to_process:
+                    raise ValueError("batch source text is empty")
+
+                prompt_to_use = _build_batch_prompt(cfg.get("prompt"), modifier_prompt)
+                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+            except Exception as e:
+                logging.error(f"[Struct] AI Generation failed for batch fix: {e}")
+                ai_text = None
+            finally:
+                typing_task.cancel()
+
+            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text)
+            if edit_success:
+                await _delete_source_messages(source_messages)
+            return
+
         is_reply = bool(message.reply_to_message)
         
         if not is_reply:

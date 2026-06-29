@@ -167,6 +167,7 @@
     "btn_v_cmd_allow_others": "Command for others: {status}",
     "btn_v_c_cmd_allow": "Command for them: {status}",
     "btn_v_summarize": "Summary (>1m): {status}",
+    "btn_v_summary_only": "Summary only: {status}",
     "btn_v_command": "Command: {cmd}",
     "v_enter_command": "✅ <b>Voice to Text Trigger</b>\n\n<b>Current command:</b>\n<code>{cmd}</code>\n\nAwaiting <code>new command</code> (e.g., .text):\n\n<blockquote><i>The message will be deleted.</i></blockquote>",
     "v_command_changed": "✅ Command changed to <code>{cmd}</code>",
@@ -176,7 +177,8 @@
     "v_summary_prompt": "Provide a brief summary of this voice message. Output ONLY the summary text. NO introductory words like 'Here is a summary', 'This text says', etc. GET STRAIGHT TO THE POINT:\n\n",
     "v_summary_prefix": "📝 <b>Brief summary:</b>\n<i>{summary}</i>",
     "v_voice_prefix": "",
-    "v_log_error_processing": "Transcription error: {e}"
+    "v_log_error_processing": "Transcription error: {e}",
+    "v_status_waiting": "⏳ <i>Waiting for audio...</i>"
   },
   "fake_activity": {
     "btn_fake_activity": "🎭 Fake Activity",

@@ -30,6 +30,7 @@ async def _get_g_cfg():
             "auto_other": v.get("auto_other", False),
             "allow_cmd": v.get("allow_cmd", False),
             "summarize": v.get("summarize", True),
+            "summary_only": v.get("summary_only", False),
             "command": v.get("command", ".text")
         }
 
@@ -55,7 +56,8 @@ async def _get_c_cfg(chat_id):
         return {
             "auto_my": v.get("auto_my", 2),
             "auto_other": v.get("auto_other", 2),
-            "allow_cmd": v.get("allow_cmd", 2)
+            "allow_cmd": v.get("allow_cmd", 2),
+            "summary_only": v.get("summary_only", 2)
         }
 
 async def _upd_c_cfg(chat_id, **kwargs):
@@ -83,12 +85,14 @@ async def get_voice_kb():
     st_auto_oth = _("status_on") if cfg["auto_other"] else _("status_off")
     st_allow_cmd = _("status_on") if cfg["allow_cmd"] else _("status_off")
     st_summ = _("status_on") if cfg["summarize"] else _("status_off")
+    st_summary_only = _("status_on") if cfg["summary_only"] else _("status_off")
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=_("btn_v_auto_my", status=st_auto_my), callback_data="v_tgl_g_auto_my"),
          InlineKeyboardButton(text=_("btn_v_auto_other", status=st_auto_oth), callback_data="v_tgl_g_auto_other")],
         [InlineKeyboardButton(text=_("btn_v_cmd_allow_others", status=st_allow_cmd), callback_data="v_tgl_g_allow_cmd")],
         [InlineKeyboardButton(text=_("btn_v_summarize", status=st_summ), callback_data="v_tgl_g_summarize")],
+        [InlineKeyboardButton(text=_("btn_v_summary_only", status=st_summary_only), callback_data="v_tgl_g_summary_only")],
         [InlineKeyboardButton(text=_("btn_v_command", cmd=cfg["command"]), callback_data="v_edit_cmd")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="main_menu")]
     ])
@@ -105,6 +109,7 @@ async def get_chat_voice_kb(chat_id):
         [InlineKeyboardButton(text=get_lbl(chat_cfg["auto_my"], "btn_v_auto_my"), callback_data=f"v_c_tgl_auto_my_{chat_id}"),
          InlineKeyboardButton(text=get_lbl(chat_cfg["auto_other"], "btn_v_auto_other"), callback_data=f"v_c_tgl_auto_other_{chat_id}")],
         [InlineKeyboardButton(text=get_lbl(chat_cfg["allow_cmd"], "btn_v_c_cmd_allow"), callback_data=f"v_c_tgl_allow_cmd_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["summary_only"], "btn_v_summary_only"), callback_data=f"v_c_tgl_summary_only_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data=f"chat_{chat_id}")]
     ])
 
@@ -154,7 +159,8 @@ async def voice_chat_toggles(call: types.CallbackQuery, state: FSMContext):
 async def voice_edit_cmd(call: types.CallbackQuery, state: FSMContext):
     logging.info(f"[Voice Transcriber] User {call.from_user.id} requested command edit")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="voice_main")]])
-    await safe_edit(call.message, state, _("v_enter_command"), kb, parse_mode="HTML")
+    cfg = await _get_g_cfg()
+    await safe_edit(call.message, state, _("v_enter_command", cmd=cfg["command"]), kb, parse_mode="HTML")
     await state.set_state(VoiceStates.waiting_for_command)
     try: await call.answer()
     except: pass
@@ -182,8 +188,51 @@ async def voice_save_cmd(message: types.Message, state: FSMContext):
             await message.bot.edit_message_text(text=_("menu_v_title"), chat_id=message.chat.id, message_id=menu_msg_id, reply_markup=await get_voice_kb(), parse_mode="HTML")
         except: pass
 
+def _apply_chat_voice_cfg(global_cfg: dict, chat_cfg: dict) -> dict:
+    cfg = dict(global_cfg)
+    summary_only = chat_cfg.get("summary_only", 2)
+    cfg["summary_only"] = global_cfg["summary_only"] if summary_only == 2 else bool(summary_only)
+    return cfg
+
+def _build_voice_chunks(raw_text: str, summary_content: str, summary_only: bool) -> list[str]:
+    safe_tg_limit = 3800
+    tags_wrapper = "<blockquote expandable>{}</blockquote>"
+    chunks = []
+
+    if summary_only:
+        content = summary_content.strip()
+        if not content:
+            content = _("v_process_error")
+    else:
+        content = raw_text.strip()
+
+    is_first = True
+    while content or is_first:
+        prefix = "" if summary_only else (summary_content if is_first else "")
+        overhead_length = len(prefix) + len(tags_wrapper.format(""))
+        available_space = safe_tg_limit - overhead_length
+
+        if len(content) > available_space:
+            split_index = content.rfind(" ", 0, available_space)
+            if split_index == -1:
+                split_index = available_space
+            chunk = content[:split_index]
+            content = content[split_index:].strip()
+            logging.debug(f"[Voice Transcriber] Splitting text chunk at index {split_index}")
+        else:
+            chunk = content
+            content = ""
+
+        chunks.append(tags_wrapper.format(prefix + chunk))
+        is_first = False
+
+    return chunks
+
 def register_userbot(app: Client):
-    async def process_voice_media(client, message, target_msg, cfg, is_manual=False):
+    voice_queues = {}
+    voice_workers = {}
+
+    async def process_voice_media(client, message, target_msg, cfg, is_manual=False, append_state=None):
         logging.info(f"[Voice Transcriber] Initiating transcription task for message {target_msg.id} in chat {message.chat.id}")
         media_path = None
         status_msg = None
@@ -248,11 +297,12 @@ def register_userbot(app: Client):
 
                 logging.info(f"[Voice Transcriber] Transcription successful. Length: {len(raw_text)}")
                 summary_content = ""
-                
-                if cfg["summarize"] and duration >= 60:
-                    logging.info("[Voice Transcriber] Duration >= 60s, triggering summarization AI")
+                should_summarize = cfg["summary_only"] or (cfg["summarize"] and duration >= 60)
+
+                if should_summarize:
+                    logging.info("[Voice Transcriber] Triggering summarization AI")
                     summary_prompt = _("v_summary_prompt") + raw_text
-                    
+
                     raw_summary = await generate_ai_response(summary_prompt, search_enabled=False)
                     if raw_summary and raw_summary != _("status_waiting"):
                         logging.info(f"[Voice Transcriber] Summarization successful. Length: {len(raw_summary)}")
@@ -260,30 +310,25 @@ def register_userbot(app: Client):
                     else:
                         logging.warning("[Voice Transcriber] Summarization failed or timed out")
 
-                current_text = raw_text.strip()
-                is_first = True
-                safe_tg_limit = 3800 
-                
-                while current_text or is_first:
-                    tags_wrapper = "<blockquote expandable>{}</blockquote>"
-                    prefix = summary_content if is_first else ""
-                    
-                    overhead_length = len(prefix) + len(tags_wrapper.format(""))
-                    available_space = safe_tg_limit - overhead_length
-                    
-                    if len(current_text) > available_space:
-                        split_index = current_text.rfind(' ', 0, available_space)
-                        if split_index == -1: split_index = available_space
-                        chunk = current_text[:split_index]
-                        current_text = current_text[split_index:].strip()
-                        logging.debug(f"[Voice Transcriber] Splitting text chunk at index {split_index}")
-                    else:
-                        chunk = current_text
-                        current_text = ""
-                    
-                    formatted_msg = tags_wrapper.format(prefix + chunk)
+                chunks = _build_voice_chunks(raw_text, summary_content, cfg["summary_only"])
+                for idx, formatted_msg in enumerate(chunks):
+                    edited_append = False
 
-                    if is_first and is_manual and is_me:
+                    if idx == 0 and not is_manual and append_state and append_state.get("message"):
+                        combined_text = f"{append_state['text']}\n\n{formatted_msg}"
+                        if len(combined_text) <= 3800:
+                            try:
+                                await append_state["message"].edit(combined_text, parse_mode=enums.ParseMode.HTML)
+                                append_state["text"] = combined_text
+                                edited_append = True
+                                logging.info("[Voice Transcriber] Appended transcription to previous auto message via edit")
+                            except Exception as edit_err:
+                                logging.warning(f"[Voice Transcriber] Append edit failed: {edit_err}. Falling back to send_message.")
+
+                    if edited_append:
+                        continue
+
+                    if idx == 0 and is_manual and is_me:
                         try:
                             await status_msg.edit(formatted_msg, parse_mode=enums.ParseMode.HTML)
                             await _add_ignored(message.chat.id, status_msg.id)
@@ -297,6 +342,9 @@ def register_userbot(app: Client):
                                 parse_mode=enums.ParseMode.HTML
                             )
                             await _add_ignored(message.chat.id, sent_msg.id)
+                            if append_state is not None:
+                                append_state["message"] = sent_msg
+                                append_state["text"] = formatted_msg
                     else:
                         sent_msg = await client.send_message(
                             chat_id=message.chat.id,
@@ -305,9 +353,10 @@ def register_userbot(app: Client):
                             parse_mode=enums.ParseMode.HTML
                         )
                         await _add_ignored(message.chat.id, sent_msg.id)
+                        if append_state is not None:
+                            append_state["message"] = sent_msg
+                            append_state["text"] = formatted_msg
                         logging.info(f"[Voice Transcriber] Sent transcription block as new message")
-                    
-                    is_first = False
 
         except TimeoutError as e:
             logging.error(f"[Voice Transcriber] API Timeout/Overload: {e}. Silencing output to chat.")
@@ -332,8 +381,47 @@ def register_userbot(app: Client):
                 try: 
                     os.remove(media_path)
                     logging.debug(f"[Voice Transcriber] Cleaned up temporary file: {media_path}")
-                except Exception as cleanup_err: 
+                except Exception as cleanup_err:
                     logging.warning(f"[Voice Transcriber] Failed to clean up file {media_path}: {cleanup_err}")
+
+    async def enqueue_voice_media(client, message, target_msg, cfg, is_manual=False):
+        chat_id = message.chat.id
+        queue = voice_queues.setdefault(chat_id, asyncio.Queue())
+        await queue.put((client, message, target_msg, cfg, is_manual))
+
+        worker = voice_workers.get(chat_id)
+        if not worker or worker.done():
+            voice_workers[chat_id] = asyncio.create_task(voice_chat_worker(chat_id))
+
+    async def voice_chat_worker(chat_id):
+        queue = voice_queues[chat_id]
+        append_state = None
+
+        try:
+            while True:
+                idle_timeout = 3.0 if append_state else 60.0
+                try:
+                    client, message, target_msg, cfg, is_manual = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    if append_state:
+                        append_state = None
+                        continue
+                    break
+
+                try:
+                    if is_manual:
+                        append_state = None
+                        await process_voice_media(client, message, target_msg, cfg, is_manual=True)
+                    else:
+                        if append_state is None:
+                            append_state = {"message": None, "text": ""}
+                        await process_voice_media(client, message, target_msg, cfg, is_manual=False, append_state=append_state)
+                finally:
+                    queue.task_done()
+        finally:
+            if queue.empty():
+                voice_queues.pop(chat_id, None)
+                voice_workers.pop(chat_id, None)
 
     @app.on_message((filters.voice | filters.video_note) & filters.private, group=11)
     async def auto_voice_handler(client, message):
@@ -350,7 +438,8 @@ def register_userbot(app: Client):
         
         if (is_me and should_my) or (not is_me and should_oth):
             logging.info(f"[Voice Transcriber] Auto-trigger activated for message {message.id} in chat {message.chat.id}")
-            asyncio.create_task(process_voice_media(client, message, message, cfg, is_manual=False))
+            effective_cfg = _apply_chat_voice_cfg(cfg, chat_cfg)
+            await enqueue_voice_media(client, message, message, effective_cfg, is_manual=False)
 
     @app.on_message(filters.text & filters.reply & filters.private, group=23)
     async def cmd_voice_handler(client, message):
@@ -368,4 +457,5 @@ def register_userbot(app: Client):
                 target = message.reply_to_message
                 if target and (target.voice or target.video_note or target.video or target.audio):
                     logging.info(f"[Voice Transcriber] Command trigger activated for message {target.id} in chat {message.chat.id}")
-                    asyncio.create_task(process_voice_media(client, message, target, cfg, is_manual=True))
+                    effective_cfg = _apply_chat_voice_cfg(cfg, chat_cfg)
+                    await enqueue_voice_media(client, message, target, effective_cfg, is_manual=True)
