@@ -107,9 +107,12 @@ docker compose up -d --build
 
 Back up `.env` and the complete `data/` directory while NexusTG is stopped. These files contain account credentials and must be stored securely.
 
+## Acknowledgements
+
+Parts of NexusTG's methods and development approach were inspired by [SpyBot](https://github.com/woxov/SpyBot), created by [woxov](https://github.com/woxov). Special thanks for publishing the project and sharing ideas that helped inform NexusTG's development.
+
 ## Version and license
 
 The latest tagged release is **v2.2.1**. The `main` branch includes additional post-release Text Structurer and Voice Transcriber fixes. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
-
