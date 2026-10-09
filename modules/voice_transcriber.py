@@ -423,15 +423,18 @@ def register_userbot(app: Client):
                 voice_queues.pop(chat_id, None)
                 voice_workers.pop(chat_id, None)
 
-    @app.on_message((filters.voice | filters.video_note) & filters.private, group=11)
+    @app.on_message((filters.voice | filters.video_note) & (filters.private | filters.group), group=11)
     async def auto_voice_handler(client, message):
         if is_bot_dialog(message):
             logging.info(f"[Voice Transcriber] Skipping bot dialog message {message.id} in chat {message.chat.id}")
             return
 
+        is_me = bool(message.from_user and message.from_user.is_self)
+        if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
+            return
+
         cfg = await _get_g_cfg()
         chat_cfg = await _get_c_cfg(message.chat.id)
-        is_me = (message.from_user and message.from_user.is_self)
         c_my, c_oth = chat_cfg["auto_my"], chat_cfg["auto_other"]
         should_my = cfg["auto_my"] if c_my == 2 else bool(c_my)
         should_oth = cfg["auto_other"] if c_oth == 2 else bool(c_oth)
@@ -441,10 +444,14 @@ def register_userbot(app: Client):
             effective_cfg = _apply_chat_voice_cfg(cfg, chat_cfg)
             await enqueue_voice_media(client, message, message, effective_cfg, is_manual=False)
 
-    @app.on_message(filters.text & filters.reply & filters.private, group=23)
+    @app.on_message(filters.text & filters.reply & (filters.private | filters.group), group=23)
     async def cmd_voice_handler(client, message):
         if is_bot_dialog(message):
             logging.info(f"[Voice Transcriber] Skipping bot dialog command in chat {message.chat.id}")
+            return
+
+        is_me = bool(message.from_user and message.from_user.is_self)
+        if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
             return
 
         cfg = await _get_g_cfg()
@@ -453,7 +460,7 @@ def register_userbot(app: Client):
             c_allow = chat_cfg["allow_cmd"]
             allow_others = cfg["allow_cmd"] if c_allow == 2 else bool(c_allow)
             
-            if (message.from_user and message.from_user.is_self) or allow_others:
+            if is_me or allow_others:
                 target = message.reply_to_message
                 if target and (target.voice or target.video_note or target.video or target.audio):
                     logging.info(f"[Voice Transcriber] Command trigger activated for message {target.id} in chat {message.chat.id}")

@@ -12,6 +12,7 @@ from aiogram import types
 from aiogram.fsm.context import FSMContext
 from core.db import AsyncSessionLocal, CoreRepository
 from core.config import _
+from core.menu_middleware import menu_request_is_current
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 class MemoryCache:
@@ -285,6 +286,8 @@ def safe_userbot_handler(func):
     return wrapper
 
 async def safe_edit(message: types.Message, state: FSMContext, text: str, reply_markup=None, parse_mode="HTML"):
+    if not menu_request_is_current():
+        return
     data = await state.get_data()
     menu_msg_id = data.get("menu_msg_id")
     bot = plugins.bot
@@ -293,6 +296,9 @@ async def safe_edit(message: types.Message, state: FSMContext, text: str, reply_
         config = await plugins.db.get_global_config()
         menu_msg_id = config.admin_menu_id
 
+    if not menu_request_is_current():
+        return
+
     try:
         if menu_msg_id:
             await bot.edit_message_text(text, chat_id=message.chat.id, message_id=menu_msg_id, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -300,6 +306,9 @@ async def safe_edit(message: types.Message, state: FSMContext, text: str, reply_
             raise ValueError("No ID")
     except Exception as e:
         if "message is not modified" in str(e).lower():
+            return
+
+        if not menu_request_is_current():
             return
             
         msg = await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)

@@ -3,6 +3,7 @@ import os
 import importlib
 import logging
 import inspect
+import html
 import zoneinfo
 from datetime import datetime
 from dotenv import load_dotenv
@@ -18,13 +19,15 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from pyrogram import Client
+from pyrogram import Client, StopPropagation, filters
 from pyrogram.enums import ChatType
 
 from core.db import init_db
 from core.utils import plugins, safe_edit
 from core.config import _
 from core.auth import router as auth_router
+from core.menu import chat_directory
+from core.menu_middleware import MenuMiddleware, CallbackAckTracker, event_loop_monitor
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", 0))
@@ -33,6 +36,8 @@ API_HASH = os.getenv("API_HASH")
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(auth_router)
+dp.callback_query.middleware(MenuMiddleware())
+bot.session.middleware(CallbackAckTracker())
 userbot_app = None
 
 try:
@@ -69,9 +74,6 @@ def load_modules(dispatcher: Dispatcher):
                 logging.error("[Core] Module load failed: %s | %s", module_name, e)
 
 async def generate_main_menu_content():
-    if not userbot_app or not userbot_app.is_connected:
-        return _("menu_connecting"), None
-
     config = await plugins.db.get_global_config()
     tz_str = config.tz if config and config.tz else "Europe/London"
     try:
@@ -116,50 +118,27 @@ async def generate_settings_menu_content():
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")])
     return text, kb
 
-@dp.callback_query(F.data == "chats_list")
+@dp.callback_query(F.data.in_({"chats_list", "chats_refresh"}))
 async def cb_chats_list(call: types.CallbackQuery, state: FSMContext):
     text = _("menu_chats_list")
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     
-    if userbot_app and userbot_app.is_connected:
-        try:
-            async for dialog in userbot_app.get_dialogs(limit=30):
-                chat = dialog.chat
-                if chat.type != ChatType.PRIVATE: 
-                    continue
-                if chat.id == 777000: 
-                    continue
-                
-                name_parts = []
-                if chat.first_name: 
-                    name_parts.append(chat.first_name)
-                if chat.last_name: 
-                    name_parts.append(chat.last_name)
-                name = " ".join(name_parts) if name_parts else _("no_name")
-                
-                kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_chat_name", name=name), callback_data=f"chat_{chat.id}")])
-        except Exception as e:
-            logging.error("[Core] Failed to fetch dialogs: %s", e)
-        
+    dialogs = await chat_directory.get_dialogs(userbot_app, force=call.data == "chats_refresh")
+    for chat_id, name in dialogs:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_chat_name", name=name), callback_data=f"chat_{chat_id}")])
+    if not dialogs:
+        text += "\n\n" + _("menu_chats_unavailable")
+    kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_menu_refresh"), callback_data="chats_refresh")])
+
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")])
     
     await state.update_data(menu_msg_id=call.message.message_id)
     await safe_edit(call.message, state, text, kb)
 
 async def get_generic_chat_menu_content(chat_id):
-    chat_name = f"<code>{chat_id}</code>"
-    if userbot_app and userbot_app.is_connected:
-        try:
-            chat = await userbot_app.get_chat(chat_id)
-            name_parts = []
-            if chat.first_name: 
-                name_parts.append(chat.first_name)
-            if chat.last_name: 
-                name_parts.append(chat.last_name)
-            if name_parts: 
-                chat_name = f"<b>{' '.join(name_parts)}</b>"
-        except Exception as e:
-            logging.debug("[Core] Failed to fetch chat info %s: %s", chat_id, e)
+    # A profile RPC is unrelated to local settings and can stall during reconnects.
+    name = chat_directory.names.get(chat_id)
+    chat_name = f"<b>{html.escape(name)}</b>" if name else f"<code>{chat_id}</code>"
 
     text = _("menu_chat_title", chat_name=chat_name)
     kb = InlineKeyboardMarkup(inline_keyboard=[])
@@ -225,6 +204,23 @@ async def start_userbot(session_string):
         await userbot_app.stop()
     
     userbot_app = Client("userbot", session_string=session_string, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+
+    @userbot_app.on_message(filters.group & ~filters.me, group=-100)
+    async def block_foreign_group_messages(_client, message):
+        try:
+            from modules.shop_list import is_shop_auto_chat
+
+            if await is_shop_auto_chat(message):
+                return
+        except Exception as shop_guard_error:
+            logging.warning("[Core] Shop List group exception check failed: %s", shop_guard_error)
+
+        logging.debug(
+            "[Core] Ignoring foreign group message %s in chat %s",
+            message.id,
+            message.chat.id,
+        )
+        raise StopPropagation
 
     for handler_func in plugins.userbot_handlers:
         try:
@@ -319,6 +315,8 @@ async def main():
         logging.info("[Core] Existing session found")
         await start_userbot(config.session_string)
         
+    asyncio.create_task(event_loop_monitor())
+    asyncio.create_task(chat_directory.get_dialogs(userbot_app))
     asyncio.create_task(userbot_health_monitor())
     asyncio.create_task(plugins.cleanup_media_cache())
     

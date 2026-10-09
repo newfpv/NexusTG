@@ -1,14 +1,17 @@
+import base64
 import os
 import logging
 import re
 import time
 import zoneinfo
+from io import BytesIO
+from html import escape
 from datetime import datetime
 from aiogram import Router, F, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from pyrogram import Client
+from pyrogram import Client, raw
 from pyrogram.errors import SessionPasswordNeeded
 
 from core.db import AsyncSessionLocal, CoreRepository
@@ -42,6 +45,13 @@ def get_numpad_kb():
         [InlineKeyboardButton(text="4", callback_data="num_4"), InlineKeyboardButton(text="5", callback_data="num_5"), InlineKeyboardButton(text="6", callback_data="num_6")],
         [InlineKeyboardButton(text="7", callback_data="num_7"), InlineKeyboardButton(text="8", callback_data="num_8"), InlineKeyboardButton(text="9", callback_data="num_9")],
         [InlineKeyboardButton(text=_("btn_numpad_del"), callback_data="num_del"), InlineKeyboardButton(text="0", callback_data="num_0"), InlineKeyboardButton(text=_("btn_numpad_submit"), callback_data="num_submit")],
+        [InlineKeyboardButton(text=_("btn_qr_auth"), callback_data="auth_qr_start")],
+        [InlineKeyboardButton(text=_("btn_change_phone"), callback_data="auth_change_phone")]
+    ])
+
+def get_qr_auth_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=_("btn_qr_check"), callback_data="auth_qr_check")],
         [InlineKeyboardButton(text=_("btn_change_phone"), callback_data="auth_change_phone")]
     ])
 
@@ -50,6 +60,115 @@ def get_auth_error_kb():
         [InlineKeyboardButton(text=_("btn_retry_auth"), callback_data="auth_start")],
         [InlineKeyboardButton(text=_("btn_reenter_all"), callback_data="full_reset")]
     ])
+
+def _code_delivery_name(value) -> str:
+    if not value:
+        return "unknown"
+
+    raw_parts = [
+        getattr(value, "name", None),
+        getattr(value, "value", None),
+        str(value),
+        value.__class__.__name__,
+    ]
+    delivery_names = {
+        "app": "Telegram app",
+        "sms": "SMS",
+        "call": "phone call",
+        "flashcall": "flash call",
+        "fragment": "Fragment SMS",
+        "firebase": "Firebase SMS",
+        "email": "email",
+    }
+
+    for raw in raw_parts:
+        if raw is None:
+            continue
+        raw_lower = str(raw).lower()
+        for marker, name in delivery_names.items():
+            if marker in raw_lower:
+                return name
+    return str(value)
+
+def _sent_code_details(sent_code) -> str:
+    delivery = _code_delivery_name(getattr(sent_code, "type", None))
+    next_delivery = _code_delivery_name(getattr(sent_code, "next_type", None))
+    timeout = getattr(sent_code, "timeout", None)
+
+    lines = [_("auth_delivery_method", delivery=escape(delivery))]
+    if next_delivery != "unknown":
+        lines.append(_("auth_delivery_next", delivery=escape(next_delivery)))
+    if timeout:
+        lines.append(_("auth_delivery_timeout", seconds=int(timeout)))
+    return "\n".join(lines)
+
+def _login_token_url(token: bytes) -> str:
+    encoded = base64.urlsafe_b64encode(token).decode().rstrip("=")
+    return f"tg://login?token={encoded}"
+
+def _qr_png_bytes(data: str) -> bytes:
+    import qrcode
+
+    qr = qrcode.QRCode(border=3, box_size=10)
+    qr.add_data(data)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+async def _export_qr_login_token(client: Client, config):
+    return await client.invoke(raw.functions.auth.ExportLoginToken(
+        api_id=config.api_id,
+        api_hash=config.api_hash,
+        except_ids=[]
+    ))
+
+def _raw_type_name(value) -> str:
+    return value.__class__.__name__
+
+async def _delete_qr_message(state: FSMContext):
+    data = await state.get_data()
+    qr_msg_id = data.get("qr_msg_id")
+    qr_chat_id = data.get("qr_chat_id")
+    if not qr_msg_id or not qr_chat_id:
+        return
+
+    try:
+        await plugins.bot.delete_message(qr_chat_id, qr_msg_id)
+    except Exception:
+        pass
+    await state.update_data(qr_msg_id=None, qr_chat_id=None)
+
+async def _send_qr_login_message(message, state: FSMContext, login_url: str, phone: str, text_key: str):
+    await _delete_qr_message(state)
+    photo = BufferedInputFile(_qr_png_bytes(login_url), filename="telegram-login-qr.png")
+    qr_msg = await message.answer_photo(
+        photo=photo,
+        caption=_(text_key, phone=phone),
+        reply_markup=get_qr_auth_kb(),
+        parse_mode="HTML",
+    )
+    await state.update_data(qr_msg_id=qr_msg.message_id, qr_chat_id=qr_msg.chat.id)
+
+async def _finish_authorized_client(client: Client, phone: str, message, state: FSMContext):
+    await _delete_qr_message(state)
+    try:
+        me = await client.get_me()
+        if getattr(me, "phone_number", None):
+            phone = f"+{me.phone_number}".replace("++", "+")
+    except Exception:
+        pass
+
+    session_string = await client.export_session_string()
+    await plugins.db.save_session(phone, session_string)
+    await client.disconnect()
+
+    await plugins.start_userbot_cb(session_string)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")]])
+    await safe_edit(message, state, _("auth_success_restart"), kb, parse_mode="HTML")
+    await state.set_state(None)
 
 @router.callback_query(F.data == "setup_ready")
 async def setup_ready(call: types.CallbackQuery, state: FSMContext):
@@ -129,6 +248,7 @@ async def auth_start(call: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "auth_change_phone")
 async def auth_change_phone(call: types.CallbackQuery, state: FSMContext):
+    await _delete_qr_message(state)
     client = auth_clients.get(call.from_user.id)
     if client:
         try: await client.disconnect()
@@ -147,11 +267,20 @@ async def auth_phone(message: types.Message, state: FSMContext):
     await client.connect()
     try:
         sent_code = await client.send_code(phone)
+        delivery_details = _sent_code_details(sent_code)
+        logging.info(
+            "[Auth] Code requested for %s: type=%r next_type=%r timeout=%s",
+            phone,
+            getattr(sent_code, "type", None),
+            getattr(sent_code, "next_type", None),
+            getattr(sent_code, "timeout", None),
+        )
         auth_clients[message.from_user.id] = client
-        await safe_edit(message, state, _("auth_code_sent", phone=phone), get_numpad_kb(), parse_mode="HTML")
+        await safe_edit(message, state, _("auth_code_sent", phone=phone, delivery_details=delivery_details), get_numpad_kb(), parse_mode="HTML")
         await state.update_data(phone=phone, hash=sent_code.phone_code_hash, entered_code="")
         await state.set_state(AuthFSM.code)
     except Exception as e:
+        await _delete_qr_message(state)
         await safe_edit(message, state, _("auth_error_options", e=e), get_auth_error_kb(), parse_mode="HTML")
         await client.disconnect()
         await state.set_state(None)
@@ -174,25 +303,76 @@ async def process_numpad(call: types.CallbackQuery, state: FSMContext):
     phone = data.get("phone", "Неизвестно")
     await safe_edit(call.message, state, _("auth_enter_code_display", display_code=display_code, phone=phone), get_numpad_kb(), parse_mode="HTML")
 
+@router.callback_query(F.data == "auth_qr_start", AuthFSM.code)
+async def auth_qr_start(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    phone = data.get("phone", "")
+    client = auth_clients.get(call.from_user.id)
+    if not client:
+        return await safe_edit(call.message, state, _("auth_error_options", e="Temporary auth client not found"), get_auth_error_kb(), parse_mode="HTML")
+
+    try:
+        config = await plugins.db.get_global_config()
+        result = await _export_qr_login_token(client, config)
+        result_type = _raw_type_name(result)
+        if result_type == "LoginTokenSuccess":
+            await _finish_authorized_client(client, phone, call.message, state)
+            auth_clients.pop(call.from_user.id, None)
+            return
+        if result_type == "LoginTokenMigrateTo":
+            return await safe_edit(call.message, state, _("auth_qr_migrate", dc=result.dc_id), get_auth_error_kb(), parse_mode="HTML")
+
+        login_url = _login_token_url(result.token)
+        await safe_edit(call.message, state, _("auth_qr_sent", phone=phone), get_numpad_kb(), parse_mode="HTML")
+        await _send_qr_login_message(call.message, state, login_url, phone, "auth_qr_prompt")
+    except SessionPasswordNeeded:
+        await _delete_qr_message(state)
+        await safe_edit(call.message, state, _("auth_2fa_required"), parse_mode="HTML")
+        await state.set_state(AuthFSM.password)
+    except Exception as e:
+        await safe_edit(call.message, state, _("auth_error_options", e=e), get_auth_error_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "auth_qr_check", AuthFSM.code)
+async def auth_qr_check(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    phone = data.get("phone", "")
+    client = auth_clients.get(call.from_user.id)
+    if not client:
+        return await safe_edit(call.message, state, _("auth_error_options", e="Temporary auth client not found"), get_auth_error_kb(), parse_mode="HTML")
+
+    try:
+        config = await plugins.db.get_global_config()
+        result = await _export_qr_login_token(client, config)
+        result_type = _raw_type_name(result)
+        if result_type == "LoginTokenSuccess":
+            await _finish_authorized_client(client, phone, call.message, state)
+            auth_clients.pop(call.from_user.id, None)
+            return
+        if result_type == "LoginTokenMigrateTo":
+            return await safe_edit(call.message, state, _("auth_qr_migrate", dc=result.dc_id), get_auth_error_kb(), parse_mode="HTML")
+
+        login_url = _login_token_url(result.token)
+        await safe_edit(call.message, state, _("auth_qr_sent", phone=phone), get_numpad_kb(), parse_mode="HTML")
+        await _send_qr_login_message(call.message, state, login_url, phone, "auth_qr_waiting")
+    except SessionPasswordNeeded:
+        await _delete_qr_message(state)
+        await safe_edit(call.message, state, _("auth_2fa_required"), parse_mode="HTML")
+        await state.set_state(AuthFSM.password)
+    except Exception as e:
+        await safe_edit(call.message, state, _("auth_error_options", e=e), get_auth_error_kb(), parse_mode="HTML")
+
 async def process_auth_code(call: types.CallbackQuery, state: FSMContext, code: str):
     data = await state.get_data()
     phone, client = data['phone'], auth_clients.get(call.from_user.id)
     try:
         await client.sign_in(phone, data['hash'], code)
-        session_string = await client.export_session_string()
-        await plugins.db.save_session(phone, session_string)
-        await client.disconnect()
-        del auth_clients[call.from_user.id]
-        
-        await plugins.start_userbot_cb(session_string)
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")]])
-        await safe_edit(call.message, state, _("auth_success_restart"), kb, parse_mode="HTML")
-        await state.set_state(None)
+        await _finish_authorized_client(client, phone, call.message, state)
+        auth_clients.pop(call.from_user.id, None)
     except SessionPasswordNeeded:
         await safe_edit(call.message, state, _("auth_2fa_required"), parse_mode="HTML")
         await state.set_state(AuthFSM.password)
     except Exception as e:
+        await _delete_qr_message(state)
         await safe_edit(call.message, state, _("auth_error_options", e=e), get_auth_error_kb(), parse_mode="HTML")
         await client.disconnect()
         await state.set_state(None)
@@ -205,17 +385,10 @@ async def auth_password(message: types.Message, state: FSMContext):
     client = auth_clients.get(message.from_user.id)
     try:
         await client.check_password(message.text)
-        session_string = await client.export_session_string()
-        await plugins.db.save_session(data['phone'], session_string)
-        await client.disconnect()
-        del auth_clients[message.from_user.id]
-        
-        await plugins.start_userbot_cb(session_string)
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")]])
-        await safe_edit(message, state, _("auth_success_restart"), kb, parse_mode="HTML")
-        await state.set_state(None)
+        await _finish_authorized_client(client, data['phone'], message, state)
+        auth_clients.pop(message.from_user.id, None)
     except Exception as e:
+        await _delete_qr_message(state)
         await safe_edit(message, state, _("auth_error_options", e=e), get_auth_error_kb(), parse_mode="HTML")
         await client.disconnect()
         await state.set_state(None)

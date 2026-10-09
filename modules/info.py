@@ -1,3 +1,4 @@
+import asyncio
 import html
 from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -27,8 +28,13 @@ async def show_my_info(call: types.CallbackQuery, state: FSMContext):
         return await call.answer(_("err_userbot_not_connected_alert"), show_alert=True)
         
     try:
-        me = await userbot_app.get_me()
-        chat = await userbot_app.get_chat(me.id)
+        await asyncio.wait_for(call.answer(), timeout=2.0)
+    except Exception:
+        pass
+
+    try:
+        me = await asyncio.wait_for(userbot_app.get_me(), timeout=6.0)
+        chat = await asyncio.wait_for(userbot_app.get_chat(me.id), timeout=6.0)
         
         full_name = f"{html.escape(me.first_name or '')} {html.escape(me.last_name or '')}".strip() or _("no_name")
         username = f"@{html.escape(me.username)}" if me.username else _("info_hidden_none")
@@ -52,8 +58,10 @@ async def show_my_info(call: types.CallbackQuery, state: FSMContext):
             bio_text=bio_text, is_premium=is_premium, is_verified=is_verified, 
             is_scam=is_scam, is_restricted=is_restricted, dc_id_text=dc_id_text
         )
+    except asyncio.TimeoutError:
+        info_text = _("menu_profile_timeout")
     except Exception as e:
-        info_text = _("info_error", e=e)
+        info_text = _("info_error", e=html.escape(str(e)))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back"), callback_data="main_menu")]])
     await safe_edit(call.message, state, info_text, kb, parse_mode="HTML")
@@ -66,8 +74,13 @@ async def show_user_info(call: types.CallbackQuery, state: FSMContext):
         return await call.answer(_("err_userbot_not_connected_alert"), show_alert=True)
         
     try:
-        user = await userbot_app.get_users(chat_id)
-        chat = await userbot_app.get_chat(chat_id)
+        await asyncio.wait_for(call.answer(), timeout=2.0)
+    except Exception:
+        pass
+
+    try:
+        user = await asyncio.wait_for(userbot_app.get_users(chat_id), timeout=6.0)
+        chat = await asyncio.wait_for(userbot_app.get_chat(chat_id), timeout=6.0)
         
         full_name = f"{html.escape(user.first_name or '')} {html.escape(user.last_name or '')}".strip() or _("no_name")
         username = f"@{html.escape(user.username)}" if user.username else _("info_hidden_none")
@@ -95,8 +108,10 @@ async def show_user_info(call: types.CallbackQuery, state: FSMContext):
             is_premium=is_premium, is_verified=is_verified, is_scam=is_scam, 
             is_deleted=is_deleted, is_restricted=is_restricted, dc_id_text=dc_id_text
         )
+    except asyncio.TimeoutError:
+        info_text = _("menu_profile_timeout")
     except Exception as e:
-        info_text = _("info_error", e=e)
+        info_text = _("info_error", e=html.escape(str(e)))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back"), callback_data=f"chat_{chat_id}")]])
     await safe_edit(call.message, state, info_text, kb, parse_mode="HTML")

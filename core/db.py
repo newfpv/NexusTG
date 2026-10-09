@@ -42,7 +42,7 @@ class GlobalConfig(Base):
     api_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     api_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     api_keys: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    model_fallback_list: Mapped[Optional[str]] = mapped_column(Text, default="gemini-3.1-flash-lite-preview,gemini-3-flash-preview,gemini-2.5-flash,gemini-2.5-flash-lite")
+    model_fallback_list: Mapped[Optional[str]] = mapped_column(Text, default="gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-3.5-flash,gemini-2.5-flash,gemini-3-flash-preview")
     phone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     session_string: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     global_ai_active: Mapped[bool] = mapped_column(Boolean, default=False)

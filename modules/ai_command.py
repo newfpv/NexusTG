@@ -29,12 +29,15 @@ AI_CMD_TIMEOUT = 240
 async def _get_cfg():
     a = await CoreAPI.get_module_cfg("ai_command")
     logging.debug("[AI Cmd] Configuration loaded")
+    prompt = a.get("global_prompt") or _("ai_cmd_default_prompt")
+    if prompt == _("default_prompt_env"):
+        prompt = _("ai_cmd_default_prompt")
     return {
         "command": a.get("command", ".ai"),
         "use_search": a.get("use_search", True),
         "allow_others": a.get("allow_others", False),
         "show_debug": a.get("show_debug", False),
-        "global_prompt": a.get("global_prompt", _("default_prompt_env"))
+        "global_prompt": prompt
     }
 
 async def _upd_cfg(**kwargs):
@@ -116,8 +119,11 @@ async def aicmd_save_prompt(message: types.Message, state: FSMContext):
 
 def register_userbot(app: Client):
     async def ai_filter(flt, cli, m):
+        is_me = bool(m.from_user and m.from_user.is_self)
+        if m.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
+            return False
+
         cfg = await _get_cfg()
-        is_me = (m.from_user and m.from_user.is_self)
         if (is_me or cfg["allow_others"]) and m.text and re.match(rf"^{re.escape(cfg['command'])}(?:\s+|$)", m.text):
             return True
         if m.reply_to_message:

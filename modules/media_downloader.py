@@ -1,15 +1,23 @@
+import asyncio
+import html
+import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
-import asyncio
-import logging
+from dataclasses import dataclass
+from pathlib import Path
+
 import yt_dlp
 from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from pyrogram import Client, filters, enums
-from pyrogram.types import ReplyParameters
+from pyrogram.types import InputMediaPhoto, InputMediaVideo, ReplyParameters
 from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import AsyncSessionLocal, CoreRepository
@@ -18,8 +26,30 @@ from core.config import _
 
 router = Router()
 
-URL_PATTERN = re.compile(r'(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|instagram\.com/reel(?:s)?)/[^\s]+)')
+URL_PATTERN = re.compile(
+    r'(https?://(?:'
+    r'(?:(?:www|m|vm|vt)\.)?tiktok\.com/'
+    r'|(?:www\.)?instagram\.com/reels?/'
+    r'|(?:(?:www|m)\.)?youtube\.com/shorts/'
+    r'|(?:\w+\.)?pinterest\.[\w.]+/pin/'
+    r'|pin\.it/'
+    r')[^\s<>"\']+)',
+    re.IGNORECASE,
+)
 COOKIES_PATH = "data/cookies.txt"
+MAX_CAPTION_LENGTH = 1024
+PHOTO_ALBUM_LIMIT = 10
+GALLERY_TITLE_PREFIX = "__NEXUS_TITLE__"
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
+
+
+@dataclass(slots=True)
+class DownloadedMedia:
+    kind: str
+    paths: list[str]
+    title: str
 
 class DownloadStates(StatesGroup):
     waiting_for_command = State()
@@ -35,6 +65,11 @@ async def _get_g_cfg():
             "auto_my": v.get("auto_my", False),
             "auto_other": v.get("auto_other", False),
             "allow_cmd": v.get("allow_cmd", False),
+            "enable_tiktok": v.get("enable_tiktok", True),
+            "enable_reels": v.get("enable_reels", True),
+            "enable_shorts": v.get("enable_shorts", True),
+            "enable_pinterest": v.get("enable_pinterest", True),
+            "replace_link": v.get("replace_link", True),
             "command": v.get("command", ".dl")
         }
 
@@ -60,7 +95,12 @@ async def _get_c_cfg(chat_id):
         return {
             "auto_my": v.get("auto_my", 2),
             "auto_other": v.get("auto_other", 2),
-            "allow_cmd": v.get("allow_cmd", 2)
+            "allow_cmd": v.get("allow_cmd", 2),
+            "enable_tiktok": v.get("enable_tiktok", 2),
+            "enable_reels": v.get("enable_reels", 2),
+            "enable_shorts": v.get("enable_shorts", 2),
+            "enable_pinterest": v.get("enable_pinterest", 2),
+            "replace_link": v.get("replace_link", 2)
         }
 
 async def _upd_c_cfg(chat_id, **kwargs):
@@ -141,11 +181,21 @@ async def get_md_kb():
     st_auto_my = _("status_on") if cfg["auto_my"] else _("status_off")
     st_auto_oth = _("status_on") if cfg["auto_other"] else _("status_off")
     st_allow_cmd = _("status_on") if cfg["allow_cmd"] else _("status_off")
+    st_tiktok = _("status_on") if cfg["enable_tiktok"] else _("status_off")
+    st_reels = _("status_on") if cfg["enable_reels"] else _("status_off")
+    st_shorts = _("status_on") if cfg["enable_shorts"] else _("status_off")
+    st_pinterest = _("status_on") if cfg["enable_pinterest"] else _("status_off")
+    st_replace_link = _("status_on") if cfg["replace_link"] else _("status_off")
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=_("btn_md_auto_my", status=st_auto_my), callback_data="md_tgl_g_auto_my"),
          InlineKeyboardButton(text=_("btn_md_auto_other", status=st_auto_oth), callback_data="md_tgl_g_auto_other")],
         [InlineKeyboardButton(text=_("btn_md_cmd_allow_others", status=st_allow_cmd), callback_data="md_tgl_g_allow_cmd")],
+        [InlineKeyboardButton(text=_("btn_md_tiktok", status=st_tiktok), callback_data="md_tgl_g_enable_tiktok"),
+         InlineKeyboardButton(text=_("btn_md_reels", status=st_reels), callback_data="md_tgl_g_enable_reels")],
+        [InlineKeyboardButton(text=_("btn_md_shorts", status=st_shorts), callback_data="md_tgl_g_enable_shorts")],
+        [InlineKeyboardButton(text=_("btn_md_pinterest", status=st_pinterest), callback_data="md_tgl_g_enable_pinterest")],
+        [InlineKeyboardButton(text=_("btn_md_replace_link", status=st_replace_link), callback_data="md_tgl_g_replace_link")],
         [InlineKeyboardButton(text=_("btn_md_command", cmd=cfg["command"]), callback_data="md_edit_cmd")],
         [InlineKeyboardButton(text=_("btn_md_cookie_manager"), callback_data="md_cookie_menu")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]
@@ -163,6 +213,11 @@ async def get_chat_md_kb(chat_id):
         [InlineKeyboardButton(text=get_lbl(chat_cfg["auto_my"], "btn_md_auto_my"), callback_data=f"md_c_tgl_auto_my_{chat_id}"),
          InlineKeyboardButton(text=get_lbl(chat_cfg["auto_other"], "btn_md_auto_other"), callback_data=f"md_c_tgl_auto_other_{chat_id}")],
         [InlineKeyboardButton(text=get_lbl(chat_cfg["allow_cmd"], "btn_md_c_cmd_allow"), callback_data=f"md_c_tgl_allow_cmd_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["enable_tiktok"], "btn_md_tiktok"), callback_data=f"md_c_tgl_enable_tiktok_{chat_id}"),
+         InlineKeyboardButton(text=get_lbl(chat_cfg["enable_reels"], "btn_md_reels"), callback_data=f"md_c_tgl_enable_reels_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["enable_shorts"], "btn_md_shorts"), callback_data=f"md_c_tgl_enable_shorts_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["enable_pinterest"], "btn_md_pinterest"), callback_data=f"md_c_tgl_enable_pinterest_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["replace_link"], "btn_md_replace_link"), callback_data=f"md_c_tgl_replace_link_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data=f"chat_{chat_id}")]
     ])
 
@@ -340,12 +395,71 @@ async def md_save_cmd(message: types.Message, state: FSMContext):
             await message.bot.edit_message_text(text=_("menu_md_title"), chat_id=message.chat.id, message_id=menu_msg_id, reply_markup=await get_md_kb(), parse_mode="HTML")
         except: pass
 
-def _download_video_sync(url: str, output_template: str) -> str | None:
+def _is_tiktok_url(url: str) -> bool:
+    return bool(re.search(r"https?://(?:(?:www|m|vm|vt)\.)?tiktok\.com/", url, re.IGNORECASE))
+
+
+def _is_pinterest_url(url: str) -> bool:
+    return bool(re.search(r"https?://(?:(?:\w+\.)?pinterest\.[\w.]+/pin/|pin\.it/)", url, re.IGNORECASE))
+
+
+def _platform_setting_for_url(url: str) -> tuple[str, str] | None:
+    lowered = url.lower()
+    if "tiktok.com/" in lowered:
+        return "enable_tiktok", "TikTok"
+    if "instagram.com/reel" in lowered:
+        return "enable_reels", "Instagram Reels"
+    if "youtube.com/shorts/" in lowered:
+        return "enable_shorts", "YouTube Shorts"
+    if _is_pinterest_url(url):
+        return "enable_pinterest", "Pinterest"
+    return None
+
+
+def _is_platform_enabled(url: str, global_cfg: dict, chat_cfg: dict) -> bool:
+    platform = _platform_setting_for_url(url)
+    if platform is None:
+        return False
+
+    setting, _ = platform
+    chat_value = chat_cfg.get(setting, 2)
+    return bool(global_cfg.get(setting, True)) if chat_value == 2 else bool(chat_value)
+
+
+def _fallback_title(url: str) -> str:
+    if "youtube.com/shorts/" in url.lower():
+        return "YouTube Shorts"
+    if "instagram.com/reel" in url.lower():
+        return "Instagram Reels"
+    if _is_pinterest_url(url):
+        return "Pinterest"
+    return "TikTok"
+
+
+def _prepare_caption(title: object, url: str) -> str:
+    caption = re.sub(r"\s+", " ", str(title or "")).strip() or _fallback_title(url)
+    if len(caption) > MAX_CAPTION_LENGTH:
+        caption = f"{caption[:MAX_CAPTION_LENGTH - 1].rstrip()}…"
+    return caption
+
+
+def _metadata_title(info: dict, url: str) -> object:
+    if "instagram.com/reel" in url.lower() or _is_pinterest_url(url):
+        return info.get("description") or info.get("title")
+    return info.get("title") or info.get("description")
+
+
+def _download_video_sync(url: str, workdir: str) -> DownloadedMedia | None:
     logging.info(f"[Media Downloader] Starting yt-dlp extraction for URL: {url}")
+    output_template = os.path.join(workdir, "video.%(ext)s")
     ydl_opts = {
         'outtmpl': output_template,
-        'format': 'best[ext=mp4]/best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'noplaylist': True,
+        'socket_timeout': 30,
         'quiet': True,
+        'noprogress': True,
         'no_warnings': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
@@ -361,40 +475,221 @@ def _download_video_sync(url: str, output_template: str) -> str | None:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            logging.info(f"[Media Downloader] yt-dlp extraction complete. Saved to: {filename}")
-            return filename
+            if not isinstance(info, dict):
+                return None
+
+            prepared_path = Path(ydl.prepare_filename(info))
+            candidates = [
+                path
+                for path in Path(workdir).iterdir()
+                if path.is_file() and path.suffix.lower() not in {".part", ".temp", ".ytdl"}
+            ]
+            if prepared_path.exists():
+                downloaded_path = prepared_path
+            elif candidates:
+                downloaded_path = max(candidates, key=lambda path: path.stat().st_size)
+            else:
+                return None
+
+            if (
+                downloaded_path.suffix.lower() not in VIDEO_EXTENSIONS
+                or downloaded_path.suffix.lower() in AUDIO_EXTENSIONS
+                or str(info.get("vcodec", "")).lower() == "none"
+            ):
+                logging.info("[Media Downloader] yt-dlp returned non-video media; trying gallery extraction")
+                for candidate in candidates:
+                    try:
+                        candidate.unlink()
+                    except OSError:
+                        pass
+                return None
+
+            title = _prepare_caption(_metadata_title(info, url), url)
+            logging.info(f"[Media Downloader] yt-dlp extraction complete. Saved to: {downloaded_path}")
+            return DownloadedMedia(kind="video", paths=[str(downloaded_path)], title=title)
     except Exception as e:
         logging.error("[Media Downloader] yt-dlp failed: %s", e)
         return None
 
+
+def _download_gallery_media_sync(url: str, workdir: str) -> DownloadedMedia | None:
+    platform = "Pinterest" if _is_pinterest_url(url) else "TikTok"
+    logging.info("[Media Downloader] Starting gallery-dl %s extraction for URL: %s", platform, url)
+    command = [
+        sys.executable,
+        "-m",
+        "gallery_dl",
+        "--no-colors",
+        "--no-mtime",
+        "--no-part",
+        "-D",
+        workdir,
+        "-f",
+        "{num:02}.{extension}",
+        "--Print",
+        f"{GALLERY_TITLE_PREFIX}{{title|description}}",
+    ]
+    if _is_tiktok_url(url):
+        command.extend([
+            "-o", "extractor.tiktok.audio=false",
+            "-o", "extractor.tiktok.videos=false",
+            "-o", "extractor.tiktok.photos=true",
+        ])
+    else:
+        command.extend([
+            "-o", "extractor.pinterest.videos=true",
+            "-o", "extractor.pinterest.stories=true",
+        ])
+    if os.path.exists(COOKIES_PATH):
+        command.extend(["--cookies", os.path.abspath(COOKIES_PATH)])
+    command.append(url)
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.error("[Media Downloader] gallery-dl failed to start: %s", exc)
+        return None
+
+    media_paths = sorted(
+        str(path)
+        for path in Path(workdir).iterdir()
+        if path.is_file() and path.suffix.lower() in PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
+    )
+    if result.returncode != 0 or not media_paths:
+        error_text = (result.stderr or result.stdout).strip()[-1000:]
+        logging.error("[Media Downloader] gallery-dl failed (%s): %s", result.returncode, error_text)
+        return None
+
+    title = next(
+        (
+            line.removeprefix(GALLERY_TITLE_PREFIX)
+            for line in result.stdout.splitlines()
+            if line.startswith(GALLERY_TITLE_PREFIX)
+        ),
+        "",
+    )
+    kind = "video" if len(media_paths) == 1 and Path(media_paths[0]).suffix.lower() in VIDEO_EXTENSIONS else "media"
+    logging.info("[Media Downloader] gallery-dl extracted %s %s file(s)", len(media_paths), platform)
+    return DownloadedMedia(kind=kind, paths=media_paths, title=_prepare_caption(title, url))
+
+
+def _download_media_sync(url: str, workdir: str) -> DownloadedMedia | None:
+    downloaded = _download_video_sync(url, workdir)
+    if downloaded:
+        return downloaded
+    if _is_tiktok_url(url) or _is_pinterest_url(url):
+        return _download_gallery_media_sync(url, workdir)
+    return None
+
+
+def _caption_for_send(title: str, url: str, replace_link: bool) -> tuple[str, enums.ParseMode]:
+    if not replace_link:
+        return title, enums.ParseMode.DISABLED
+    caption = f'<a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>'
+    return caption, enums.ParseMode.HTML
+
+
+async def _send_downloaded_media(
+    client: Client,
+    chat_id: int,
+    reply_to_id: int,
+    media: DownloadedMedia,
+    url: str,
+    replace_link: bool,
+) -> None:
+    reply_parameters = None if replace_link else ReplyParameters(message_id=reply_to_id, chat_id=chat_id)
+    caption, parse_mode = _caption_for_send(media.title, url, replace_link)
+    if media.kind == "video":
+        await client.send_video(
+            chat_id=chat_id,
+            video=media.paths[0],
+            caption=caption,
+            parse_mode=parse_mode,
+            reply_parameters=reply_parameters,
+        )
+        return
+
+    for offset in range(0, len(media.paths), PHOTO_ALBUM_LIMIT):
+        chunk = media.paths[offset:offset + PHOTO_ALBUM_LIMIT]
+        if len(chunk) == 1:
+            if Path(chunk[0]).suffix.lower() in VIDEO_EXTENSIONS:
+                await client.send_video(
+                    chat_id=chat_id,
+                    video=chunk[0],
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    reply_parameters=reply_parameters,
+                )
+            else:
+                await client.send_photo(
+                    chat_id=chat_id,
+                    photo=chunk[0],
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    reply_parameters=reply_parameters,
+                )
+            continue
+
+        album = [
+            (InputMediaVideo if Path(path).suffix.lower() in VIDEO_EXTENSIONS else InputMediaPhoto)(
+                media=path,
+                caption=caption if index == 0 else "",
+                parse_mode=parse_mode,
+            )
+            for index, path in enumerate(chunk)
+        ]
+        await client.send_media_group(
+            chat_id=chat_id,
+            media=album,
+            parse_mode=enums.ParseMode.DISABLED,
+            reply_parameters=reply_parameters,
+        )
+
 def register_userbot(app: Client):
-    async def process_media_download(client, message, target_msg, url: str, is_manual=False):
+    async def process_media_download(client, message, target_msg, url: str, replace_link: bool, is_manual=False):
         logging.info(f"[Media Downloader] Initiating download task for {url} in chat {message.chat.id}")
         status_msg = None
         is_me = (message.from_user and message.from_user.is_self)
-        
+
         if is_manual and is_me:
             status_msg = await message.edit(_("md_status_downloading"), parse_mode=enums.ParseMode.HTML)
-            
-        temp_path = f"data/dl_{target_msg.id}.mp4"
-        downloaded_path = None
-        
+
+        os.makedirs("data", exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"dl_{target_msg.id}_", dir="data")
+        downloaded_media = None
+
         try:
-            downloaded_path = await asyncio.to_thread(_download_video_sync, url, temp_path)
-            
-            if downloaded_path and os.path.exists(downloaded_path):
-                logging.info(f"[Media Downloader] Uploading video to chat {message.chat.id}")
-                await client.send_video(
-                    chat_id=message.chat.id,
-                    video=downloaded_path,
-                    reply_parameters=ReplyParameters(message_id=target_msg.id)
+            downloaded_media = await asyncio.to_thread(_download_media_sync, url, temp_dir)
+
+            if downloaded_media and all(os.path.exists(path) for path in downloaded_media.paths):
+                logging.info(
+                    "[Media Downloader] Uploading %s (%s file(s)) to chat %s",
+                    downloaded_media.kind,
+                    len(downloaded_media.paths),
+                    message.chat.id,
                 )
-                logging.info(f"[Media Downloader] Successfully sent video to chat {message.chat.id}")
+                await _send_downloaded_media(
+                    client,
+                    message.chat.id,
+                    target_msg.id,
+                    downloaded_media,
+                    url,
+                    replace_link,
+                )
+                if replace_link:
+                    try:
+                        await target_msg.delete()
+                    except Exception as delete_error:
+                        logging.warning(
+                            "[Media Downloader] Could not delete source message %s: %s",
+                            target_msg.id,
+                            delete_error,
+                        )
+                logging.info(f"[Media Downloader] Successfully sent media to chat {message.chat.id}")
             else:
                 logging.warning(f"[Media Downloader] File not found after download attempt for {url}")
                 raise ValueError(_("err_md_download_failed"))
-                
+
         except Exception as e:
             logging.error("[Media Downloader] Download task failed: %s", e)
             err_txt = _("md_process_error")
@@ -402,25 +697,27 @@ def register_userbot(app: Client):
                 if is_me and status_msg: 
                     try: await status_msg.edit(err_txt)
                     except: await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
-                else: 
+                else:
                     await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
         finally:
-            if downloaded_path and os.path.exists(downloaded_path):
-                try: 
-                    os.remove(downloaded_path)
-                    logging.debug(f"[Media Downloader] Cleaned up temporary file: {downloaded_path}")
-                except Exception as cleanup_err: 
-                    logging.warning(f"[Media Downloader] Failed to clean up file {downloaded_path}: {cleanup_err}")
+            try:
+                shutil.rmtree(temp_dir)
+                logging.debug(f"[Media Downloader] Cleaned up temporary directory: {temp_dir}")
+            except Exception as cleanup_err:
+                logging.warning(f"[Media Downloader] Failed to clean up directory {temp_dir}: {cleanup_err}")
             if status_msg:
                 try: await status_msg.delete()
                 except: pass
             logging.info(f"[Media Downloader] Task completed for chat {message.chat.id}")
 
-    @app.on_message(filters.regex(URL_PATTERN) & filters.private, group=10)
+    @app.on_message(filters.regex(URL_PATTERN) & (filters.private | filters.group), group=10)
     async def auto_download_handler(client, message):
+        is_me = bool(message.from_user and message.from_user.is_self)
+        if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
+            return
+
         cfg = await _get_g_cfg()
         chat_cfg = await _get_c_cfg(message.chat.id)
-        is_me = (message.from_user and message.from_user.is_self)
         
         c_my, c_oth = chat_cfg["auto_my"], chat_cfg["auto_other"]
         should_my = cfg["auto_my"] if c_my == 2 else bool(c_my)
@@ -430,22 +727,44 @@ def register_userbot(app: Client):
             match = URL_PATTERN.search(message.text or message.caption)
             if match:
                 url = match.group(1)
+                if not _is_platform_enabled(url, cfg, chat_cfg):
+                    platform = _platform_setting_for_url(url)
+                    logging.info(
+                        "[Media Downloader] Ignoring disabled platform %s in chat %s",
+                        platform[1] if platform else "unknown",
+                        message.chat.id,
+                    )
+                    return
                 logging.info(f"[Media Downloader] Auto-download match found for URL: {url} in chat {message.chat.id}")
-                asyncio.create_task(process_media_download(client, message, message, url, is_manual=False))
+                replace_link = cfg["replace_link"] if chat_cfg["replace_link"] == 2 else bool(chat_cfg["replace_link"])
+                asyncio.create_task(process_media_download(client, message, message, url, replace_link, is_manual=False))
 
-    @app.on_message(filters.text & filters.reply & filters.private, group=22)
+    @app.on_message(filters.text & filters.reply & (filters.private | filters.group), group=22)
     async def cmd_download_handler(client, message):
+        is_me = bool(message.from_user and message.from_user.is_self)
+        if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
+            return
+
         cfg = await _get_g_cfg()
         if message.text.lower().startswith(cfg["command"].lower()):
             chat_cfg = await _get_c_cfg(message.chat.id)
             c_allow = chat_cfg["allow_cmd"]
             allow_others = cfg["allow_cmd"] if c_allow == 2 else bool(c_allow)
             
-            if (message.from_user and message.from_user.is_self) or allow_others:
+            if is_me or allow_others:
                 target = message.reply_to_message
                 if target and (target.text or target.caption):
                     match = URL_PATTERN.search(target.text or target.caption)
                     if match:
                         url = match.group(1)
+                        if not _is_platform_enabled(url, cfg, chat_cfg):
+                            platform = _platform_setting_for_url(url)
+                            logging.info(
+                                "[Media Downloader] Ignoring disabled platform %s command in chat %s",
+                                platform[1] if platform else "unknown",
+                                message.chat.id,
+                            )
+                            return
                         logging.info(f"[Media Downloader] Command trigger match found for URL: {url} in chat {message.chat.id}")
-                        asyncio.create_task(process_media_download(client, message, target, url, is_manual=True))
+                        replace_link = cfg["replace_link"] if chat_cfg["replace_link"] == 2 else bool(chat_cfg["replace_link"])
+                        asyncio.create_task(process_media_download(client, message, target, url, replace_link, is_manual=True))

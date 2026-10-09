@@ -7,7 +7,7 @@ from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import InputChecklist, InputChecklistTask
 
 from core.services import generate_ai_response
@@ -59,6 +59,22 @@ async def _get_cfg():
 
 async def _upd_cfg(**kwargs):
     await CoreAPI.update_module_cfg("shop", **kwargs)
+
+async def is_shop_auto_chat(message) -> bool:
+    text = message.text or message.caption or ""
+    if not text:
+        return False
+
+    cfg = await _get_cfg()
+    return bool(
+        cfg.get("active", True)
+        and cfg.get("auto_chats")
+        and _matches_auto_chat(
+            cfg.get("auto_chats", ""),
+            message.chat.id,
+            getattr(message, "message_thread_id", None),
+        )
+    )
 
 async def get_settings_buttons():
     return [[InlineKeyboardButton(text=_("btn_shop_settings"), callback_data="shop_main")]]
@@ -144,9 +160,9 @@ def register_userbot(app: Client):
     async def shop_filter(flt, cli, m):
         try:
             text = m.text or m.caption or ""
-            if not text: 
+            if not text:
                 return False
-                
+
             cfg = await _get_cfg()
             cmd = str(cfg.get("command", ".shop")).strip()
             
@@ -166,13 +182,16 @@ def register_userbot(app: Client):
                     getattr(m, "message_thread_id", None)
                 )
 
+            is_me = bool(m.from_user and m.from_user.is_self)
+            if m.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me and not is_auto:
+                return False
+
             if is_cmd or is_reply_list or is_auto:
                 if not cfg.get("active", True):
                     logging.warning(f"[Shop] Module is OFF")
                     return False
                     
-                is_me = bool(m.from_user and m.from_user.is_self)
-                if not is_me and not cfg.get("allow_others", True):
+                if not is_me and not is_auto and not cfg.get("allow_others", True):
                     logging.warning(f"[Shop] Blocked: allow_others is OFF")
                     return False
                     
