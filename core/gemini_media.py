@@ -25,9 +25,10 @@ API_ROOT = 'https://generativelanguage.googleapis.com'
 
 
 class MediaPreparationError(Exception):
-    def __init__(self, message, code=None):
+    def __init__(self, message, code=None, details=None):
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 def request_slots():
@@ -70,7 +71,11 @@ def _sha256_file(path):
 async def _json_response(response, action):
     if response.status >= 400:
         # Upload URLs contain private session tokens; never include them or keys.
-        raise MediaPreparationError(f'Gemini media {action} failed (HTTP {response.status})', response.status)
+        try:
+            details = await response.json()
+        except (ValueError, aiohttp.ContentTypeError):
+            details = None
+        raise MediaPreparationError(f'Gemini media {action} failed (HTTP {response.status})', response.status, details)
     return await response.json()
 
 
@@ -84,7 +89,7 @@ async def _upload(api_key, path, mime_type):
         async with session.post(API_ROOT + '/upload/v1beta/files', headers=headers,
                                 json={'file': {'display_name': 'NexusTG media'}}) as response:
             if response.status >= 400:
-                raise MediaPreparationError(f'Gemini media start failed (HTTP {response.status})', response.status)
+                await _json_response(response, 'start')
             upload_url = response.headers.get('X-Goog-Upload-URL')
         if not upload_url:
             raise MediaPreparationError('Gemini media upload URL is missing')

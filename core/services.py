@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import hashlib
 import json
 import logging
 import mimetypes
@@ -17,8 +18,8 @@ from google.genai import types as genai_types
 from core.gemini_media import (prepare_contents, request_slots, count_text_tokens,
                                MediaPreparationError, INLINE_LIMIT, bounded_media_request)
 from core.config import _
-from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache
-from core.utils import download_media_checked, is_bot_dialog
+from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache, AIKeyState
+from core.utils import download_media_checked, is_bot_dialog, plugins
 
 GEMINI_TIMEOUT = 60.0
 MEDIA_DOWNLOAD_TIMEOUT = 300.0
@@ -31,7 +32,18 @@ CONTEXT_MEDIA_BATCH_TIMEOUT = 1200.0
 CONTEXT_HISTORY_TIMEOUT = 30.0
 AI_TWIN_HISTORY_LIMIT = 1000
 CONTEXT_HISTORY_TOKEN_BUDGET = 65536
+HISTORY_TOKEN_BUDGET_MIN = 4096
+HISTORY_TOKEN_BUDGET_MAX = 262144
+_INVALID_KEYS = set()
 _MODEL_CANONICAL = {}
+
+
+def history_token_budget(value=None):
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return CONTEXT_HISTORY_TOKEN_BUDGET
+    return max(HISTORY_TOKEN_BUDGET_MIN, min(HISTORY_TOKEN_BUDGET_MAX, value))
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -91,6 +103,8 @@ def _cooldown_for(exc: Exception) -> float:
 
 
 async def _is_available(repo: CoreRepository, api_key: str, model: str, search_enabled: bool) -> bool:
+    if api_key in _INVALID_KEYS:
+        return False
     state = await repo.get_ai_key_state(api_key)
     now = time.time()
     if search_enabled and state.search_unban_time > now:
@@ -102,6 +116,42 @@ async def _is_available(repo: CoreRepository, api_key: str, model: str, search_e
 
 
 async def _mark_failure(api_key: str, model: str, search_enabled: bool, exc: Exception) -> None:
+    # Delete only an explicit invalid-key verdict, never quota/permission errors.
+    if any(item.get("reason") == "API_KEY_INVALID" for item in _error_details(exc)):
+        removed = False
+        async with AsyncSessionLocal() as session:
+            repo = CoreRepository(session)
+            cfg = await repo.get_global_config()
+            keys = _split_csv(cfg.api_keys)
+            if api_key in keys:
+                removed = True
+                fingerprint = hashlib.sha256(api_key.encode()).hexdigest()[:10]
+                position = keys.index(api_key) + 1
+                cfg.api_keys = ",".join(key for key in keys if key != api_key)
+                remaining = len(_split_csv(cfg.api_keys))
+                settings = dict(cfg.module_settings or {})
+                audit = dict(settings.get("api_keys_audit", {}))
+                events = list(audit.get("removed", []))
+                events.append({"fingerprint": fingerprint, "position": position,
+                               "reason": "API_KEY_INVALID", "at": datetime.now(timezone.utc).isoformat()})
+                audit["removed"] = events[-20:]
+                settings["api_keys_audit"] = audit
+                cfg.module_settings = settings
+            admin_id = cfg.admin_id
+            state = await session.get(AIKeyState, api_key)
+            if state is not None:
+                await session.delete(state)
+            await session.commit()
+        _INVALID_KEYS.add(api_key)
+        if removed:
+            logging.warning("[Services] Removed a confirmed invalid Gemini API key (%s)", fingerprint)
+            if plugins.bot and admin_id:
+                try:
+                    await asyncio.wait_for(plugins.bot.send_message(admin_id, _("api_key_removed_notice",
+                        position=position, fingerprint=fingerprint, remaining=remaining)), timeout=10)
+                except Exception as notification_error:
+                    logging.warning("[Services] Key removal notice failed: %s", type(notification_error).__name__)
+        return
     cooldown = _cooldown_for(exc)
     if cooldown <= 0:
         return
@@ -623,13 +673,13 @@ def _compact_dialog_context(records, target_id, owner_id=None, chat_id=None, cha
     return "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in payload)
 
 
-async def _bounded_dialog_context(records, target_id, owner_id=None, chat_id=None, chat_name=None):
+async def _bounded_dialog_context(records, target_id, owner_id=None, chat_id=None, chat_name=None, token_budget=None):
     """Keep the newest whole messages; count the serialized history, not raw media."""
     def serialize(items):
         return _compact_dialog_context(items, target_id, owner_id, chat_id, chat_name)
 
     payload = serialize(records)
-    budget = CONTEXT_HISTORY_TOKEN_BUDGET
+    budget = history_token_budget(token_budget)
     if len(payload.encode("utf-8")) + 16 <= budget:
         return payload
     kept = records
@@ -755,6 +805,7 @@ async def build_dialog_context(
     structured: bool = False,
     target_message=None,
     retain_target_media: list[str] | None = None,
+    token_budget: int | None = None,
 ) -> tuple[str, list[str], int, bool]:
     messages = []
     history_kwargs = {"limit": limit}
@@ -825,7 +876,7 @@ async def build_dialog_context(
         nonlocal context_messages
         records = [context_record(msg) for msg in context_messages]
         records = [record for record in records if record["text"] or "media" in record]
-        bounded = await _bounded_dialog_context(records, target_msg_id, owner_id, chat_id, chat_name)
+        bounded = await _bounded_dialog_context(records, target_msg_id, owner_id, chat_id, chat_name, token_budget)
         selected = {json.loads(line)[0] for line in bounded.splitlines()[1:]}
         context_messages = [msg for msg in context_messages if msg.id in selected]
         for mid in list(media_results):
@@ -922,6 +973,6 @@ async def build_dialog_context(
         elif text:
             lines.append(f"{sender}: {text}")
 
-    history = (await _bounded_dialog_context(structured_records, target_msg_id, owner_id, chat_id, chat_name)
+    history = (await _bounded_dialog_context(structured_records, target_msg_id, owner_id, chat_id, chat_name, token_budget)
                if structured else "\n".join(lines))
     return history, media_paths, latest_media_duration, video_too_long

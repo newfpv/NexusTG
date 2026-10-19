@@ -24,8 +24,9 @@ from pyrogram.types import ReplyParameters
 
 from core.db import AsyncSessionLocal, CoreRepository
 from core.services import (generate_ai_response, transcribe_media, get_youtube_context,
-                           build_dialog_context, AI_TWIN_HISTORY_LIMIT, download_context_media)
-from core.utils import safe_edit, plugins, simulate_human_typing, introduce_typo
+                           build_dialog_context, AI_TWIN_HISTORY_LIMIT, download_context_media, history_token_budget,
+                           HISTORY_TOKEN_BUDGET_MIN, HISTORY_TOKEN_BUDGET_MAX)
+from core.utils import safe_edit, plugins, simulate_human_typing, introduce_typo, get_cancel_kb, get_back_kb
 from core.config import _
 from core.ai_recovery import save_checkpoint, get_checkpoint, start_recovery
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -207,6 +208,7 @@ class AISettingsFSM(StatesGroup):
     custom_prompt = State()
     delays = State()
     sleep_hours = State()
+    history_budget = State()
     global_prompt = State()
     global_delays = State()
     global_typing = State()
@@ -255,6 +257,7 @@ async def _get_g_cfg():
             "tmax": a.get("tmax", 3.5),
             "pmin": a.get("pmin", 0.5),
             "pmax": a.get("pmax", 2.0),
+            "history_token_budget": history_token_budget(a.get("history_token_budget")),
             "ai_debug": a.get("ai_debug", True) 
         }
 
@@ -338,6 +341,7 @@ async def get_settings_buttons():
 
 @router.callback_query(F.data == "ai_global_settings")
 async def global_settings_menu(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(None)
     await state.update_data(menu_msg_id=call.message.message_id)
     cfg = await _get_g_cfg()    
     
@@ -357,6 +361,7 @@ async def global_settings_menu(call: types.CallbackQuery, state: FSMContext):
          InlineKeyboardButton(text=_("btn_ai_g_delays"), callback_data="ai_g_set_delays")],
         [InlineKeyboardButton(text=_("btn_ai_g_typing"), callback_data="ai_g_set_typing"),
          InlineKeyboardButton(text=_("btn_ai_debug", status=debug_status), callback_data="ai_toggle_debug")],
+        [InlineKeyboardButton(text=_("btn_ai_history_budget", budget=f'{cfg["history_token_budget"]:,}'), callback_data="ai_history_budget")],
         [InlineKeyboardButton(text=_("btn_ai_g_prompt"), callback_data="ai_g_set_prompt")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="main_menu")]
     ])
@@ -606,6 +611,35 @@ async def cfg_typ_c(call: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data=f"ai_human_chat_{chat_id}")]])
     await safe_edit(call.message, state, _("ai_h_cfg_typing_req"), kb)
     await state.set_state(AISettingsFSM.c_h_typing_cfg)
+
+@router.callback_query(F.data == "ai_history_budget")
+async def ask_history_budget(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(menu_msg_id=call.message.message_id)
+    cfg = await _get_g_cfg()
+    await safe_edit(call.message, state, _("ai_history_budget_request", budget=cfg["history_token_budget"],
+                    minimum=HISTORY_TOKEN_BUDGET_MIN, maximum=HISTORY_TOKEN_BUDGET_MAX),
+                    get_cancel_kb("ai_global_settings"))
+    await state.set_state(AISettingsFSM.history_budget)
+
+
+@router.message(AISettingsFSM.history_budget)
+async def save_history_budget(message: types.Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        value = int((message.text or "").replace(" ", "").replace("_", "").replace(",", ""))
+        if not HISTORY_TOKEN_BUDGET_MIN <= value <= HISTORY_TOKEN_BUDGET_MAX:
+            raise ValueError
+    except ValueError:
+        await safe_edit(message, state, _("ai_history_budget_error", minimum=HISTORY_TOKEN_BUDGET_MIN,
+                        maximum=HISTORY_TOKEN_BUDGET_MAX), get_cancel_kb("ai_global_settings"))
+        return
+    await _upd_g_cfg(history_token_budget=value)
+    await state.set_state(None)
+    await safe_edit(message, state, _("ai_history_budget_saved", budget=value), get_back_kb("ai_global_settings"))
+
 
 @router.callback_query(F.data == "ai_g_set_prompt")
 async def ask_g_prompt(call: types.CallbackQuery, state: FSMContext):
@@ -1013,7 +1047,8 @@ async def process_reply(client, message, force=False):
             history_str, new_paths, latest_media_duration, video_too_long = await build_dialog_context(
                 client, chat_id, limit=AI_TWIN_HISTORY_LIMIT, target_msg_id=message.id,
                 chat_name=chat_name, played_media_ids=played_media_ids,
-                structured=True, target_message=message, retain_target_media=media_paths_to_cleanup
+                structured=True, target_message=message, retain_target_media=media_paths_to_cleanup,
+                token_budget=g_cfg.get("history_token_budget")
             )
             media_paths_to_cleanup.extend(new_paths)
         except asyncio.TimeoutError:
