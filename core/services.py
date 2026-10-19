@@ -6,26 +6,32 @@ import mimetypes
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
+from zoneinfo import ZoneInfo
 
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
+from core.gemini_media import (prepare_contents, request_slots, count_text_tokens,
+                               MediaPreparationError, INLINE_LIMIT, bounded_media_request)
 from core.config import _
 from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache
 from core.utils import download_media_checked, is_bot_dialog
 
 GEMINI_TIMEOUT = 60.0
-MEDIA_DOWNLOAD_TIMEOUT = 90.0
+MEDIA_DOWNLOAD_TIMEOUT = 300.0
 KEY_COOLDOWN = 60.0
 SERVER_COOLDOWN = 180.0
 AUTH_COOLDOWN = 1800.0
 YOUTUBE_CACHE_TTL_DAYS = 7
 CONTEXT_MEDIA_BATCH_SIZE = 3
-CONTEXT_MEDIA_BATCH_TIMEOUT = 180.0
+CONTEXT_MEDIA_BATCH_TIMEOUT = 1200.0
 CONTEXT_HISTORY_TIMEOUT = 30.0
+AI_TWIN_HISTORY_LIMIT = 1000
+CONTEXT_HISTORY_TOKEN_BUDGET = 65536
+_MODEL_CANONICAL = {}
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -47,11 +53,37 @@ def _error_code(exc: Exception) -> int | None:
     return status_code if isinstance(status_code, int) else None
 
 
+def _error_details(exc):
+    data = getattr(exc, "details", None)
+    if not isinstance(data, dict):
+        return []
+    data = data.get("error", data)
+    items = data.get("details", []) if isinstance(data, dict) else []
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _auth_failure(exc):
+    return (_error_code(exc) in {401, 403} or any(
+        item.get("reason") == "API_KEY_INVALID" for item in _error_details(exc)))
+
+
 def _cooldown_for(exc: Exception) -> float:
     code = _error_code(exc)
-    if code in {401, 403}:
+    if _auth_failure(exc):
         return AUTH_COOLDOWN
     if code == 429:
+        details = _error_details(exc)
+        for item in details:
+            if item.get("@type", "").endswith("RetryInfo"):
+                try:
+                    return max(1.0, min(86400.0, float(item["retryDelay"].removesuffix("s")) + 1))
+                except (KeyError, TypeError, ValueError):
+                    pass
+        if any("PerDay" in violation.get("quotaId", "")
+               for item in details for violation in item.get("violations", [])):
+            pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
+            reset = datetime.combine(pacific.date() + timedelta(days=1), datetime.min.time(), tzinfo=pacific.tzinfo)
+            return max(1.0, reset.timestamp() - pacific.timestamp())
         return KEY_COOLDOWN
     if code and code >= 500:
         return SERVER_COOLDOWN
@@ -66,7 +98,7 @@ async def _is_available(repo: CoreRepository, api_key: str, model: str, search_e
     if not search_enabled and state.unban_time > now:
         return False
     exhausted = state.search_exhausted_models if search_enabled else state.exhausted_models
-    return exhausted.get(model, 0) <= now
+    return max(exhausted.get(model, 0), exhausted.get(_MODEL_CANONICAL.get(model, model), 0)) <= now
 
 
 async def _mark_failure(api_key: str, model: str, search_enabled: bool, exc: Exception) -> None:
@@ -74,20 +106,26 @@ async def _mark_failure(api_key: str, model: str, search_enabled: bool, exc: Exc
     if cooldown <= 0:
         return
     until = time.time() + cooldown
+    canonical = next((violation.get("quotaDimensions", {}).get("model")
+                      for item in _error_details(exc) for violation in item.get("violations", [])
+                      if violation.get("quotaDimensions", {}).get("model")), model)
+    _MODEL_CANONICAL[model] = canonical
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
         state = await repo.get_ai_key_state(api_key)
         if search_enabled:
             exhausted = dict(state.search_exhausted_models or {})
             exhausted[model] = until
+            exhausted[canonical] = until
             state.search_exhausted_models = exhausted
-            if _error_code(exc) in {401, 403, 429}:
+            if _auth_failure(exc):
                 state.search_unban_time = until
         else:
             exhausted = dict(state.exhausted_models or {})
             exhausted[model] = until
+            exhausted[canonical] = until
             state.exhausted_models = exhausted
-            if _error_code(exc) in {401, 403, 429}:
+            if _auth_failure(exc):
                 state.unban_time = until
         await session.commit()
 
@@ -110,8 +148,10 @@ def _build_contents(prompt_context: str, media_path: str | None = None) -> list:
     prompt_context = (prompt_context or "").strip()
     contents: list = [prompt_context] if prompt_context else []
     if media_path and os.path.isfile(media_path) and os.path.getsize(media_path) > 0:
+        if os.path.getsize(media_path) > INLINE_LIMIT:
+            raise ValueError("Large media requires async streaming preparation")
         with open(media_path, "rb") as media_file:
-            contents.append(genai_types.Part.from_bytes(data=media_file.read(), mime_type=_guess_mime(media_path)))
+            contents.append(genai_types.Part.from_bytes(data=media_file.read(INLINE_LIMIT + 1), mime_type=_guess_mime(media_path)))
     return contents
 
 
@@ -141,46 +181,68 @@ async def _run_with_fallbacks(prompt_context: str, media_path: str | None, custo
         logging.warning("[Services] Gemini request skipped: empty prompt and no media")
         return _("status_waiting")
 
-    api_keys, models = await _get_ai_config()
-    if not api_keys:
-        logging.error("[Services] Gemini API keys are not configured")
-        return _("err_no_api_keys")
-    if not models:
-        models = ["gemini-2.5-flash"]
+    async with bounded_media_request(media_path):
+        api_keys, models = await _get_ai_config()
+        if not api_keys:
+            logging.error("[Services] Gemini API keys are not configured")
+            return _("err_no_api_keys")
+        if not models:
+            models = ["gemini-2.5-flash"]
 
-    last_error: Exception | None = None
-    for api_key in api_keys:
-        async with AsyncSessionLocal() as session:
-            repo = CoreRepository(session)
-            usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
-        if not usable_models:
-            continue
+        if media_path and not custom_prompt:
+            # Save scarce full-model daily requests for actual conversation replies.
+            models = sorted(models, key=lambda name: "-lite" not in name)
 
-        client = genai.Client(api_key=api_key)
-        for model in usable_models:
+        last_error: Exception | None = None
+        for api_key in api_keys:
+            async with AsyncSessionLocal() as session:
+                repo = CoreRepository(session)
+                usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
+            if not usable_models:
+                continue
+
+            client = genai.Client(api_key=api_key)
             try:
-                response = await asyncio.wait_for(
-                    client.aio.models.generate_content(
-                        model=model,
-                        contents=_build_contents(prompt_context, media_path),
-                        config=_build_config(custom_prompt, search_enabled),
-                    ),
-                    timeout=GEMINI_TIMEOUT,
-                )
-                text = _response_text(response)
-                if text:
-                    return text
-            except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
-                last_error = exc
-                logging.warning("[Services] Gemini request failed on %s: %s", model, exc)
-                await _mark_failure(api_key, model, search_enabled, exc)
-            except Exception as exc:
-                last_error = exc
-                logging.exception("[Services] Unexpected Gemini request failure on %s", model)
+                contents = await prepare_contents(prompt_context, media_path, api_key,
+                                                  _guess_mime(media_path) if media_path else "")
+            except MediaPreparationError as exc:
+                logging.warning("[Services] Media preparation failed: %s", exc)
+                await _mark_failure(api_key, usable_models[0], search_enabled, exc)
+                continue
+            for model in usable_models:
+                async with AsyncSessionLocal() as session:
+                    if not await _is_available(CoreRepository(session), api_key, model, search_enabled):
+                        continue
+                try:
+                    async with request_slots():
+                        response = await asyncio.wait_for(
+                            client.aio.models.generate_content(
+                                model=model,
+                                contents=contents,
+                                config=_build_config(custom_prompt, search_enabled),
+                            ),
+                            timeout=GEMINI_TIMEOUT * (2 if media_path else 1),
+                        )
+                    usage = getattr(response, "usage_metadata", None)
+                    if isinstance(getattr(response, "model_version", None), str):
+                        _MODEL_CANONICAL[model] = response.model_version
+                    logging.info("[Services] Gemini success: requested=%s resolved=%s input_tokens=%s output_tokens=%s",
+                                 model, getattr(response, "model_version", model),
+                                 getattr(usage, "prompt_token_count", None), getattr(usage, "candidates_token_count", None))
+                    text = _response_text(response)
+                    if text:
+                        return text
+                except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
+                    last_error = exc
+                    logging.warning("[Services] Gemini request failed on %s: %s", model, exc)
+                    await _mark_failure(api_key, model, search_enabled, exc)
+                except Exception as exc:
+                    last_error = exc
+                    logging.exception("[Services] Unexpected Gemini request failure on %s", model)
 
-    if last_error:
-        logging.error("[Services] All Gemini fallbacks failed: %s", last_error)
-    return _("status_waiting")
+        if last_error:
+            logging.error("[Services] All Gemini fallbacks failed: %s", last_error)
+        return _("status_waiting")
 
 
 async def generate_ai_response(
@@ -198,51 +260,63 @@ async def generate_ai_response_stream(
     custom_prompt: str | None = None,
     search_enabled: bool = True,
 ) -> AsyncIterator[str]:
-    api_keys, models = await _get_ai_config()
-    if not api_keys:
-        logging.error("[Services] Gemini API keys are not configured")
-        yield _("err_no_api_keys")
-        return
-    if not models:
-        models = ["gemini-2.5-flash"]
+    async with bounded_media_request(media_path):
+        api_keys, models = await _get_ai_config()
+        if not api_keys:
+            logging.error("[Services] Gemini API keys are not configured")
+            yield _("err_no_api_keys")
+            return
+        if not models:
+            models = ["gemini-2.5-flash"]
 
-    for api_key in api_keys:
-        async with AsyncSessionLocal() as session:
-            repo = CoreRepository(session)
-            usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
-        if not usable_models:
-            continue
+        for api_key in api_keys:
+            async with AsyncSessionLocal() as session:
+                repo = CoreRepository(session)
+                usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
+            if not usable_models:
+                continue
 
-        client = genai.Client(api_key=api_key)
-        for model in usable_models:
+            client = genai.Client(api_key=api_key)
             try:
-                stream = client.aio.models.generate_content_stream(
-                    model=model,
-                    contents=_build_contents(prompt_context, media_path),
-                    config=_build_config(custom_prompt, search_enabled),
-                )
-                if inspect.isawaitable(stream):
-                    stream = await asyncio.wait_for(stream, timeout=GEMINI_TIMEOUT)
+                contents = await prepare_contents(prompt_context, media_path, api_key,
+                                                  _guess_mime(media_path) if media_path else "")
+            except MediaPreparationError as exc:
+                logging.warning("[Services] Media preparation failed: %s", exc)
+                await _mark_failure(api_key, usable_models[0], search_enabled, exc)
+                continue
+            for model in usable_models:
+                async with AsyncSessionLocal() as session:
+                    if not await _is_available(CoreRepository(session), api_key, model, search_enabled):
+                        continue
+                try:
+                    async with request_slots():
+                        stream = client.aio.models.generate_content_stream(
+                            model=model,
+                            contents=contents,
+                            config=_build_config(custom_prompt, search_enabled),
+                        )
+                        if inspect.isawaitable(stream):
+                            stream = await asyncio.wait_for(stream, timeout=GEMINI_TIMEOUT)
 
-                got_response = False
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
-                    except StopAsyncIteration:
-                        break
+                        got_response = False
+                        while True:
+                            try:
+                                chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
+                            except StopAsyncIteration:
+                                break
 
-                    text = _response_text(chunk)
-                    if text:
-                        got_response = True
-                        yield text
-                if got_response:
-                    return
-            except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
-                logging.warning("[Services] Gemini stream failed on %s: %s", model, exc)
-                await _mark_failure(api_key, model, search_enabled, exc)
-            except Exception:
-                logging.exception("[Services] Unexpected Gemini stream failure on %s", model)
-    yield _("status_waiting")
+                            text = _response_text(chunk)
+                            if text:
+                                got_response = True
+                                yield text
+                        if got_response:
+                            return
+                except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
+                    logging.warning("[Services] Gemini stream failed on %s: %s", model, exc)
+                    await _mark_failure(api_key, model, search_enabled, exc)
+                except Exception:
+                    logging.exception("[Services] Unexpected Gemini stream failure on %s", model)
+        yield _("status_waiting")
 
 
 async def transcribe_media(media_path: str) -> str:
@@ -442,6 +516,9 @@ def _dialog_message_record(message, chat_id, owner_id, media_text="", reply_mess
     record = {"record_type": "message", "message_id": message.id,
               **_speaker_identity(message, chat_id, owner_id),
               "text": getattr(message, "text", None) or getattr(message, "caption", None) or ""}
+    date = getattr(message, "date", None)
+    if isinstance(date, datetime):
+        record["timestamp"] = (date.replace(tzinfo=timezone.utc) if date.tzinfo is None else date).astimezone(timezone.utc)
     for kind in ("photo", "video", "voice", "video_note", "audio", "document", "animation", "sticker"):
         if getattr(message, kind, None):
             record["media"] = {"type": kind, "description_or_transcript": media_text or None}
@@ -529,10 +606,84 @@ def _compact_dialog_context(records, target_id, owner_id=None, chat_id=None, cha
             row.append(details)
         rows.append(row)
     header = {"to": target_id, "s": people}
+    dated = [record for record in records if record.get("timestamp") is not None]
+    anchors = {}
+    previous = None
+    for record in dated:
+        stamp = record["timestamp"]
+        if (previous is None or stamp.date() != previous.date()
+                or (stamp - previous).total_seconds() >= 8 * 3600 or record is dated[-1]):
+            anchors[str(record["message_id"])] = stamp.strftime("%Y-%m-%dT%H:%MZ")
+        previous = stamp
+    if anchors:
+        header["d"] = anchors
     if quotes:
         header["q"] = quotes
     payload = [header, *rows]
     return "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in payload)
+
+
+async def _bounded_dialog_context(records, target_id, owner_id=None, chat_id=None, chat_name=None):
+    """Keep the newest whole messages; count the serialized history, not raw media."""
+    def serialize(items):
+        return _compact_dialog_context(items, target_id, owner_id, chat_id, chat_name)
+
+    payload = serialize(records)
+    budget = CONTEXT_HISTORY_TOKEN_BUDGET
+    if len(payload.encode("utf-8")) + 16 <= budget:
+        return payload
+    kept = records
+    try:
+        keys, models = await _get_ai_config()
+        if not keys:
+            raise ValueError("Token counter has no configured key")
+        model = (models or ["gemini-2.5-flash"])[0]
+        for _attempt in range(5):
+            count = await count_text_tokens(payload, keys[0], model)
+            if count <= budget:
+                logging.info("[Services] Context history: %s/%s messages, %s/%s tokens",
+                             len(kept), len(records), count, budget)
+                return payload
+            if len(kept) <= 1:
+                break
+            size = max(1, min(len(kept) - 1, int(len(kept) * budget / count * 0.9)))
+            kept = kept[-size:]
+            payload = serialize(kept)
+    except Exception as exc:
+        # A counter outage must not grow context without a limit or block a reply.
+        logging.warning("[Services] Context counter unavailable (%s); using conservative UTF-8 bound",
+                        type(exc).__name__)
+    low, high = 1, len(kept)
+    while low < high:
+        size = (low + high + 1) // 2
+        candidate = serialize(kept[-size:])
+        if len(candidate.encode("utf-8")) + 16 <= budget:
+            low = size
+        else:
+            high = size - 1
+    kept = kept[-low:]
+    payload = serialize(kept)
+    if len(payload.encode("utf-8")) + 16 > budget and kept and "media" in kept[-1]:
+        # Preserve the actual message; a huge generated attachment description
+        # remains in the cache and the original target can still be attached.
+        latest = dict(kept[-1])
+        latest["media"] = {**latest["media"], "description_or_transcript": "[Media description exceeds context budget]"}
+        payload = serialize([latest])
+    logging.info("[Services] Context history bounded locally: %s/%s messages", len(kept), len(records))
+    return payload
+
+
+async def download_context_media(client, message, file_name, timeout=MEDIA_DOWNLOAD_TIMEOUT):
+    try:
+        return await download_media_checked(client, message, file_name=file_name, timeout=timeout)
+    except BaseException:
+        for candidate in (file_name, file_name + ".temp"):
+            try:
+                if os.path.isfile(candidate):
+                    os.remove(candidate)
+            except OSError:
+                pass
+        raise
 
 
 async def _describe_message_media(client, message, media_paths: list[str]) -> tuple[str, int, bool]:
@@ -571,7 +722,7 @@ async def _describe_message_media(client, message, media_paths: list[str]) -> tu
 
     path = None
     try:
-        path = await download_media_checked(
+        path = await download_context_media(
             client,
             message,
             file_name=f"data/context_{message.id}{ext}",
@@ -603,6 +754,7 @@ async def build_dialog_context(
     played_media_ids: list[int] | None = None,
     structured: bool = False,
     target_message=None,
+    retain_target_media: list[str] | None = None,
 ) -> tuple[str, list[str], int, bool]:
     messages = []
     history_kwargs = {"limit": limit}
@@ -653,12 +805,64 @@ async def build_dialog_context(
             pass
         context_messages.append(msg)
 
+    media_results = {}
+    messages_by_id = {msg.id: msg for msg in context_messages}
+    owner_id = getattr(getattr(client, "me", None), "id", None)
+    if owner_id is None:
+        owner_id = next((getattr(getattr(msg, "from_user", None), "id", None)
+                         for msg in context_messages if _is_owner_message(msg)
+                         and getattr(getattr(msg, "from_user", None), "id", None) is not None), None)
+
+    def context_record(msg):
+        reply = getattr(msg, "reply_to_message", None)
+        if reply is None:
+            reply = messages_by_id.get(getattr(msg, "reply_to_message_id", None))
+        if reply is not None and reply.id in ignored_ids:
+            reply = None
+        return _dialog_message_record(msg, chat_id, owner_id, media_results.get(msg.id, ("", 0, False))[0], reply)
+
+    async def prune_history():
+        nonlocal context_messages
+        records = [context_record(msg) for msg in context_messages]
+        records = [record for record in records if record["text"] or "media" in record]
+        bounded = await _bounded_dialog_context(records, target_msg_id, owner_id, chat_id, chat_name)
+        selected = {json.loads(line)[0] for line in bounded.splitlines()[1:]}
+        context_messages = [msg for msg in context_messages if msg.id in selected]
+        for mid in list(media_results):
+            if mid not in selected:
+                del media_results[mid]
+
+    if structured:
+        # Read cached descriptions before choosing the window; discarded old
+        # attachments must not be downloaded just to be thrown away afterward.
+        await prune_history()
+        cached_count = 0
+        async with AsyncSessionLocal() as session:
+            repo = CoreRepository(session)
+            for msg in reversed(context_messages[:]):
+                if msg.id not in {item.id for item in context_messages}:
+                    continue
+                kind = next((kind for kind in ("photo", "video", "voice", "video_note", "audio")
+                             if getattr(msg, kind, None)), None)
+                if kind:
+                    cached = await repo.get_media_memory(msg.id, kind)
+                    if cached:
+                        duration = getattr(getattr(msg, kind), "duration", 0) or 0
+                        media_results[msg.id] = (cached, duration, duration > 600)
+                        cached_count += 1
+                        if cached_count % 15 == 0:
+                            await prune_history()
+        await prune_history()
     media_messages = [msg for msg in context_messages
                       if any(getattr(msg, kind, None) for kind in ("photo", "video", "voice", "video_note", "audio"))]
-    media_results = {}
+    if structured:
+        media_messages.reverse()  # Recognize the most recent attachments first.
     total_batches = (len(media_messages) + CONTEXT_MEDIA_BATCH_SIZE - 1) // CONTEXT_MEDIA_BATCH_SIZE
     for offset in range(0, len(media_messages), CONTEXT_MEDIA_BATCH_SIZE):
-        batch = media_messages[offset:offset + CONTEXT_MEDIA_BATCH_SIZE]
+        allowed = {msg.id for msg in context_messages}
+        batch = [msg for msg in media_messages[offset:offset + CONTEXT_MEDIA_BATCH_SIZE] if msg.id in allowed]
+        if not batch:
+            continue
         batch_paths = []
         batch_number = offset // CONTEXT_MEDIA_BATCH_SIZE + 1
         logging.info("[Services] Chat %s: media batch %s/%s (%s attachments)",
@@ -666,7 +870,8 @@ async def build_dialog_context(
 
         async def describe_batch(batch_messages, paths):
             for media_message in batch_messages:
-                media_results[media_message.id] = await _describe_message_media(client, media_message, paths)
+                if media_message.id not in media_results:
+                    media_results[media_message.id] = await _describe_message_media(client, media_message, paths)
 
         try:
             await asyncio.wait_for(describe_batch(batch, batch_paths), timeout=CONTEXT_MEDIA_BATCH_TIMEOUT)
@@ -674,17 +879,19 @@ async def build_dialog_context(
             # Results are cached after each file. Cancellation can safely resume from that cache.
             for path in batch_paths:
                 try:
-                    if path and os.path.isfile(path):
+                    target = next((msg for msg in batch if msg.id == target_msg_id), None)
+                    keep = (retain_target_media is not None and target is not None
+                            and (getattr(target, "photo", None) or getattr(target, "video", None))
+                            and os.path.basename(path).startswith(f"context_{target_msg_id}.")
+                            and not media_results.get(target_msg_id, ("", 0, False))[2])
+                    if keep and path and os.path.isfile(path):
+                        retain_target_media.append(path)
+                    elif path and os.path.isfile(path):
                         os.remove(path)
                 except OSError:
                     logging.warning("[Services] Could not remove context media %s", path, exc_info=True)
-
-    messages_by_id = {msg.id: msg for msg in context_messages}
-    owner_id = getattr(getattr(client, "me", None), "id", None)
-    if owner_id is None:
-        owner_id = next((getattr(getattr(msg, "from_user", None), "id", None)
-                         for msg in context_messages if _is_owner_message(msg)
-                         and getattr(getattr(msg, "from_user", None), "id", None) is not None), None)
+        if structured and batch_number % 5 == 0:
+            await prune_history()
     for msg in context_messages:
         sender = _message_sender(msg, chat_name)
         text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
@@ -715,6 +922,6 @@ async def build_dialog_context(
         elif text:
             lines.append(f"{sender}: {text}")
 
-    history = (_compact_dialog_context(structured_records, target_msg_id, owner_id, chat_id, chat_name)
+    history = (await _bounded_dialog_context(structured_records, target_msg_id, owner_id, chat_id, chat_name)
                if structured else "\n".join(lines))
     return history, media_paths, latest_media_duration, video_too_long

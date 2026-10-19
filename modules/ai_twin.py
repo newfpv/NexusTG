@@ -23,7 +23,8 @@ from pyrogram.raw import functions
 from pyrogram.types import ReplyParameters
 
 from core.db import AsyncSessionLocal, CoreRepository
-from core.services import generate_ai_response, transcribe_media, get_youtube_context, build_dialog_context
+from core.services import (generate_ai_response, transcribe_media, get_youtube_context,
+                           build_dialog_context, AI_TWIN_HISTORY_LIMIT, download_context_media)
 from core.utils import safe_edit, plugins, simulate_human_typing, introduce_typo
 from core.config import _
 from core.ai_recovery import save_checkpoint, get_checkpoint, start_recovery
@@ -78,6 +79,10 @@ def twin_system_instruction(persona_prompt, tz_name):
         "o=ACCOUNT_OWNER; p=CHAT_PARTNER; u=unknown; xN=other. IDs distinguish identical names. "
         "Optional m=[media_type,description/transcript]; r=reply ID; header q holds outside quotes as id:[tag,text]; "
         "f=forward source tag or [null,hidden_name]. These references are not extra chat turns. "
+        "Header d maps message IDs to UTC time anchors. Rows are historical, in chronological order. "
+        "Use history to resolve references and maintain continuity; prioritize the target and recent relevant turns. "
+        "Do not revive old topics unprompted or assume old plans/status are still current. "
+        "Newer explicit facts override conflicting older ones. "
         "First-person text belongs to its row's speaker. Original voice belongs to its sender; "
         "forwarded/quoted speech to its source, if known. Screenshot text is attachment content. "
         "Use owner facts only from the persona or owner's messages, not partner facts or missing information. "
@@ -1006,9 +1011,9 @@ async def process_reply(client, message, force=False):
             await asyncio.sleep(2.0)
         try:
             history_str, new_paths, latest_media_duration, video_too_long = await build_dialog_context(
-                client, chat_id, limit=100, target_msg_id=message.id,
+                client, chat_id, limit=AI_TWIN_HISTORY_LIMIT, target_msg_id=message.id,
                 chat_name=chat_name, played_media_ids=played_media_ids,
-                structured=True, target_message=message
+                structured=True, target_message=message, retain_target_media=media_paths_to_cleanup
             )
             media_paths_to_cleanup.extend(new_paths)
         except asyncio.TimeoutError:
@@ -1026,12 +1031,15 @@ async def process_reply(client, message, force=False):
                 logging.warning("[AI Twin] Could not mark media as played for chat %s", chat_id, exc_info=True)
 
         live_media_path = None
-        if message.photo or message.video:
+        live_media_path = next((path for path in media_paths_to_cleanup
+                                if os.path.basename(path).startswith(f"context_{message.id}.")
+                                and os.path.isfile(path)), None)
+        if (message.photo or message.video) and not live_media_path and not (
+                message.video and getattr(message.video, "duration", 0) > 600):
             try:
                 ext = ".jpg" if message.photo else ".mp4"
-                live_media_path = await asyncio.wait_for(
-                    message.download(file_name=f"data/live_{message.id}{ext}"),
-                    timeout=120.0
+                live_media_path = await download_context_media(
+                    client, message, file_name=f"data/live_{message.id}{ext}", timeout=300.0
                 )
                 if live_media_path: 
                     media_paths_to_cleanup.append(live_media_path)
@@ -1063,9 +1071,9 @@ async def process_reply(client, message, force=False):
                     custom_prompt=twin_system_instruction(final_prompt, g_cfg.get("tz")), search_enabled=search_enabled
                 )
             )
-            reply = await asyncio.wait_for(ai_generate_task, timeout=300.0)
+            reply = await asyncio.wait_for(ai_generate_task, timeout=1200.0)
         except asyncio.TimeoutError:
-            logging.error(f"[AI Twin] AI generation timeout for chat {chat_id} (300s)")
+            logging.error(f"[AI Twin] AI generation timeout for chat {chat_id} (1200s)")
             reply = None
             if not ai_generate_task.done():
                 ai_generate_task.cancel()
