@@ -7,6 +7,7 @@ import logging
 import html
 import traceback
 import time
+import weakref
 from datetime import datetime, timezone
 
 from aiogram import Router, F, types, Bot
@@ -17,6 +18,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from pyrogram import Client, filters, enums
 from pyrogram.enums import ChatType
+from pyrogram.errors import FloodWait
 from pyrogram.raw import functions
 from pyrogram.types import ReplyParameters
 
@@ -24,12 +26,166 @@ from core.db import AsyncSessionLocal, CoreRepository
 from core.services import generate_ai_response, transcribe_media, get_youtube_context, build_dialog_context
 from core.utils import safe_edit, plugins, simulate_human_typing, introduce_typo
 from core.config import _
+from core.ai_recovery import save_checkpoint, get_checkpoint, start_recovery
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 router = Router()
 skip_video_timers = {}
 SKIP_VIDEO_TTL = 300
 active_reply_tasks = {}
 ai_is_answering = set()
+reply_statuses = {}
+reply_locks = weakref.WeakValueDictionary()
+userbot_client = None
+
+
+def runtime_clock_instruction(tz_name, now=None):
+    tz_name = tz_name or "UTC"
+    try:
+        local_tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        logging.warning("[AI Twin] Invalid clock timezone %r; using UTC", tz_name)
+        tz_name = "UTC"
+        local_tz = timezone.utc
+    utc_now = now if now is not None else datetime.now(timezone.utc)
+    if utc_now.tzinfo is None:
+        raise ValueError("The runtime clock requires a timezone-aware timestamp")
+    local_now = utc_now.astimezone(local_tz)
+    return (
+        "Authoritative runtime clock, supplied by the server for this response:\n"
+        f"Current local date: {local_now:%Y-%m-%d}\n"
+        f"Current local time (24-hour clock): {local_now:%H:%M:%S}\n"
+        f"Weekday: {local_now:%A}\n"
+        f"Timezone: {tz_name}; UTC offset: {local_now:%z}\n"
+        f"Current UTC timestamp: {utc_now.astimezone(timezone.utc).isoformat(timespec='seconds')}\n"
+        "For questions about the current date, year, weekday or time, use this runtime clock. "
+        "Unless another timezone is explicitly requested, answer in the local timezone above. "
+        "Previous messages, screenshots, model knowledge and roleplay dates are historical context, "
+        "not the current clock. This clock takes precedence over conflicting dates or times in them. "
+        "The clock is factual background, not a response template. Keep the conversation's persona and language. "
+        "For a simple date/time question, use one short, casual, slightly reluctant phrase, "
+        "like a person glancing at their phone, not an announcer reading a calendar. "
+        "Give only what was asked: normally the day and month for a date, or HH:MM for the time. "
+        "Omit the weekday, year, seconds and timezone unless requested or needed to avoid ambiguity. "
+        "Use ordinary 24-hour digits for time; never spell out each digit or read the leading zeros aloud. "
+        "A brief natural approximation is fine when accurate, such as 'already past midnight'; "
+        "give precise values when explicitly requested. "
+        "Do not turn a short question into a formal report, a lecture, an extra question or obligatory teasing. "
+        "Avoid stock jokes about a stuck calendar or the other person sleeping through time. "
+        "Keep the facts correct without sounding like a clock service."
+    )
+
+
+def set_reply_status(chat_id, stage, message=None, seconds=0):
+    previous = reply_statuses.get(chat_id, {})
+    reply_statuses[chat_id] = {
+        "stage": stage,
+        "message_id": message.id if message is not None else previous.get("message_id"),
+        "received_at": time.time() if message is not None else previous.get("received_at", time.time()),
+        "updated_at": time.time(),
+        "until": time.time() + seconds if seconds else None,
+    }
+    logging.info("[AI Twin] Chat %s message %s: %s%s", chat_id,
+                 reply_statuses[chat_id]["message_id"], stage,
+                 f" ({seconds:.1f}s)" if seconds else "")
+    if len(reply_statuses) > 2000:
+        oldest = next((cid for cid in reply_statuses if cid not in active_reply_tasks), None)
+        if oldest is not None:
+            reply_statuses.pop(oldest, None)
+
+
+def reply_status_text(chat_id):
+    status = reply_statuses.get(chat_id)
+    if not status:
+        return _("ai_runtime_unknown")
+    text = _("ai_runtime_status", stage=_(f"ai_stage_{status['stage']}"),
+             message_id=status["message_id"], age=int(time.time() - status["received_at"]))
+    if status["until"]:
+        text += _("ai_runtime_remaining", seconds=max(0, int(status["until"] - time.time() + 0.999)))
+    return text
+
+
+async def schedule_reply(client, message, force=False, recovery=False):
+    chat_id = message.chat.id
+    lock = reply_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        checkpoint = await get_checkpoint(chat_id)
+        if checkpoint and checkpoint.get("retry_at", 0) > time.time():
+            return False
+        status = reply_statuses.get(chat_id, {})
+        if force and ((status.get("message_id") or 0) > message.id or
+                (status.get("message_id") == message.id and status.get("stage") in {"sent", "delay_after"})):
+            return False
+        old_task = active_reply_tasks.get(chat_id)
+        if recovery and ((old_task and not old_task.done()) or
+                (status.get("message_id") == message.id and status.get("stage") in {"sent", "reaction", "ignored", "disabled", "excluded", "no_text"})):
+            return False
+        if old_task and not old_task.done():
+            stage = reply_statuses.get(chat_id, {}).get("stage")
+            if force and (stage in {"typing", "sending"} or getattr(old_task, "forced_reply", False)):
+                return False
+            force = force or getattr(old_task, "forced_reply", False)
+            old_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(old_task), timeout=5.0)
+            except asyncio.TimeoutError:
+                return False
+            except asyncio.CancelledError:
+                pass
+        set_reply_status(chat_id, "received", message)
+        task = asyncio.create_task(process_reply(client, message, force=force))
+        task.forced_reply = force
+        active_reply_tasks[chat_id] = task
+        def cleanup(done):
+            if active_reply_tasks.get(chat_id) is done:
+                active_reply_tasks.pop(chat_id, None)
+        task.add_done_callback(cleanup)
+        return True
+
+
+@router.callback_query(F.data.startswith("ai_force_reply_"))
+async def force_reply_cb(call: types.CallbackQuery, state: FSMContext):
+    config = await plugins.db.get_global_config()
+    if call.from_user.id != config.admin_id:
+        await call.answer(_("auth_not_authorized"), show_alert=True)
+        return
+    chat_id = int(call.data.removeprefix("ai_force_reply_"))
+    client = userbot_client
+    if not client or not client.is_connected:
+        await call.answer(_("ai_force_disconnected"), show_alert=True)
+        return
+    checkpoint = await get_checkpoint(chat_id)
+    if checkpoint and checkpoint.get("retry_at", 0) > time.time():
+        await call.answer(_("ai_stage_flood_wait"), show_alert=True)
+        return
+    task = active_reply_tasks.get(chat_id)
+    if task and not task.done() and (getattr(task, "forced_reply", False) or
+            reply_statuses.get(chat_id, {}).get("stage") in {"typing", "sending"}):
+        await call.answer(_("ai_force_busy"), show_alert=True)
+        return
+    await call.answer(_("ai_force_checking"))
+    try:
+        latest = None
+        async def find_latest():
+            async for msg in client.get_chat_history(chat_id, limit=100):
+                if msg.outgoing or (msg.from_user and msg.from_user.is_self):
+                    break
+                if (msg.chat.type == ChatType.PRIVATE and msg.from_user
+                        and not msg.from_user.is_bot and msg.from_user.id != 777000
+                        and not msg.service and not msg.empty):
+                    return msg
+        latest = await asyncio.wait_for(find_latest(), timeout=20)
+        if latest is None:
+            await call.message.answer(_("ai_force_no_messages"))
+            return
+        started = await schedule_reply(client, latest, force=True)
+        if not started:
+            await call.message.answer(_("ai_force_busy"))
+        await chat_settings_menu(call, state, chat_id=chat_id)
+    except Exception:
+        logging.exception("[AI Twin] Manual reply launch failed for %s", chat_id)
+        await call.message.answer(_("ai_force_error"))
+
 
 class AISettingsFSM(StatesGroup):
     custom_prompt = State()
@@ -46,6 +202,10 @@ class AISettingsFSM(StatesGroup):
     g_h_typing_cfg = State()
     c_h_typing_cfg = State()
 
+async def on_startup():
+    await start_recovery()
+
+
 async def _get_g_cfg():
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
@@ -60,6 +220,7 @@ async def _get_g_cfg():
         
         return {
             "is_active": getattr(c, "global_ai_active", False),
+            "tz": getattr(c, "tz", None) or "UTC",
             "search_enabled": getattr(c, "google_search", True),
             "prompt": getattr(c, "global_prompt", None) or _("default_prompt_env"),
             "typing_speed": getattr(c, "typing_speed", 0.08),
@@ -216,10 +377,28 @@ async def chat_settings_menu(call: types.CallbackQuery, state: FSMContext, chat_
         [InlineKeyboardButton(text=_("btn_ai_prompt", prompt=prompt), callback_data=f"ai_prompt_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_ai_delays", c_db_min=c_db_min, c_db_max=c_db_max, c_da_min=c_da_min, c_da_max=c_da_max), callback_data=f"ai_delays_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_ai_human_settings"), callback_data=f"ai_human_chat_{chat_id}")],
+        [InlineKeyboardButton(text=_("btn_ai_force_reply"), callback_data=f"ai_force_reply_{chat_id}")],
+        [InlineKeyboardButton(text=_("btn_ai_refresh_status"), callback_data=f"ai_chat_menu_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_ai_skip_video"), callback_data=f"skipwait_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data=f"chat_{chat_id}")]
     ])
-    await safe_edit(call.message, state, _("ai_chat_menu_text", chat_id=chat_id), kb)
+    runtime_text = reply_status_text(chat_id)
+    if userbot_client and userbot_client.is_connected:
+        try:
+            async def latest_incoming():
+                async for msg in userbot_client.get_chat_history(chat_id, limit=1):
+                    return msg
+            latest = await asyncio.wait_for(latest_incoming(), timeout=5)
+            status = reply_statuses.get(chat_id, {})
+            if (latest and not latest.outgoing and latest.from_user
+                    and not latest.from_user.is_self and not latest.from_user.is_bot
+                    and latest.id > (status.get("message_id") or 0)):
+                runtime_text += "\n\n" + _("ai_runtime_unseen", message_id=latest.id)
+        except Exception:
+            logging.debug("[AI Twin] Could not check latest message for %s", chat_id, exc_info=True)
+    await safe_edit(call.message, state, _("ai_chat_menu_text", chat_id=chat_id) + "\n\n" + runtime_text, kb)
+    try: await call.answer()
+    except Exception: pass
 
 @router.callback_query(F.data.regexp(r"^ai_toggle_search_-?\d+$"))
 async def toggle_chat_search_cb(call: types.CallbackQuery, state: FSMContext):
@@ -713,6 +892,8 @@ async def save_delays(message: types.Message, state: FSMContext):
     finally: await state.set_state(None)
 
 def register_userbot(app: Client, bot: Bot):
+    global userbot_client
+    userbot_client = app
     @app.on_message(filters.private & filters.me, group=32)
     async def cancel_on_my_reply(client, message):
         chat_id = message.chat.id
@@ -735,32 +916,16 @@ def register_userbot(app: Client, bot: Bot):
                 
         chat_id = message.chat.id
             
-        if chat_id in active_reply_tasks:
-            old_task = active_reply_tasks[chat_id]
-            if not old_task.done():
-                old_task.cancel()
-                logging.info(f"[AI Twin] The previous chat task was canceled {chat_id}")
-                try:
-                    await asyncio.wait_for(old_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-            
-        task = asyncio.create_task(process_reply(client, message))
-        active_reply_tasks[chat_id] = task
-            
-        def cleanup_task(t):
-            if active_reply_tasks.get(chat_id) == t:
-                del active_reply_tasks[chat_id]
-                    
-        task.add_done_callback(cleanup_task)
+        await schedule_reply(client, message)
 
-async def process_reply(client, message):
+async def process_reply(client, message, force=False):
     chat_id = message.chat.id
     start_time = time.time()
     media_paths_to_cleanup = []
     is_processing_started = False
     
     try:
+        await save_checkpoint(chat_id, message.id, "received", new_attempt=True)
         g_cfg = await _get_g_cfg()
         c_cfg = await _get_c_cfg(chat_id)
         
@@ -771,18 +936,24 @@ async def process_reply(client, message):
         if g_cfg["ai_debug"]:
             logging.info(f"[AI Twin] MSG from {message.from_user.id if message.from_user else 'unknown'}. ChatActive={chat_is_active}, GlobActive={is_global_ai}")
             
-        if not is_global_ai and not chat_is_active: return 
-        if is_global_ai and not chat_is_active and is_ignored: return 
+        if not force and not is_global_ai and not chat_is_active:
+            set_reply_status(chat_id, "disabled")
+            return 
+        if not force and is_global_ai and not chat_is_active and is_ignored:
+            set_reply_status(chat_id, "excluded")
+            return 
         
         sleep_start, sleep_end = g_cfg["sleep_start"], g_cfg["sleep_end"]
-        if sleep_start and sleep_end:
-            now_str = datetime.now().strftime("%H:%M")
+        if not force and sleep_start and sleep_end:
+            now_str = datetime.now(ZoneInfo(g_cfg.get("tz", "UTC"))).strftime("%H:%M")
             if sleep_start <= sleep_end:
                 if sleep_start <= now_str <= sleep_end: 
+                    set_reply_status(chat_id, "sleep")
                     if g_cfg["ai_debug"]: logging.info(_("ai_log_skip_sleep", chat_id=chat_id))
                     return
             else:
                 if now_str >= sleep_start or now_str <= sleep_end: 
+                    set_reply_status(chat_id, "sleep")
                     if g_cfg["ai_debug"]: logging.info(_("ai_log_skip_sleep", chat_id=chat_id))
                     return
         
@@ -797,6 +968,8 @@ async def process_reply(client, message):
             
         final_prompt = g_cfg["prompt"] or ""
         if c_cfg["prompt"]: final_prompt += _("ai_additional_rules", prompt=c_cfg["prompt"])
+        if force:
+            final_prompt += _("ai_force_prompt")
         
         text_to_search = message.text or message.caption or ""
         yt_links = re.findall(r'(https?://(?:www\.)?(?:youtube\.com|youtu\.be|youtube\.com/shorts)/[^\s]+)', text_to_search)
@@ -814,15 +987,31 @@ async def process_reply(client, message):
 
         chat_name = message.from_user.first_name if message.from_user else (message.chat.title or _("other_sender"))
         
+        played_media_ids = []
+        set_reply_status(chat_id, "context")
+        # Let an album arrive before starting expensive recognition. New messages
+        # replace this task; completed files remain available in the media cache.
+        if not force and getattr(message, "media_group_id", None):
+            await asyncio.sleep(2.0)
         try:
-            history_str, new_paths, latest_media_duration, video_too_long = await asyncio.wait_for(
-                build_dialog_context(client, chat_id, limit=50, target_msg_id=message.id, chat_name=chat_name),
-                timeout=180.0
+            history_str, new_paths, latest_media_duration, video_too_long = await build_dialog_context(
+                client, chat_id, limit=100, target_msg_id=message.id,
+                chat_name=chat_name, played_media_ids=played_media_ids
             )
             media_paths_to_cleanup.extend(new_paths)
         except asyncio.TimeoutError:
+            set_reply_status(chat_id, "context_timeout")
             logging.error(f"[AI Twin] Chat context gathering timeout: {chat_id}")
             return
+
+        if played_media_ids:
+            try:
+                await client.invoke(functions.messages.ReadMessageContents(id=played_media_ids))
+                logging.info("[AI Twin] Chat %s: marked %s voice/video messages as played", chat_id, len(played_media_ids))
+            except FloodWait:
+                raise
+            except Exception:
+                logging.warning("[AI Twin] Could not mark media as played for chat %s", chat_id, exc_info=True)
 
         live_media_path = None
         if message.photo or message.video:
@@ -862,9 +1051,13 @@ async def process_reply(client, message):
                 logging.info(_("log_attached_live_media", path=live_media_path))
             logging.info("="*50)
 
+        set_reply_status(chat_id, "generating")
         try:
             ai_generate_task = asyncio.create_task(
-                generate_ai_response(full_history_str, live_media_path, custom_prompt="", search_enabled=search_enabled)
+                generate_ai_response(
+                    full_history_str, live_media_path,
+                    custom_prompt=runtime_clock_instruction(g_cfg.get("tz")), search_enabled=search_enabled
+                )
             )
             reply = await asyncio.wait_for(ai_generate_task, timeout=300.0)
         except asyncio.TimeoutError:
@@ -876,36 +1069,51 @@ async def process_reply(client, message):
                     await ai_generate_task
                 except asyncio.CancelledError:
                     pass
+        except FloodWait:
+            raise
         except Exception as e:
             logging.error(f"[AI Twin] Error generating AI for the chat {chat_id}: {e}")
             reply = None
 
-        if not reply or reply == "⏳": 
+        if not reply or reply == _("status_waiting") or reply == _("err_no_api_keys"):
+            set_reply_status(chat_id, "api_unavailable")
             return
             
         if g_cfg["ai_debug"]: 
             logging.info(_("log_llm_res_main", reply=reply[:200] + "..."))
 
         reply_upper = reply.upper().strip()
-        if reply_upper.startswith("[LIKE]"):
+        if reply_upper.startswith("[LIKE]") and not force:
             try: 
                 await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
-            except Exception as e: 
+            except FloodWait:
+                raise
+            except Exception as e:
+                set_reply_status(chat_id, "error")
                 logging.debug(f"send reaction error: {e}")
+            else:
+                set_reply_status(chat_id, "reaction")
             return
             
-        if "[LIKE]" in reply_upper:
+        if "[LIKE]" in reply_upper and not (force and reply_upper == "[LIKE]"):
             try: 
                 await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
+            except FloodWait:
+                raise
             except Exception as e: 
                 logging.debug(f"send reaction error: {e}")
             reply = re.sub(r'(?i)\[LIKE\]', '', reply).strip()
 
-        if not reply: 
+        if force:
+            reply = re.sub(r'(?i)\[LIKE\]', '', reply).strip()
+        if not reply:
+            set_reply_status(chat_id, "no_text" if force else "reaction")
             return 
 
         try:
             await client.read_chat_history(chat_id)
+        except FloodWait:
+            raise
         except Exception as e:
             logging.debug(f"read_chat_history error: {e}")
 
@@ -914,21 +1122,23 @@ async def process_reply(client, message):
         c_da_min = c_cfg["da_min"] if c_cfg["da_min"] is not None else g_cfg["da_min"]
         c_da_max = c_cfg["da_max"] if c_cfg["da_max"] is not None else g_cfg["da_max"]
 
-        delay_before = random.randint(c_db_min, c_db_max)
+        delay_before = 0 if force else random.randint(c_db_min, c_db_max)
         if delay_before > 0: 
             logging.info(f"[AI Twin] Chat {chat_id}: waiting for delay_before={delay_before}s")
+            set_reply_status(chat_id, "delay_before", seconds=delay_before)
             await asyncio.sleep(delay_before)
 
         is_question = bool(re.search(_("ai_question_words_regex"), text_to_search.lower()))
-        if not is_question and use_h_ignore > 0:
+        if not force and not is_question and use_h_ignore > 0:
             if random.randint(1, 100) <= use_h_ignore:
                 if g_cfg["ai_debug"]: 
                     logging.info(_("ai_log_ignored", chat_id=chat_id, chance=use_h_ignore))
+                set_reply_status(chat_id, "ignored")
                 return
 
         c_s_mul = c_cfg["s_mul"] if c_cfg["s_mul"] is not None else g_cfg["s_mul"]
         smart_delay = 0
-        if use_h_smart:
+        if use_h_smart and not force:
             if video_too_long: 
                 smart_delay = len(text_to_search) * c_s_mul
             elif latest_media_duration > 0: 
@@ -937,6 +1147,7 @@ async def process_reply(client, message):
                 smart_delay = len(text_to_search) * c_s_mul
 
         if smart_delay > 0:
+            set_reply_status(chat_id, "reading", seconds=smart_delay)
             logging.info(f"[AI Twin] Chat {chat_id}: smart reading {smart_delay:.1f}s")
             current_time = time.time()
             for cid in list(skip_video_timers.keys()):
@@ -970,9 +1181,11 @@ async def process_reply(client, message):
 
         for i, part in enumerate(parts):
             typing_time = min(len(part) * float(g_cfg["typing_speed"]), 10.0) 
-            await simulate_human_typing(client, chat_id, typing_time, use_h_typing, c_tmin, c_tmax, c_pmin, c_pmax)
+            set_reply_status(chat_id, "typing")
+            if not force:
+                await simulate_human_typing(client, chat_id, typing_time, use_h_typing, c_tmin, c_tmax, c_pmin, c_pmax)
             
-            use_typo = random.random() < 0.05
+            use_typo = not force and random.random() < 0.05
             if use_typo:
                 final_part = await asyncio.to_thread(introduce_typo, part)
             else:
@@ -981,6 +1194,8 @@ async def process_reply(client, message):
             reply_params = ReplyParameters(message_id=message.id) if (i == 0 and use_reply) else None
             
             try:
+                set_reply_status(chat_id, "sending")
+                await save_checkpoint(chat_id, message.id, "sending")
                 ai_is_answering.add(chat_id)
                 sent_msg = await client.send_message(chat_id, final_part, reply_parameters=reply_params)
             finally:
@@ -989,6 +1204,8 @@ async def process_reply(client, message):
             
             try: 
                 await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
+            except FloodWait:
+                raise
             except Exception as e: 
                 logging.debug(f"cancel action error: {e}")
             
@@ -996,21 +1213,30 @@ async def process_reply(client, message):
                 await asyncio.sleep(random.uniform(3, 10.0))
                 try: 
                     await sent_msg.edit_text(part)
+                except FloodWait:
+                    raise
                 except Exception as e: 
                     logging.debug(f"edit typo error: {e}")
             
             if i < len(parts) - 1:
                 await asyncio.sleep(random.uniform(0.5, 2.0)) 
 
-        delay_after = random.randint(c_da_min, c_da_max)
+        delay_after = 0 if force else random.randint(c_da_min, c_da_max)
         if delay_after > 0:
             logging.info(f"[AI Twin] Chat {chat_id}: waiting for delay_after={delay_after}s")
+            set_reply_status(chat_id, "delay_after", seconds=delay_after)
             await asyncio.sleep(delay_after)
+        set_reply_status(chat_id, "sent")
 
-    except asyncio.CancelledError: 
+    except asyncio.CancelledError:
+        set_reply_status(chat_id, "cancelled")
         logging.info(f"Task cancelled for chat {chat_id}")
         raise
+    except FloodWait as e:
+        set_reply_status(chat_id, "flood_wait", seconds=e.value)
+        logging.warning("[AI Twin] Telegram requests paused for chat %s for %ss", chat_id, e.value)
     except Exception as e:
+        set_reply_status(chat_id, "error")
         logging.error(_("log_ai_critical_error", e=e))
         traceback.print_exc()
         try:
@@ -1018,6 +1244,13 @@ async def process_reply(client, message):
         except: 
             pass
     finally:
+        try:
+            status = reply_statuses.get(chat_id, {})
+            if status.get("message_id") == message.id:
+                await save_checkpoint(chat_id, message.id, status["stage"],
+                                      retry_at=(status.get("until") or 0) if status["stage"] == "flood_wait" else 0)
+        except Exception:
+            logging.exception("[AI Twin] Could not persist reply checkpoint for %s", chat_id)
         if is_processing_started:
             elapsed = time.time() - start_time
             logging.info(f"[AI Twin] Completion of chat processing {chat_id}, time: {elapsed:.1f}s")
@@ -1026,6 +1259,8 @@ async def process_reply(client, message):
             if p and os.path.exists(p):
                 try: 
                     os.remove(p)
+                except FloodWait:
+                    raise
                 except Exception as e: 
                     logging.debug(f"cleanup media error: {e}")
                     

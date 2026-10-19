@@ -22,7 +22,9 @@ KEY_COOLDOWN = 60.0
 SERVER_COOLDOWN = 180.0
 AUTH_COOLDOWN = 1800.0
 YOUTUBE_CACHE_TTL_DAYS = 7
-MAX_CONTEXT_MEDIA = 3
+CONTEXT_MEDIA_BATCH_SIZE = 3
+CONTEXT_MEDIA_BATCH_TIMEOUT = 180.0
+CONTEXT_HISTORY_TIMEOUT = 30.0
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -445,9 +447,6 @@ async def _describe_message_media(client, message, media_paths: list[str]) -> tu
         too_long = True
         return _("ai_msg_file"), duration, too_long
 
-    if len(media_paths) >= MAX_CONTEXT_MEDIA:
-        return _("ai_msg_file"), duration, too_long
-
     path = None
     try:
         path = await download_media_checked(
@@ -479,6 +478,7 @@ async def build_dialog_context(
     limit: int = 30,
     target_msg_id: int | None = None,
     chat_name: str | None = None,
+    played_media_ids: list[int] | None = None,
 ) -> tuple[str, list[str], int, bool]:
     messages = []
     history_kwargs = {"limit": limit}
@@ -492,12 +492,15 @@ async def build_dialog_context(
             fallback_kwargs["offset_id"] = target_msg_id + 1
         history_iter = client.get_chat_history(chat_id, **fallback_kwargs)
 
-    async for msg in history_iter:
-        if target_msg_id is not None and msg.id > target_msg_id:
-            continue
-        if is_bot_dialog(msg):
-            continue
-        messages.append(msg)
+    async def collect_history():
+        async for msg in history_iter:
+            if target_msg_id is not None and msg.id > target_msg_id:
+                continue
+            if is_bot_dialog(msg):
+                continue
+            messages.append(msg)
+
+    await asyncio.wait_for(collect_history(), timeout=CONTEXT_HISTORY_TIMEOUT)
 
     messages.sort(key=lambda item: item.id)
     media_paths: list[str] = []
@@ -505,6 +508,7 @@ async def build_dialog_context(
     video_too_long = False
     lines: list[str] = []
 
+    context_messages = []
     for msg in messages:
         try:
             async with AsyncSessionLocal() as session:
@@ -512,11 +516,46 @@ async def build_dialog_context(
                     continue
         except Exception:
             pass
+        context_messages.append(msg)
 
+    media_messages = [msg for msg in context_messages
+                      if any(getattr(msg, kind, None) for kind in ("photo", "video", "voice", "video_note", "audio"))]
+    media_results = {}
+    total_batches = (len(media_messages) + CONTEXT_MEDIA_BATCH_SIZE - 1) // CONTEXT_MEDIA_BATCH_SIZE
+    for offset in range(0, len(media_messages), CONTEXT_MEDIA_BATCH_SIZE):
+        batch = media_messages[offset:offset + CONTEXT_MEDIA_BATCH_SIZE]
+        batch_paths = []
+        batch_number = offset // CONTEXT_MEDIA_BATCH_SIZE + 1
+        logging.info("[Services] Chat %s: media batch %s/%s (%s attachments)",
+                     chat_id, batch_number, total_batches, len(batch))
+
+        async def describe_batch(batch_messages, paths):
+            for media_message in batch_messages:
+                media_results[media_message.id] = await _describe_message_media(client, media_message, paths)
+
+        try:
+            await asyncio.wait_for(describe_batch(batch, batch_paths), timeout=CONTEXT_MEDIA_BATCH_TIMEOUT)
+        finally:
+            # Results are cached after each file. Cancellation can safely resume from that cache.
+            for path in batch_paths:
+                try:
+                    if path and os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    logging.warning("[Services] Could not remove context media %s", path, exc_info=True)
+
+    for msg in context_messages:
         sender = _message_sender(msg, chat_name)
         text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
 
-        media_text, duration, too_long = await _describe_message_media(client, msg, media_paths)
+        media_text, duration, too_long = media_results.get(msg.id, ("", 0, False))
+        # Telegram tracks playback separately from reading the chat history.
+        if (played_media_ids is not None
+                and (getattr(msg, "voice", None) or getattr(msg, "video_note", None))
+                and not getattr(msg, "outgoing", False)
+                and not getattr(getattr(msg, "from_user", None), "is_self", False)
+                and media_text and media_text not in {_("ai_msg_file"), _("status_waiting"), _("err_no_api_keys")}):
+            played_media_ids.append(msg.id)
         if duration:
             latest_media_duration = duration
         video_too_long = video_too_long or too_long
