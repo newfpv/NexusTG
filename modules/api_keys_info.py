@@ -26,8 +26,11 @@ def _model_ready(state, model, search, now):
     return max(until or 0, exhausted.get(model, 0), exhausted.get(_MODEL_CANONICAL.get(model, model), 0)) <= now
 
 def test_summary(rows):
-    statuses = [item['status'] for row in rows for item in row.get('results', [])]
-    return f'🟢 {statuses.count("ok")} · ⏳ {statuses.count("quota")} · ❌ {sum(s not in {"ok", "quota"} for s in statuses)}'
+    items = [item for row in rows for item in row.get('results', [])]
+    answered = [item['status'] for item in items if item.get('answered', item.get('status') != 'timeout')]
+    summary = f'🟢 {answered.count("ok")} · ⏳ {answered.count("quota")} · ❌ {sum(s not in {"ok", "quota"} for s in answered)}'
+    unanswered = len(items) - len(answered)
+    return summary + (f' · ⌛ {unanswered}' if unanswered else '')
 
 async def build_keys_info(page=0, reveal=False, results=False):
     now = time.time()
@@ -68,6 +71,8 @@ async def build_keys_info(page=0, reveal=False, results=False):
                 except (KeyError, TypeError, ValueError):
                     stamp = '?'
                 lines.append(_("api_compact_last_test", at=stamp, summary=test_summary(test.get('rows', []))))
+                if test.get('cancelled'):
+                    lines.append(_("api_test_cancelled"))
             if audit.get('removed'):
                 lines.append(_("api_compact_removed", count=len(audit['removed'])))
     mode = 'results' if results else ('show' if reveal else 'info')

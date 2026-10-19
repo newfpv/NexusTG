@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 import logging
@@ -20,7 +21,7 @@ from core.config import _
 
 router = Router()
 auth_clients = {}
-_active_credential_tests = set()
+_active_credential_tests = {}
 
 class SetupFSM(StatesGroup):
     api_id = State()
@@ -464,36 +465,62 @@ async def save_new_tz(message: types.Message, state: FSMContext):
 @router.callback_query(F.data.in_({"test_ai_config", "api_keys_test"}))
 async def cb_test_ai(call: types.CallbackQuery, state: FSMContext):
     uid = call.from_user.id
-    if uid in _active_credential_tests:
-        return await call.answer(_("api_test_busy"), show_alert=False)
     config = await plugins.db.get_global_config()
     if uid != config.admin_id or call.message.chat.id != uid:
         return await call.answer(_("auth_not_authorized"), show_alert=True)
-    _active_credential_tests.add(uid)
-    plugins.cache.delete(f"cancel_test_{uid}")
+    if uid in _active_credential_tests:
+        return await call.answer(_("api_test_busy"), show_alert=False)
+    from core.api_key_tests import CredentialTestRun
+    job = CredentialTestRun("keys" if call.data == "api_keys_test" else "models")
+    _active_credential_tests[uid] = job
     await state.update_data(menu_msg_id=call.message.message_id, api_test_running=True)
+    if _active_credential_tests.get(uid) is not job:
+        job.stop()
+        return
     stop_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_stop_test"), callback_data="stop_ai_test")]])
-    try:
-        from core.services import test_ai_credentials
-        async def progress_callback(text):
-            data = await state.get_data()
-            if plugins.cache.get(f"cancel_test_{uid}") or not data.get("api_test_running"):
-                return False
-            await safe_edit(call.message, state, text, stop_kb, parse_mode="HTML")
-            return True
-        await test_ai_credentials(progress_cb=progress_callback, mode="keys" if call.data == "api_keys_test" else "models")
-        if (await state.get_data()).get("api_test_running"):
-            from modules.api_keys_info import build_keys_info
-            text, kb = await build_keys_info(results=True)
-            await safe_edit(call.message, state, text, kb, parse_mode="HTML")
-    finally:
-        _active_credential_tests.discard(uid)
-        await state.update_data(api_test_running=False)
+    async def progress_callback(text):
+        if _active_credential_tests.get(uid) is not job or not (await state.get_data()).get("api_test_running"):
+            return False
+        await safe_edit(call.message, state, text, stop_kb, parse_mode="HTML")
+        return True
+    async def execute_test():
+        try:
+            await job.execute(progress_callback)
+            if _active_credential_tests.get(uid) is job and (await state.get_data()).get("api_test_running"):
+                from modules.api_keys_info import build_keys_info
+                text, kb = await build_keys_info(results=True)
+                await safe_edit(call.message, state, text, kb, parse_mode="HTML")
+        except asyncio.CancelledError:
+            job.stop()
+            raise
+        except Exception as exc:
+            logging.error("[API tests] Test worker failed: %s", type(exc).__name__)
+        finally:
+            if _active_credential_tests.get(uid) is job:
+                _active_credential_tests.pop(uid, None)
+                await state.update_data(api_test_running=False)
+    job.task = asyncio.create_task(execute_test(), name="api-credential-test")
 
 @router.callback_query(F.data == "stop_ai_test")
 async def cb_stop_test(call: types.CallbackQuery, state: FSMContext):
-    plugins.cache.set(f"cancel_test_{call.from_user.id}", True, ttl=60)
-    await call.answer(_("test_stopping"), show_alert=False)
+    uid = call.from_user.id
+    config = await plugins.db.get_global_config()
+    if uid != config.admin_id or call.message.chat.id != uid:
+        return await call.answer(_("auth_not_authorized"), show_alert=True)
+    job = _active_credential_tests.pop(uid, None)
+    if job:
+        job.stop()
+    await state.update_data(api_test_running=False)
+    try:
+        async with asyncio.timeout(1):
+            await call.answer()
+    except Exception:
+        pass
+    if job:
+        from core.api_key_tests import _save_report
+        await _save_report(job.report)
+    from modules.api_keys_info import keys_info
+    await keys_info(call, state)
 
 @router.callback_query(F.data == "full_reset")
 async def ask_full_reset(call: types.CallbackQuery, state: FSMContext):
