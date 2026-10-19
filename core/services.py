@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -404,13 +405,134 @@ async def get_youtube_context(url: str) -> tuple[int, str]:
     return duration, context
 
 
-def _message_sender(message, fallback_name: str | None) -> str:
-    if message.from_user and getattr(message.from_user, "is_self", False):
-        return _("me_sender")
-    if fallback_name:
-        return fallback_name
+def _is_owner_message(message, owner_id=None) -> bool:
     user = getattr(message, "from_user", None)
-    return getattr(user, "first_name", None) or getattr(getattr(message, "chat", None), "title", None) or _("other_sender")
+    return bool(getattr(message, "outgoing", False)
+                or getattr(user, "is_self", False)
+                or (owner_id is not None and getattr(user, "id", None) == owner_id))
+
+
+def _message_sender(message, fallback_name: str | None) -> str:
+    if _is_owner_message(message):
+        return _("me_sender")
+    user = getattr(message, "from_user", None)
+    return (getattr(user, "first_name", None) or fallback_name
+            or getattr(getattr(message, "chat", None), "title", None) or _("other_sender"))
+
+
+def _speaker_identity(message, chat_id, owner_id):
+    user = getattr(message, "from_user", None)
+    sender_id = getattr(user, "id", None)
+    if _is_owner_message(message, owner_id):
+        speaker = "ACCOUNT_OWNER"
+    elif sender_id is not None and sender_id == chat_id:
+        speaker = "CHAT_PARTNER"
+    elif sender_id is not None:
+        speaker = "OTHER"
+    else:
+        speaker = "UNKNOWN"
+    return {
+        "speaker": speaker,
+        "sender_id": sender_id if sender_id is not None else (owner_id if speaker == "ACCOUNT_OWNER" else None),
+        "sender_name": getattr(user, "first_name", None),
+    }
+
+
+def _dialog_message_record(message, chat_id, owner_id, media_text="", reply_message=None):
+    record = {"record_type": "message", "message_id": message.id,
+              **_speaker_identity(message, chat_id, owner_id),
+              "text": getattr(message, "text", None) or getattr(message, "caption", None) or ""}
+    for kind in ("photo", "video", "voice", "video_note", "audio", "document", "animation", "sticker"):
+        if getattr(message, kind, None):
+            record["media"] = {"type": kind, "description_or_transcript": media_text or None}
+            break
+    reply_id = getattr(message, "reply_to_message_id", None)
+    if reply_message is not None:
+        reply_id = reply_message.id
+        record["reply_to"] = {"message_id": reply_id,
+                              **_speaker_identity(reply_message, chat_id, owner_id),
+                              "quoted_text": (getattr(reply_message, "text", None)
+                                              or getattr(reply_message, "caption", None) or "")[:400]}
+    elif reply_id:
+        record["reply_to"] = {"message_id": reply_id}
+    origin = getattr(message, "forward_from", None) or getattr(message, "forward_from_chat", None)
+    hidden_name = getattr(message, "forward_sender_name", None)
+    if origin is not None or hidden_name:
+        record["forwarded_from"] = {
+            "id": getattr(origin, "id", None),
+            "name": (getattr(origin, "first_name", None) or getattr(origin, "title", None) or hidden_name),
+        }
+    return record
+
+
+def _compact_dialog_context(records, target_id, owner_id=None, chat_id=None, chat_name=None):
+    people = {}
+    if owner_id is not None:
+        people["o"] = [owner_id]
+    if chat_id is not None:
+        people["p"] = [chat_id, chat_name] if chat_name else [chat_id]
+    others = {}
+
+    def register(identity):
+        role = identity.get("speaker")
+        uid, name = identity.get("sender_id"), identity.get("sender_name")
+        if role == "UNKNOWN":
+            return "u"
+        if role in {"ACCOUNT_OWNER", "CHAT_PARTNER"}:
+            tag = "o" if role == "ACCOUNT_OWNER" else "p"
+        else:
+            if uid is None:
+                return "u"
+            tag = others.setdefault(uid, f"x{len(others) + 1}")
+        old = people.get(tag, [])
+        uid = uid if uid is not None else (old[0] if old else None)
+        name = name or (old[1] if len(old) > 1 else None)
+        if uid is not None or name:
+            people[tag] = [uid, name] if name else [uid]
+        return tag
+
+    for record in records:
+        register(record)
+        if "reply_to" in record and "speaker" in record["reply_to"]:
+            register(record["reply_to"])
+    known_ids = {record["message_id"] for record in records}
+    quotes = {}
+    rows = []
+    for record in records:
+        row = [record["message_id"], register(record), record["text"]]
+        details = {}
+        media = record.get("media")
+        if media:
+            details["m"] = [media["type"]]
+            if media.get("description_or_transcript"):
+                details["m"].append(media["description_or_transcript"])
+        reply = record.get("reply_to")
+        if reply:
+            rid = reply["message_id"]
+            details["r"] = rid
+            if rid not in known_ids and "speaker" in reply:
+                entry = quotes.setdefault(str(rid), [register(reply)])
+                if entry[0] == "u":
+                    entry[0] = register(reply)
+                if len(entry) == 1 and reply.get("quoted_text"):
+                    entry.append(reply["quoted_text"])
+        origin = record.get("forwarded_from")
+        if origin:
+            uid = origin.get("id")
+            if uid is None:
+                details["f"] = [None, origin.get("name")]
+            else:
+                tag = next((tag for tag, info in people.items() if info[0] == uid), None)
+                details["f"] = tag or register({"speaker": "OTHER", "sender_id": uid,
+                                                "sender_name": origin.get("name")})
+        if details:
+            row.append(details)
+        rows.append(row)
+    header = {"to": target_id, "s": people}
+    if quotes:
+        header["q"] = quotes
+    payload = [header, *rows]
+    return "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in payload)
 
 
 async def _describe_message_media(client, message, media_paths: list[str]) -> tuple[str, int, bool]:
@@ -479,6 +601,8 @@ async def build_dialog_context(
     target_msg_id: int | None = None,
     chat_name: str | None = None,
     played_media_ids: list[int] | None = None,
+    structured: bool = False,
+    target_message=None,
 ) -> tuple[str, list[str], int, bool]:
     messages = []
     history_kwargs = {"limit": limit}
@@ -502,17 +626,28 @@ async def build_dialog_context(
 
     await asyncio.wait_for(collect_history(), timeout=CONTEXT_HISTORY_TIMEOUT)
 
+    if (target_message is not None and getattr(target_message, "id", None) == target_msg_id
+            and getattr(getattr(target_message, "chat", None), "id", None) == chat_id
+            and not is_bot_dialog(target_message)):
+        # An incoming update can include reply metadata that get_chat_history lacks.
+        messages = [msg for msg in messages if msg.id != target_message.id]
+        messages.append(target_message)
     messages.sort(key=lambda item: item.id)
+    if limit > 0:
+        messages = messages[-limit:]
     media_paths: list[str] = []
     latest_media_duration = 0
     video_too_long = False
     lines: list[str] = []
+    structured_records = []
 
     context_messages = []
+    ignored_ids = set()
     for msg in messages:
         try:
             async with AsyncSessionLocal() as session:
                 if await CoreRepository(session).is_msg_ignored(chat_id, msg.id):
+                    ignored_ids.add(msg.id)
                     continue
         except Exception:
             pass
@@ -544,6 +679,12 @@ async def build_dialog_context(
                 except OSError:
                     logging.warning("[Services] Could not remove context media %s", path, exc_info=True)
 
+    messages_by_id = {msg.id: msg for msg in context_messages}
+    owner_id = getattr(getattr(client, "me", None), "id", None)
+    if owner_id is None:
+        owner_id = next((getattr(getattr(msg, "from_user", None), "id", None)
+                         for msg in context_messages if _is_owner_message(msg)
+                         and getattr(getattr(msg, "from_user", None), "id", None) is not None), None)
     for msg in context_messages:
         sender = _message_sender(msg, chat_name)
         text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
@@ -552,8 +693,7 @@ async def build_dialog_context(
         # Telegram tracks playback separately from reading the chat history.
         if (played_media_ids is not None
                 and (getattr(msg, "voice", None) or getattr(msg, "video_note", None))
-                and not getattr(msg, "outgoing", False)
-                and not getattr(getattr(msg, "from_user", None), "is_self", False)
+                and not _is_owner_message(msg, owner_id)
                 and media_text and media_text not in {_("ai_msg_file"), _("status_waiting"), _("err_no_api_keys")}):
             played_media_ids.append(msg.id)
         if duration:
@@ -562,8 +702,19 @@ async def build_dialog_context(
         if media_text:
             text = f"{text}\n[{media_text}]" if text else f"[{media_text}]"
 
-        if not text:
-            continue
-        lines.append(f"{sender}: {text}")
+        if structured:
+            reply = getattr(msg, "reply_to_message", None)
+            if reply is None:
+                reply = messages_by_id.get(getattr(msg, "reply_to_message_id", None))
+            if reply is not None and reply.id in ignored_ids:
+                reply = None
+            record = _dialog_message_record(msg, chat_id, owner_id, media_text, reply)
+            if record["text"] or "media" in record:
+                # JSON escaping keeps multiline text and embedded speaker labels in one message.
+                structured_records.append(record)
+        elif text:
+            lines.append(f"{sender}: {text}")
 
-    return "\n".join(lines), media_paths, latest_media_duration, video_too_long
+    history = (_compact_dialog_context(structured_records, target_msg_id, owner_id, chat_id, chat_name)
+               if structured else "\n".join(lines))
+    return history, media_paths, latest_media_duration, video_too_long
