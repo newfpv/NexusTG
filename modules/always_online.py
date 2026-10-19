@@ -75,25 +75,19 @@ def register_userbot(app):
 
 async def get_settings_buttons():
     cfg = await plugins.db.get_module_cfg("always_online")
-    status = _("status_on") if cfg.get("enabled", False) else _("status_off")
-    return [[InlineKeyboardButton(text=_("btn_always_online", status=status), callback_data="online_menu")]]
+    enabled = bool(cfg.get("enabled", False))
+    status = _("status_on") if enabled else _("status_off")
+    return [[InlineKeyboardButton(text=_("btn_always_online", status=status),
+        callback_data="online_set_off" if enabled else "online_set_on")]]
 
 
 @router.callback_query(F.data == "online_menu")
 async def online_menu(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(None)
     await state.update_data(menu_msg_id=call.message.message_id)
-    cfg = await plugins.db.get_module_cfg("always_online")
-    enabled = bool(cfg.get("enabled", False))
-    connected = userbot_app and userbot_app.is_connected and userbot_app.is_initialized
-    text = _("online_menu", status=_("status_on") if enabled else _("status_off"),
-             connection=_("online_connected") if connected else _("online_disconnected"))
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=_("online_disable") if enabled else _("online_enable"),
-                              callback_data="online_set_off" if enabled else "online_set_on")],
-        [InlineKeyboardButton(text=_("btn_back"), callback_data="main_menu")],
-    ])
-    await safe_edit(call.message, state, text, kb)
+    if plugins.generate_menu_cb:
+        text, kb = await plugins.generate_menu_cb()
+        await safe_edit(call.message, state, text, kb)
 
 
 @router.callback_query(F.data.in_({"online_set_on", "online_set_off"}))

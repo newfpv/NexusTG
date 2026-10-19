@@ -118,7 +118,8 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret-two', text)
         self.assertIn(keys_info.fingerprint('secret-one'), text)
         self.assertIn('1', text)
-        self.assertIn('Google AI Studio', text)
+        self.assertIn(keys_info._('api_compact_hint'), text)
+        self.assertLess(len(text), 1000)
         self.assertLess(len(text), 4096)
         self.assertTrue(kb.inline_keyboard)
 

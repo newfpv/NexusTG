@@ -20,6 +20,7 @@ from core.config import _
 
 router = Router()
 auth_clients = {}
+_active_credential_tests = set()
 
 class SetupFSM(StatesGroup):
     api_id = State()
@@ -395,18 +396,29 @@ async def auth_password(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "set_edit_keys")
 async def cb_edit_keys(call: types.CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="global_settings")]])
+    from modules.api_keys_info import keys_info
+    await keys_info(call, state)
+
+@router.callback_query(F.data == "api_keys_edit")
+async def ask_edit_keys(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(menu_msg_id=call.message.message_id, api_test_running=False)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="set_edit_keys")]])
     await state.set_state(BotSettingsFSM.keys)
     await safe_edit(call.message, state, _("ask_new_keys"), kb, parse_mode="HTML")
 
 @router.message(BotSettingsFSM.keys)
 async def save_new_keys(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
-    await plugins.db.update_global_config(api_keys=message.text.strip())
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]])
-    await safe_edit(message, state, _("keys_updated"), kb)
+    except Exception: pass
+    from core.services import _split_csv, _INVALID_KEYS
+    keys = list(dict.fromkeys(_split_csv((message.text or "").replace("\n", ","))))
+    if not keys:
+        return
+    await plugins.db.update_global_config(api_keys=",".join(keys))
+    _INVALID_KEYS.difference_update(keys)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back"), callback_data="set_edit_keys")]])
     await state.set_state(None)
+    await safe_edit(message, state, _("keys_updated"), kb)
 
 @router.callback_query(F.data == "set_edit_models")
 async def cb_edit_models(call: types.CallbackQuery, state: FSMContext):
@@ -449,25 +461,34 @@ async def save_new_tz(message: types.Message, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_cancel"), callback_data="global_settings")]])
         await safe_edit(message, state, _("tz_error_setup"), kb, parse_mode="HTML")
 
-@router.callback_query(F.data == "test_ai_config")
+@router.callback_query(F.data.in_({"test_ai_config", "api_keys_test"}))
 async def cb_test_ai(call: types.CallbackQuery, state: FSMContext):
-    plugins.cache.delete(f"cancel_test_{call.from_user.id}")
-    
+    uid = call.from_user.id
+    if uid in _active_credential_tests:
+        return await call.answer(_("api_test_busy"), show_alert=False)
+    config = await plugins.db.get_global_config()
+    if uid != config.admin_id or call.message.chat.id != uid:
+        return await call.answer(_("auth_not_authorized"), show_alert=True)
+    _active_credential_tests.add(uid)
+    plugins.cache.delete(f"cancel_test_{uid}")
+    await state.update_data(menu_msg_id=call.message.message_id, api_test_running=True)
     stop_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_stop_test"), callback_data="stop_ai_test")]])
-    await safe_edit(call.message, state, _("test_running"), stop_kb, parse_mode="HTML")
-    
-    from core.services import test_ai_credentials
-    
-    async def progress_callback(text: str) -> bool:
-        if plugins.cache.get(f"cancel_test_{call.from_user.id}"):
-            return False
-        await safe_edit(call.message, state, text, stop_kb, parse_mode="HTML")
-        return True
-        
-    result_text = await test_ai_credentials(progress_cb=progress_callback)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]])
-    await safe_edit(call.message, state, result_text, kb, parse_mode="HTML")
+    try:
+        from core.services import test_ai_credentials
+        async def progress_callback(text):
+            data = await state.get_data()
+            if plugins.cache.get(f"cancel_test_{uid}") or not data.get("api_test_running"):
+                return False
+            await safe_edit(call.message, state, text, stop_kb, parse_mode="HTML")
+            return True
+        await test_ai_credentials(progress_cb=progress_callback, mode="keys" if call.data == "api_keys_test" else "models")
+        if (await state.get_data()).get("api_test_running"):
+            from modules.api_keys_info import build_keys_info
+            text, kb = await build_keys_info(results=True)
+            await safe_edit(call.message, state, text, kb, parse_mode="HTML")
+    finally:
+        _active_credential_tests.discard(uid)
+        await state.update_data(api_test_running=False)
 
 @router.callback_query(F.data == "stop_ai_test")
 async def cb_stop_test(call: types.CallbackQuery, state: FSMContext):

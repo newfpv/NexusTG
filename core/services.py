@@ -377,51 +377,9 @@ async def transcribe_media(media_path: str) -> str:
     return "" if result == _("status_waiting") else result
 
 
-async def test_ai_credentials(progress_cb=None) -> str:
-    api_keys, models = await _get_ai_config()
-    if not api_keys or not models:
-        return _("test_no_data")
-
-    total_steps = len(api_keys) * len(models)
-    current_step = 0
-    final_report = _("test_result_title")
-    cancelled = False
-
-    for api_key in api_keys:
-        if cancelled:
-            break
-        key_hidden = f"{api_key[:4]}***{api_key[-4:]}" if len(api_key) >= 8 else "***"
-        final_report += _("test_key_status", key_hidden=key_hidden, status="")
-        client = genai.Client(api_key=api_key)
-
-        for model in models:
-            current_step += 1
-            if progress_cb:
-                should_continue = await progress_cb(
-                    _("test_progress", key_hidden=key_hidden, model=model, current=current_step, total=total_steps)
-                )
-                if should_continue is False:
-                    cancelled = True
-                    break
-                await asyncio.sleep(0.1)
-
-            try:
-                response = await asyncio.wait_for(
-                    client.aio.models.generate_content(model=model, contents=[_("ping_prompt")]),
-                    timeout=30.0,
-                )
-                result = _("test_ok") if _response_text(response) else _("test_error")
-            except asyncio.TimeoutError:
-                result = _("test_error_timeout")
-            except Exception as exc:
-                result = f"{_('test_error')} ({str(exc)[:60]})"
-
-            final_report += _("test_model_status", model=model, res=result)
-        final_report += "\n"
-
-    if cancelled:
-        final_report += "\n" + _("test_cancelled_msg")
-    return final_report
+async def test_ai_credentials(progress_cb=None, mode="models") -> str:
+    from core.api_key_tests import run_tests
+    return await run_tests(progress_cb=progress_cb, mode=mode)
 
 
 def _extract_video_id(url: str) -> str:

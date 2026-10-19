@@ -107,11 +107,9 @@ async def generate_settings_menu_content():
     text = _("menu_settings_title")
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     
-    kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_keys"), callback_data="set_edit_keys")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text=_("api_section_title"), callback_data="set_edit_keys")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_models"), callback_data="set_edit_models")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_tz"), callback_data="set_edit_tz")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_limits"), callback_data="sys_limits_menu")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_test_ai"), callback_data="test_ai_config")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_yt_cookies_menu"), callback_data="yt_cookies_menu")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_full_reset"), callback_data="full_reset")])
             
