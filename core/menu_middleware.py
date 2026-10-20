@@ -36,6 +36,7 @@ class CallbackAckTracker:
 class MenuMiddleware(BaseMiddleware):
     def __init__(self):
         self.manual_answers = {}
+        self.recent_navigation = OrderedDict()
 
     async def _answer(self, event, request):
         if request["answered"]:
@@ -47,6 +48,16 @@ class MenuMiddleware(BaseMiddleware):
             logging.warning("[Menu] Callback acknowledgement failed: %s", type(exc).__name__)
 
     async def __call__(self, handler, event, data):
+        if str(event.data or '').startswith('wizard_'):
+            key=(event.from_user.id,event.data,event.message.message_id if event.message else None)
+            now=time.monotonic()
+            previous=self.recent_navigation.get(key,0)
+            self.recent_navigation[key]=now
+            while len(self.recent_navigation)>512:self.recent_navigation.popitem(last=False)
+            if now-previous<.8:
+                try:await event.answer()
+                except Exception:pass
+                return
         callback = data["handler"].callback
         if callback not in self.manual_answers:
             try:

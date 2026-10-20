@@ -1,3 +1,7 @@
+from core.durable_cleanup import delete_batch, recover as recover_cleanup
+_cleanup_task = None
+from core.job_queue import serial_events
+from core.telegram_guard import delivery_failure
 import os
 import re
 import asyncio
@@ -183,12 +187,10 @@ def _build_batch_prompt(base_prompt: str | None, modifier_prompt: str) -> str:
     return "\n\n".join(part for part in parts if part)
 
 async def _delete_source_messages(source_messages: list[Message]):
-    for source_message in source_messages:
-        try:
-            await source_message.delete()
-            logging.debug("[Struct] Deleted batch source message %s", source_message.id)
-        except Exception as exc:
-            logging.warning("[Struct] Failed to delete batch source message %s: %s", source_message.id, exc)
+    try:
+        await delete_batch(source_messages)
+    except Exception:
+        logging.warning('[Struct] Source cleanup queued after confirmed replacement',exc_info=True)
 
 async def _get_cfg() -> dict:
     cfg = await CoreAPI.get_module_cfg(MODULE_NAME)
@@ -291,6 +293,7 @@ async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
         logging.info(f"[Struct] Successfully applied edit to message {msg_to_edit.id}")
         return ai_ok
     except Exception as e:
+        if delivery_failure(e):raise
         logging.warning(f"[Struct] Failed to edit message with HTML parse mode: {e}. Attempting fallback.")
         try:
             if msg_to_edit.media:
@@ -304,8 +307,12 @@ async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
             return False
 
 def register_userbot(app: Client):
+    global _cleanup_task
+    if _cleanup_task and not _cleanup_task.done():_cleanup_task.cancel()
+    _cleanup_task=asyncio.create_task(recover_cleanup(app),name='batch-cleanup-recovery')
     @app.on_message(filters.me & (filters.text | filters.caption), group=-5)
     @safe_userbot_handler
+    @serial_events
     async def handle_struct_cmd(client: Client, message: Message):
         cfg = await _get_cfg()
         if not cfg.get("is_active"):

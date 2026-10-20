@@ -1,3 +1,4 @@
+import math
 import time
 import asyncio
 import logging
@@ -112,6 +113,8 @@ async def start_fake_action(message: types.Message, state: FSMContext):
     
     try:
         minutes = float(message.text.replace(",", "."))
+        if not math.isfinite(minutes) or minutes <= 0 or minutes > 1440:
+            raise ValueError("duration must be between 0 and 1440 minutes")
         if userbot_app and userbot_app.is_connected:
             if chat_id in active_fake_tasks and not active_fake_tasks[chat_id].done():
                 active_fake_tasks[chat_id].cancel()

@@ -127,9 +127,14 @@ class OwnerGuardTests(unittest.IsolatedAsyncioTestCase):
         client=NS(on_message=MagicMock(return_value=lambda f:f),start=AsyncMock())
         constructor=MagicMock(return_value=client)
         plugins=NS(db=NS(get_global_config=AsyncMock(return_value=NS(api_id=999,api_hash='own-hash'))),userbot_handlers=[])
-        scope={'Client':constructor,'plugins':plugins,'API_ID':111,'API_HASH':'parent-hash','userbot_app':None,'filters':filters,'StopPropagation':StopPropagation,'logging':logging,'inspect':inspect}
+        scope={'asyncio':__import__('asyncio'),'install_guard':lambda *a:NS(recover=AsyncMock()),'Client':constructor,'plugins':plugins,'API_ID':111,'API_HASH':'parent-hash','userbot_app':None,'filters':filters,'StopPropagation':StopPropagation,'logging':logging,'inspect':inspect}
         exec(compile(ast.Module(body=[node],type_ignores=[]),'account_start','exec'),scope)
-        await scope['start_userbot']('own-session')
+        import base64,struct
+        from core.session_lock import release_session
+        encoded=base64.urlsafe_b64encode(struct.pack('>BI?256sQ?',2,999,False,b'x'*256,123,False)).decode().rstrip('=')
+        with tempfile.TemporaryDirectory() as locks,patch.dict(os.environ,{'NEXUS_RESOURCE_DIR':locks}):
+            try:await scope['start_userbot'](encoded)
+            finally:release_session(client)
         self.assertEqual(constructor.call_args.kwargs['api_id'],999)
         self.assertEqual(constructor.call_args.kwargs['api_hash'],'own-hash')
 

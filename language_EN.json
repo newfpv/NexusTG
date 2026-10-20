@@ -750,5 +750,13 @@
   "managed_logs_empty": "No diagnostic records yet.",
   "managed_logs_file": "📄 Latest 100 records",
   "menu_chats_more_loading": "Chats load in pages. Tap › to load more private chats, including archived chats. Groups and bots are not shown here.",
-  "saver_storage_status": "🗄 Local media: <b>{used} / {limit} GiB</b>\nText has no expiry and is outside the quota. Forwarded media is removed first, original voice and round videos last. Set the total limit in the primary bot: core settings → My bots → account."
+  "saver_storage_status": "🗄 Local media: <b>{used} / {limit} GiB</b>\nText has no expiry and is outside the quota. Forwarded media is removed first, original voice and round videos last. Set the total limit in the primary bot: core settings → My bots → account.",
+  "telegram_delivery": {
+  "telegram_paused_notice": "⏸ Account sending paused: {code}. Check restrictions and authorization. After resolving the issue, use Core settings → Resume Telegram sending. An active FloodWait is preserved.",
+  "btn_telegram_resume": "▶️ Resume Telegram sending",
+  "telegram_resumed": "Sending allowed. Any active FloodWait is still respected.",
+  "btn_shop_senders": "👤 Allowed senders",
+  "shop_senders_prompt": "Sender IDs separated by commas. “-” allows everyone permitted by the current settings. Bots and messages sent via bots are ignored.",
+  "saver_setup_review": "The previous group creation was not confirmed. Check your groups and select the created group manually; no duplicate is created automatically."
+}
 }

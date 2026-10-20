@@ -1,3 +1,5 @@
+from core.job_queue import serial_events
+from core.telegram_guard import delivery_failure
 import os
 import json
 import asyncio
@@ -18,6 +20,7 @@ router = Router()
 
 class ShopStates(StatesGroup):
     waiting_for_chats = State()
+    waiting_for_senders = State()
     waiting_for_command = State()
 
 def _parse_auto_chat_entries(raw_value: str) -> list[tuple[str, str | None]]:
@@ -54,6 +57,7 @@ async def _get_cfg():
         "command": s.get("command", ".shop"),
         "delete_orig": s.get("delete_orig", True),
         "auto_chats": s.get("auto_chats", ""),
+        "allowed_senders": s.get("allowed_senders", ""),
         "prompt": s.get("prompt", _("default_ai_prompt"))
     }
 
@@ -92,6 +96,7 @@ async def get_shop_kb():
          InlineKeyboardButton(text=_("btn_shop_del_orig", status=st_del), callback_data="shop_tgl_delete_orig")],
         [InlineKeyboardButton(text=_("btn_shop_others", status=st_oth), callback_data="shop_tgl_allow_others")],
         [InlineKeyboardButton(text=_("btn_shop_auto_chats", status=chats_lbl), callback_data="shop_edit_chats")],
+        [InlineKeyboardButton(text=_("btn_shop_senders"), callback_data="shop_edit_senders")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="main_menu")]
     ])
 
@@ -156,10 +161,31 @@ async def shop_save_chats(message: types.Message, state: FSMContext):
             await message.bot.edit_message_text(_("menu_shop_title"), message.chat.id, data["menu_msg_id"], reply_markup=await get_shop_kb(), parse_mode="HTML")
         except: pass
 
+
+@router.callback_query(F.data=='shop_edit_senders')
+async def edit_senders(call:types.CallbackQuery,state:FSMContext):
+    await state.set_state(ShopStates.waiting_for_senders)
+    await state.update_data(menu_msg_id=call.message.message_id)
+    await safe_edit(call.message,state,_('shop_senders_prompt'),get_back_kb('shop_main'))
+
+@router.message(ShopStates.waiting_for_senders)
+async def save_senders(message:types.Message,state:FSMContext):
+    raw=(message.text or '').strip()
+    values=[value.strip() for value in raw.split(',') if value.strip()] if raw!='-' else []
+    if any(not value.isdecimal() or int(value)<=0 for value in values):
+        return await safe_edit(message,state,_('shop_senders_prompt'),get_back_kb('shop_main'))
+    await _upd_cfg(allowed_senders=','.join(dict.fromkeys(values)))
+    await state.set_state(None)
+    await safe_edit(message,state,_('menu_shop_title'),await get_shop_kb())
+
 def register_userbot(app: Client):
+    recent_lists={}
     async def shop_filter(flt, cli, m):
         try:
+            sender=getattr(m,'from_user',None)
+            if not sender or getattr(sender,'is_bot',False) or getattr(m,'via_bot',None) or getattr(m,'checklist',None):return False
             text = m.text or m.caption or ""
+            if _("checklist_title") in text or _("markdown_title") in text:return False
             if not text:
                 return False
 
@@ -183,6 +209,8 @@ def register_userbot(app: Client):
                 )
 
             is_me = bool(m.from_user and m.from_user.is_self)
+            allowed={value.strip() for value in cfg.get('allowed_senders','').split(',') if value.strip()}
+            if not is_me and allowed and str(sender.id) not in allowed:return False
             if m.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me and not is_auto:
                 return False
 
@@ -203,6 +231,7 @@ def register_userbot(app: Client):
             return False
 
     @app.on_message(filters.create(shop_filter), group=24)
+    @serial_events
     async def handle_shop(client, message):
         typing_task = None
         try:
@@ -218,11 +247,15 @@ def register_userbot(app: Client):
                 is_manual = True
                 raw_text = raw_text[len(cmd):].strip()
 
+            list_key=(message.chat.id,getattr(message,'message_thread_id',None))
+            reply_target=message.reply_to_message
+            if not is_manual and not reply_target:
+                reply_target=recent_lists.get(list_key)
             old_list = ""
             should_delete_old = None
 
-            if message.reply_to_message:
-                target = message.reply_to_message
+            if reply_target:
+                target = reply_target
                 is_real_checklist = getattr(target, "checklist", None) is not None
                 target_text = target.text or target.caption or ""
                 check_title = _("checklist_title")
@@ -295,12 +328,25 @@ def register_userbot(app: Client):
                     others_can_add_tasks=True
                 )
                 try:
-                    await client.send_checklist(chat_id=message.chat.id, checklist=checklist, message_thread_id=reply_id)
+                    if len(clean_tasks)<=30 and should_delete_old and getattr(should_delete_old,'checklist',None):
+                        sent=await client.edit_message_checklist(message.chat.id,should_delete_old.id,checklist)
+                        should_delete_old=None
+                    else:
+                        sent=await client.send_checklist(chat_id=message.chat.id, checklist=checklist, message_thread_id=reply_id)
+                    if len(clean_tasks)<=30:recent_lists[list_key]=sent
                 except Exception as list_err:
+                    if delivery_failure(list_err):raise
                     logging.warning(f"[Shop] send_checklist failed: {list_err}")
                     fmt = _("markdown_title") + "\n".join([f"- [ ] {t}" for t in chunk])
-                    await client.send_message(message.chat.id, fmt, message_thread_id=reply_id)
+                    if len(clean_tasks)<=30 and should_delete_old and not getattr(should_delete_old,'checklist',None):
+                        sent=await should_delete_old.edit_text(fmt)
+                        should_delete_old=None
+                    else:
+                        sent=await client.send_message(message.chat.id, fmt, message_thread_id=reply_id)
+                    if len(clean_tasks)<=30:recent_lists[list_key]=sent
 
+            if len(recent_lists)>128:recent_lists.pop(next(iter(recent_lists)))
+            if len(clean_tasks)>30:recent_lists.pop(list_key,None)
             if should_delete_old:
                 try: await should_delete_old.delete()
                 except: pass

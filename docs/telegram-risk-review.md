@@ -51,3 +51,8 @@ Multiple accounts on one server/IP are not, by themselves, a published fixed ban
 - [Updating online status](https://core.telegram.org/method/account.updateStatus).
 
 The queues, pacing and additional guards listed as remedies above are recommendations from this review unless explicitly described as existing behavior. They have not all been implemented by the account-management/archive update.
+
+
+## Implementation update
+
+The recommendations have now been implemented, excluding API-key module changes. See [delivery and TTL details](telegram-delivery.md) for the applied controls, recovery limits and remaining policy risks. The original table records the pre-change audit.

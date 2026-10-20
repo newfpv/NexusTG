@@ -1,3 +1,5 @@
+from core.job_queue import serial_events
+from core.telegram_guard import delivery_failure, delivery_context, retain_result
 import os
 import re
 import html
@@ -137,6 +139,7 @@ def register_userbot(app: Client):
         return False
 
     @app.on_message(filters.create(ai_filter), group=32)
+    @serial_events
     async def handle_ai_cmd(client, message):
         media_paths_to_cleanup = []
         start_time = time.time()
@@ -270,6 +273,9 @@ def register_userbot(app: Client):
                 await CoreRepository(session).track_ai_message(message.chat.id, status_msg.id)
 
         except Exception as e:
+            if delivery_failure(e):
+                logging.warning("[AI Cmd] Telegram delivery interrupted",exc_info=True)
+                return
             logging.error(f"[AI Cmd] Critical failure during AI command handling: {e}", exc_info=True)
             if 'status_msg' in locals() and status_msg: 
                 try: 
@@ -288,52 +294,51 @@ def register_userbot(app: Client):
             elapsed = time.time() - start_time
             logging.info(f"[AI Cmd] Processing completed in {elapsed:.1f}s for chat {message.chat.id}")
 
-async def _consume_stream(stream_gen, status_msg, prefix, no_preview, start_time, timeout):
-    full_reply = ""
-    last_sent_text = ""
-    last_ui_update = time.time()
-    
-    logging.debug(f"[AI Cmd] Stream consumer started. Timeout set to {timeout}s")
+async def _consume_stream(stream_gen,status_msg,prefix,no_preview,start_time,timeout):
+    # Consume Gemini independently: Telegram cooldowns must not stall the model
+    # stream or discard its finished answer. Only one latest preview is pending.
+    full_reply=''
+    last_sent=''
+    done=asyncio.Event()
+    async def preview():
+        nonlocal last_sent
+        interval=2.5
+        while not done.is_set():
+            await asyncio.sleep(interval)
+            if done.is_set():return
+            current=f"{prefix}<blockquote expandable>{md_to_html(full_reply[:2500])}</blockquote>"
+            if not full_reply or current==last_sent:continue
+            try:
+                await status_msg.edit(current,parse_mode=enums.ParseMode.HTML,link_preview_options=no_preview)
+                last_sent=current
+                interval=min(8,interval+.25)
+            except asyncio.CancelledError:raise
+            except Exception as exc:
+                if delivery_failure(exc):return
+                logging.debug('[AI Cmd] Preview edit rejected: %s',type(exc).__name__)
+    task=asyncio.create_task(preview(),name='ai-command-preview')
     try:
         async for chunk in stream_gen:
-            if time.time() - start_time > timeout:
-                logging.warning("[AI Cmd] Total timeout during streaming has been exceeded")
-                break
-                
-            full_reply += chunk
-            
-            if time.time() - last_ui_update > 0.8:
-                html_p = md_to_html(full_reply)
-                current_display = f"{prefix}<blockquote expandable>{html_p}</blockquote>"
-
-                if current_display.strip() != last_sent_text.strip():
-                    try:
-                        await status_msg.edit(current_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                        last_sent_text = current_display
-                        last_ui_update = time.time()
-                    except FloodWait as e:
-                        logging.warning(f"[AI Cmd] FloodWait encountered ({e.value}s) during streaming")
-                        await asyncio.sleep(e.value + 1)
-                    except Exception as e:
-                        if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
-                            logging.debug(f"[AI Cmd] Suppressed stream edit error: {e}")
-        
-        if full_reply:
-            logging.debug("[AI Cmd] Stream ended, processing final message state")
-            html_final = md_to_html(full_reply)
-            final_display = f"{prefix}<blockquote expandable>{html_final}</blockquote>"
-            
-            if final_display.strip() != last_sent_text.strip():
-                try: 
-                    await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                except FloodWait as e:
-                    logging.warning(f"[AI Cmd] Final message FloodWait ({e.value}s)")
-                    await asyncio.sleep(e.value + 1)
-                    await status_msg.edit(final_display, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-                except Exception as e:
-                    logging.error(f"[AI Cmd] Failed to apply final edit: {e}")
-                    
-    except Exception as e:
-        logging.error(f"[AI Cmd] Exception in stream consumer: {e}", exc_info=True)
-        
+            full_reply+=chunk
+            if time.time()-start_time>timeout:break
+    finally:
+        done.set();task.cancel()
+        try:await task
+        except asyncio.CancelledError:pass
+    if full_reply:
+        result_path=retain_result(f'ai-command:{status_msg.chat.id}:{status_msg.id}',full_reply)
+        token=delivery_context.set('ai-command-result')
+        try:
+            display=f"{prefix}<blockquote expandable>{md_to_html(full_reply)}</blockquote>"
+            if len(display)<=3800:
+                if display!=last_sent:
+                    await status_msg.edit(display,parse_mode=enums.ParseMode.HTML,link_preview_options=no_preview)
+            else:
+                # Never silently truncate the final answer to fit a preview caption.
+                for offset in range(0,len(full_reply),1800):
+                    chunk=full_reply[offset:offset+1800]
+                    if not offset:await status_msg.edit(chunk,parse_mode=enums.ParseMode.DISABLED,link_preview_options=no_preview)
+                    else:await status_msg.reply(chunk,parse_mode=enums.ParseMode.DISABLED,link_preview_options=no_preview)
+            result_path.unlink(missing_ok=True)
+        finally:delivery_context.reset(token)
     return full_reply

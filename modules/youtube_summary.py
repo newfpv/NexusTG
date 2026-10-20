@@ -1,3 +1,4 @@
+from core.telegram_guard import delivery_failure
 import os
 import re
 import html
@@ -199,7 +200,7 @@ def register_userbot(app: Client):
             async for chunk in stream_gen:
                 full_reply += chunk
                 
-                if time.time() - last_ui_update > 1.4:
+                if time.time() - last_ui_update > 2.5:
                     formatted = _clean_formatting(full_reply)
                     
                     if len(formatted) > 3800:
@@ -219,6 +220,7 @@ def register_userbot(app: Client):
                         await active_msg.edit(f"{_clean_formatting(full_reply)} <i>...</i>", parse_mode=enums.ParseMode.HTML)
                         last_ui_update = time.time()
                     except Exception as e:
+                        if delivery_failure(e):raise
                         if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
                             logging.debug(f"[YT Sum] Stream edit suppressed: {e}")
 
@@ -226,5 +228,8 @@ def register_userbot(app: Client):
             logging.info("[YT Sum] Processing completed successfully")
 
         except Exception as e:
+            if delivery_failure(e):
+                logging.warning("[YT Sum] Telegram delivery interrupted",exc_info=True)
+                return
             logging.error(f"[YT Sum] Critical error during processing: {e}", exc_info=True)
             await active_msg.edit(_("ys_error_ai", e=str(e)[:200]))

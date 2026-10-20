@@ -1,5 +1,19 @@
 import asyncio
 import html
+import time
+from collections import OrderedDict
+_profile_cache = OrderedDict()
+_profile_lock = asyncio.Lock()
+
+async def _profile(app, key, factory):
+    async with _profile_lock:
+        entry = _profile_cache.get(key)
+        if entry and entry[0] > time.monotonic(): return entry[1]
+        value = await asyncio.wait_for(factory(), timeout=6.0)
+        _profile_cache[key] = (time.monotonic()+30, value)
+        while len(_profile_cache)>128: _profile_cache.popitem(last=False)
+        return value
+
 from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -14,6 +28,7 @@ userbot_app = None
 def register_userbot(app: Client):
     global userbot_app
     userbot_app = app
+    _profile_cache.clear()
 
 async def get_settings_buttons():
     return [[InlineKeyboardButton(text=_("btn_my_info"), callback_data="my_info")]]
@@ -33,8 +48,8 @@ async def show_my_info(call: types.CallbackQuery, state: FSMContext):
         pass
 
     try:
-        me = await asyncio.wait_for(userbot_app.get_me(), timeout=6.0)
-        chat = await asyncio.wait_for(userbot_app.get_chat(me.id), timeout=6.0)
+        me = await _profile(userbot_app, 'me', userbot_app.get_me)
+        chat = await _profile(userbot_app, ('chat',me.id), lambda:userbot_app.get_chat(me.id))
         
         full_name = f"{html.escape(me.first_name or '')} {html.escape(me.last_name or '')}".strip() or _("no_name")
         username = f"@{html.escape(me.username)}" if me.username else _("info_hidden_none")
@@ -79,8 +94,8 @@ async def show_user_info(call: types.CallbackQuery, state: FSMContext):
         pass
 
     try:
-        user = await asyncio.wait_for(userbot_app.get_users(chat_id), timeout=6.0)
-        chat = await asyncio.wait_for(userbot_app.get_chat(chat_id), timeout=6.0)
+        user = await _profile(userbot_app, ('user',chat_id), lambda:userbot_app.get_users(chat_id))
+        chat = await _profile(userbot_app, ('chat',chat_id), lambda:userbot_app.get_chat(chat_id))
         
         full_name = f"{html.escape(user.first_name or '')} {html.escape(user.last_name or '')}".strip() or _("no_name")
         username = f"@{html.escape(user.username)}" if user.username else _("info_hidden_none")

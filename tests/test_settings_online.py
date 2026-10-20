@@ -142,7 +142,12 @@ class OnlineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         online._task = online._binding = None
         online._configure_lock = asyncio.Lock()
-        self.app = NS(is_initialized=True, is_connected=True, invoke=AsyncMock(return_value=True))
+        def invoke(query,**kwargs):
+            if type(query).__name__=='GetConfig':return NS(online_update_period_ms=210000,offline_idle_timeout_ms=300000,date=int(__import__('time').time()),expires=int(__import__('time').time())+3600)
+            if type(query).__name__=='GetUsers':return [NS(status=NS(expires=int(__import__('time').time())+300))]
+            return True
+        self.invoke_reply=invoke
+        self.app = NS(is_initialized=True, is_connected=True, invoke=AsyncMock(side_effect=invoke))
         online.userbot_app = self.app
         self.addAsyncCleanup(self.cleanup)
 
@@ -159,7 +164,7 @@ class OnlineTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.01)
         workers = [task for task in asyncio.all_tasks() if task.get_name() == 'always-online' and not task.done()]
         self.assertEqual(len(workers), 1)
-        call = self.app.invoke.await_args
+        call = next(call for call in self.app.invoke.await_args_list if type(call.args[0]).__name__=="UpdateStatus")
         self.assertFalse(call.args[0].offline)
         self.assertEqual(call.kwargs['sleep_threshold'], 0)
         task = online._task
@@ -186,7 +191,7 @@ class OnlineTests(unittest.IsolatedAsyncioTestCase):
             self.app.is_initialized = False
         with patch.object(online.asyncio, 'sleep', AsyncMock(side_effect=stop_after_update)):
             await online._heartbeat(self.app)
-        self.app.invoke.assert_awaited_once()
+        self.assertEqual(sum(type(call.args[0]).__name__=="UpdateStatus" for call in self.app.invoke.await_args_list),1)
 
     async def test_enabled_setting_restores_on_new_client(self):
         with patch.object(online.plugins.db, 'get_module_cfg', AsyncMock(return_value={'enabled': True})):
@@ -194,12 +199,12 @@ class OnlineTests(unittest.IsolatedAsyncioTestCase):
             await online._binding
             await asyncio.sleep(0.01)
             first = online._task
-            new_app = NS(is_initialized=True, is_connected=True, invoke=AsyncMock(return_value=True))
+            new_app = NS(is_initialized=True, is_connected=True, invoke=AsyncMock(side_effect=self.invoke_reply))
             online.register_userbot(new_app)
             await online._binding
             await asyncio.sleep(0.01)
         self.assertTrue(first.cancelled())
-        new_app.invoke.assert_awaited_once()
+        self.assertEqual(sum(type(call.args[0]).__name__=="UpdateStatus" for call in new_app.invoke.await_args_list),1)
 
     async def test_disabled_setting_has_no_worker(self):
         with patch.object(online.plugins.db, 'get_module_cfg', AsyncMock(return_value={})):

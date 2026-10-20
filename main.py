@@ -34,6 +34,8 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH")
 
 bot = Bot(token=TG_BOT_TOKEN)
+from core.telegram_guard import BotDeliveryGuard, install_guard
+bot.session.middleware(BotDeliveryGuard())
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(auth_router)
 from core.owner_middleware import OwnerMiddleware
@@ -228,13 +230,28 @@ async def generic_chat_menu(call: types.CallbackQuery, state: FSMContext):
 async def start_userbot(session_string):
     global userbot_app
     if userbot_app:
-        await userbot_app.stop()
+        try: await userbot_app.stop()
+        finally:
+            from core.session_lock import release_session
+            release_session(userbot_app)
     
     account_config = await plugins.db.get_global_config()
     account_api_id = account_config.api_id or API_ID
     account_api_hash = account_config.api_hash or API_HASH
     plugins.api_id, plugins.api_hash = account_api_id, account_api_hash
     userbot_app = Client("userbot", session_string=session_string, api_id=account_api_id, api_hash=account_api_hash, in_memory=True)
+
+    from core.session_lock import claim_session
+    claim_session(userbot_app,session_string)
+    guard = install_guard(userbot_app, session_string)
+    async def notify_restriction(code):
+        try:
+            cfg = await plugins.db.get_global_config()
+            if cfg.admin_id:
+                await bot.send_message(cfg.admin_id, _('telegram_paused_notice', code=code))
+        except Exception:
+            logging.warning('[Telegram guard] Owner notification failed', exc_info=True)
+    guard.notify = notify_restriction
 
     @userbot_app.on_message(filters.group & ~filters.me, group=-100)
     async def block_foreign_group_messages(_client, message):
@@ -264,6 +281,7 @@ async def start_userbot(session_string):
             logging.error("[Core] Module startup failed: %s", e)
 
     await userbot_app.start()
+    asyncio.create_task(guard.recover(userbot_app), name="telegram-pending-deliveries")
     if getattr(plugins,'bot',None):
         from core.environment import mark_ready
         me=getattr(userbot_app,'me',None)
@@ -274,7 +292,10 @@ async def start_userbot(session_string):
 async def stop_userbot():
     global userbot_app
     if userbot_app:
-        await userbot_app.stop()
+        try: await userbot_app.stop()
+        finally:
+            from core.session_lock import release_session
+            release_session(userbot_app)
         userbot_app = None
 
 async def userbot_health_monitor():

@@ -1,3 +1,5 @@
+import json
+from core.telegram_guard import delivery_failure, delivery_context, retain_result
 import os
 import asyncio
 import logging
@@ -236,6 +238,8 @@ def register_userbot(app: Client):
         logging.info(f"[Voice Transcriber] Initiating transcription task for message {target_msg.id} in chat {message.chat.id}")
         media_path = None
         status_msg = None
+        delivery_started = False
+        delivery_token = None
         is_me = (message.from_user and message.from_user.is_self)
 
         async def _add_ignored(c_id, m_id):
@@ -311,6 +315,9 @@ def register_userbot(app: Client):
                         logging.warning("[Voice Transcriber] Summarization failed or timed out")
 
                 chunks = _build_voice_chunks(raw_text, summary_content, cfg["summary_only"])
+                result_path=retain_result(f'voice:{message.chat.id}:{target_msg.id}',json.dumps(chunks,ensure_ascii=False))
+                delivery_started = True
+                delivery_token = delivery_context.set('voice-result')
                 for idx, formatted_msg in enumerate(chunks):
                     edited_append = False
 
@@ -323,6 +330,7 @@ def register_userbot(app: Client):
                                 edited_append = True
                                 logging.info("[Voice Transcriber] Appended transcription to previous auto message via edit")
                             except Exception as edit_err:
+                                if delivery_failure(edit_err):raise
                                 logging.warning(f"[Voice Transcriber] Append edit failed: {edit_err}. Falling back to send_message.")
 
                     if edited_append:
@@ -334,6 +342,7 @@ def register_userbot(app: Client):
                             await _add_ignored(message.chat.id, status_msg.id)
                             logging.info(f"[Voice Transcriber] Replaced status message with transcription result")
                         except Exception as edit_err:
+                            if delivery_failure(edit_err):raise
                             logging.warning(f"[Voice Transcriber] Status edit failed: {edit_err}. Falling back to send_message.")
                             sent_msg = await client.send_message(
                                 chat_id=message.chat.id,
@@ -358,7 +367,12 @@ def register_userbot(app: Client):
                             append_state["text"] = formatted_msg
                         logging.info(f"[Voice Transcriber] Sent transcription block as new message")
 
+                result_path.unlink(missing_ok=True)
+
         except TimeoutError as e:
+            if delivery_started:
+                logging.warning("[Voice] Telegram delivery interrupted",exc_info=True)
+                return
             logging.error(f"[Voice Transcriber] API Timeout/Overload: {e}. Silencing output to chat.")
             if is_manual and is_me and status_msg:
                 try:
@@ -368,6 +382,10 @@ def register_userbot(app: Client):
                     logging.warning(f"[Voice Transcriber] Failed to delete status message: {del_err}")
 
         except Exception as e:
+            if delivery_started and delivery_failure(e):
+                logging.warning("[Delivery] Telegram delivery interrupted",exc_info=True)
+
+                return
             logging.error(f"[Voice Transcriber] Error processing media: {e}", exc_info=True)
             err_txt = _("v_process_error")
             if is_manual:
@@ -377,6 +395,7 @@ def register_userbot(app: Client):
                 else: await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
         
         finally:
+            if delivery_token is not None:delivery_context.reset(delivery_token)
             if media_path and os.path.exists(media_path):
                 try: 
                     os.remove(media_path)

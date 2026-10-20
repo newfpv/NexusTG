@@ -1,3 +1,5 @@
+from core.job_queue import JobQueue
+from core.telegram_guard import delivery_failure
 import asyncio
 import html
 import logging
@@ -449,6 +451,12 @@ def _metadata_title(info: dict, url: str) -> object:
     return info.get("title") or info.get("description")
 
 
+def _check_staging(workdir):
+    total=sum(p.stat().st_size for p in Path(workdir).rglob('*') if p.is_file() and not p.is_symlink())
+    if total>512*1024**2 or shutil.disk_usage(workdir).free<128*1024**2:
+        raise OSError('Temporary media budget exceeded')
+
+
 def _download_video_sync(url: str, workdir: str) -> DownloadedMedia | None:
     logging.info(f"[Media Downloader] Starting yt-dlp extraction for URL: {url}")
     output_template = os.path.join(workdir, "video.%(ext)s")
@@ -457,6 +465,8 @@ def _download_video_sync(url: str, workdir: str) -> DownloadedMedia | None:
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
         'merge_output_format': 'mp4',
         'noplaylist': True,
+        'max_filesize': 512*1024**2,
+        'progress_hooks': [lambda info: _check_staging(workdir)],
         'socket_timeout': 30,
         'quiet': True,
         'noprogress': True,
@@ -545,7 +555,19 @@ def _download_gallery_media_sync(url: str, workdir: str) -> DownloadedMedia | No
     command.append(url)
 
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+        with tempfile.TemporaryFile(mode='w+',encoding='utf-8') as stdout, tempfile.TemporaryFile(mode='w+',encoding='utf-8') as stderr:
+            proc=subprocess.Popen(command,stdout=stdout,stderr=stderr,text=True)
+            deadline=time.monotonic()+180
+            try:
+                while proc.poll() is None:
+                    _check_staging(workdir)
+                    if time.monotonic()>deadline:raise subprocess.TimeoutExpired(command,180)
+                    time.sleep(.25)
+            finally:
+                if proc.poll() is None:proc.kill()
+                proc.wait()
+            stdout.seek(0);stderr.seek(0)
+            result=subprocess.CompletedProcess(command,proc.returncode,stdout.read(65536),stderr.read(65536))
     except (OSError, subprocess.TimeoutExpired) as exc:
         logging.error("[Media Downloader] gallery-dl failed to start: %s", exc)
         return None
@@ -646,6 +668,7 @@ async def _send_downloaded_media(
         )
 
 def register_userbot(app: Client):
+    downloads=JobQueue(capacity=16)
     async def process_media_download(client, message, target_msg, url: str, replace_link: bool, is_manual=False):
         logging.info(f"[Media Downloader] Initiating download task for {url} in chat {message.chat.id}")
         status_msg = None
@@ -668,6 +691,7 @@ def register_userbot(app: Client):
                     len(downloaded_media.paths),
                     message.chat.id,
                 )
+                _check_staging(temp_dir)
                 await _send_downloaded_media(
                     client,
                     message.chat.id,
@@ -691,6 +715,12 @@ def register_userbot(app: Client):
                 raise ValueError(_("err_md_download_failed"))
 
         except Exception as e:
+
+            if delivery_failure(e):
+
+                logging.warning("[Delivery] Result retained in account journal",exc_info=True)
+
+                return
             logging.error("[Media Downloader] Download task failed: %s", e)
             err_txt = _("md_process_error")
             if is_manual:
@@ -737,7 +767,7 @@ def register_userbot(app: Client):
                     return
                 logging.info(f"[Media Downloader] Auto-download match found for URL: {url} in chat {message.chat.id}")
                 replace_link = cfg["replace_link"] if chat_cfg["replace_link"] == 2 else bool(chat_cfg["replace_link"])
-                asyncio.create_task(process_media_download(client, message, message, url, replace_link, is_manual=False))
+                await downloads.submit((message.chat.id,message.id,url),lambda:process_media_download(client,message,message,url,replace_link,is_manual=False))
 
     @app.on_message(filters.text & filters.reply & (filters.private | filters.group), group=22)
     async def cmd_download_handler(client, message):
@@ -767,4 +797,4 @@ def register_userbot(app: Client):
                             return
                         logging.info(f"[Media Downloader] Command trigger match found for URL: {url} in chat {message.chat.id}")
                         replace_link = cfg["replace_link"] if chat_cfg["replace_link"] == 2 else bool(chat_cfg["replace_link"])
-                        asyncio.create_task(process_media_download(client, message, target, url, replace_link, is_manual=True))
+                        await downloads.submit((message.chat.id,target.id,url),lambda:process_media_download(client,message,target,url,replace_link,is_manual=True))

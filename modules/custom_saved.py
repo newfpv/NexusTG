@@ -11,7 +11,7 @@ from aiogram.fsm.state import StatesGroup, State
 from pyrogram import Client, filters, enums
 from pyrogram.types import LinkPreviewOptions
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 
 from core.db import AsyncSessionLocal, CoreRepository
 from core.services import generate_ai_response
@@ -22,6 +22,7 @@ router = Router()
 MODULE_NAME = "custom_saved"
 _transfer_lock = asyncio.Lock()
 _pending_transfers = set()
+_recovery_task = None
 
 class CustomSavedFSM(StatesGroup):
     waiting_for_dest = State()
@@ -127,8 +128,8 @@ async def transfer_saved_message(client, message):
             ids = sorted({item.id for item in messages})
             await _transfer_journal()
             async with AsyncSessionLocal() as session:
-                records = (await session.execute(text('SELECT message_id, completed FROM custom_saved_transfers WHERE source_chat=:source'),
-                                                  {'source': owner_id})).all()
+                records = (await session.execute(text('SELECT message_id, completed FROM custom_saved_transfers WHERE source_chat=:source AND message_id IN :mids').bindparams(bindparam('mids',expanding=True)),
+                                                  {'source': owner_id,'mids':ids})).all()
             delivered = {mid for mid, done in records}
             completed = {mid for mid, done in records if done}
             pending = [mid for mid in ids if mid not in delivered]
@@ -225,7 +226,31 @@ async def process_fsm_input(message: types.Message, state: FSMContext):
         mock_call = types.CallbackQuery(id="", from_user=message.from_user, chat_instance="", message=types.Message(message_id=data["menu_msg_id"], chat=message.chat, date=message.date))
         await render_menu(mock_call, state)
 
+async def recover_transfer_receipts(app):
+    # Only confirmed forwards are eligible for cleanup; never forward again.
+    try:
+        while not getattr(app,'is_initialized',False):await asyncio.sleep(1)
+        await _transfer_journal()
+        async with _transfer_lock:
+            cfg=await _get_cfg()
+            if not cfg['is_active'] or not cfg['transfer_saved']:return
+            owner_id=getattr(getattr(app,'me',None),'id',None)
+            if not owner_id:return
+            async with AsyncSessionLocal() as session:
+                rows=(await session.execute(text('SELECT message_id FROM custom_saved_transfers WHERE source_chat=:source AND completed=0 ORDER BY message_id'),{'source':owner_id})).all()
+            for (mid,) in rows:
+                result=await app.delete_messages(owner_id,[mid])
+                if result is None or result is False:continue
+                async with AsyncSessionLocal() as session:
+                    await session.execute(text('UPDATE custom_saved_transfers SET completed=1,updated_at=:at WHERE source_chat=:source AND message_id=:mid'),{'source':owner_id,'mid':mid,'at':time.time()})
+                    await session.commit()
+    except asyncio.CancelledError:raise
+    except Exception:logging.warning('[CSaver] Receipt recovery paused; original retained',exc_info=True)
+
 def register_userbot(app: Client):
+    global _recovery_task
+    if _recovery_task and not _recovery_task.done():_recovery_task.cancel()
+    _recovery_task=asyncio.create_task(recover_transfer_receipts(app),name='saved-receipt-recovery')
     @app.on_message(filters.private, group=21)
     async def saved_transfer_handler(client, message):
         await transfer_saved_message(client, message)
