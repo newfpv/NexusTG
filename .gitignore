@@ -40,3 +40,6 @@ Thumbs.db
 # Independent account profiles and generated mounts
 /accounts
 .accounts.mounts.json
+
+# Private operational backups
+/maintenance

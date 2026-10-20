@@ -60,3 +60,27 @@ To add a bot, send its BotFather token as text or a small `.txt` file. The token
 The compact list shows public bot usernames and running/disabled status. Open an added bot's entry to enable, disable or restart it; disabling preserves all data. The primary bot cannot be disabled from this panel. The panel does not expose owner IDs, phone numbers, Telegram sessions, Gemini keys, settings or message contents, and does not read other profiles' conversation databases.
 
 Adding the second bot through Telegram briefly replaces the direct worker with the supervisor, then starts both profiles. Further additions start without restarting existing bots. The Linux installer uses this mode by default for fresh installations. Existing standalone Docker or native installations need the documented adoption step before using managed account controls.
+
+## One installation directory
+
+Keep a single application checkout with all account state underneath it:
+
+```text
+NexusTG/
+  core/
+  modules/
+  accounts/
+    main/
+      .env
+      account.json
+      data/              # This account's databases, cookies, media and caches
+    bot_123456789/
+      .env
+      account.json
+      data/              # A different account's private state
+  maintenance/           # Optional private operational backups
+```
+
+Existing profiles can keep names such as `pavel` or `masha`; bots added through Telegram use their own generated profile names. Application code is shared, while Telegram identities, settings and all account data remain separate. No full application copy is needed per account.
+
+Both Git and Docker build contexts exclude `accounts/` and `maintenance/`. Store backups in `maintenance/`, and never add that directory to source control or an image. After moving a legacy data directory into its account folder, remove the profile's obsolete `host_data_dir` override and update any external service that mounts its files. Stop the account before moving its database files.
