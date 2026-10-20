@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import time
+import shutil
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9_-]{0,39}$')
 TOKEN = re.compile(r'^\d+:[A-Za-z0-9_-]{20,}$')
@@ -65,10 +66,10 @@ def token_identity(path):
     return None
 
 
-def create_account(token, bot_id, username, owner_id, language='RU'):
+def create_account(token, bot_id, username, owner_id=None, language='RU', display_name=None):
     root=require_root()
     if not TOKEN.fullmatch(token) or str(bot_id)!=token.split(':',1)[0]:raise ValueError('Invalid bot token')
-    if not isinstance(owner_id,int) or isinstance(owner_id,bool) or not 0<owner_id<2**63:raise ValueError('Invalid owner')
+    if owner_id is not None and (not isinstance(owner_id,int) or isinstance(owner_id,bool) or not 0<owner_id<2**63):raise ValueError('Invalid owner')
     if not re.fullmatch(r'[A-Za-z0-9_]{5,32}',username or ''):raise ValueError('Invalid bot username')
     name='bot_'+str(bot_id)
     with registry_lock(root):
@@ -79,7 +80,10 @@ def create_account(token, bot_id, username, owner_id, language='RU'):
         try:
             descriptor=os.open(target/'.env',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
             with os.fdopen(descriptor,'w') as file:file.write(f'TG_BOT_TOKEN={token}\nLANG_FILE=language_{language if language in {"RU","EN"} else "RU"}.json\n')
-            atomic_json(target/'account.json',{'enabled':True,'generation':0,'owner_id':owner_id,'bot_username':username,'created_at':time.time()})
+            metadata={'enabled':True,'generation':0,'bot_username':username,'created_at':time.time()}
+            if owner_id is not None:metadata['owner_id']=owner_id  # Retain explicit CLI/backward-compatible binding.
+            if display_name:metadata['bot_name']=clean_name(display_name)
+            atomic_json(target/'account.json',metadata)
         except BaseException:
             # Only this unpublished, newly-created empty profile may be rolled back.
             (target/'.env').unlink(missing_ok=True)
@@ -118,7 +122,8 @@ def public_status(root, workers, restarts=None):
         ready=bool(running and record.get('pid')==worker.get('pid') and record.get('ready'))
         username=cfg.get('bot_username') or record.get('bot_username')
         if not re.fullmatch(r'[A-Za-z0-9_]{5,32}',username or ''):username=None
-        result.append({'name':path.name,'username':username,'enabled':bool(cfg.get('enabled',True)),
+        display=clean_name(cfg.get('display_name') or record.get('account_name') or cfg.get('account_name') or cfg.get('bot_name') or '')
+        result.append({'name':path.name,'username':username,'display_name':display,'enabled':bool(cfg.get('enabled',True)),
                        'running':running,'ready':ready,'primary':path.name==manager_name(root)})
     return {'at':time.time(),'bots':result}
 
@@ -129,5 +134,55 @@ def status():
         return public_status(root,{os.environ['NEXUS_ACCOUNT_NAME']:{'pid':os.getpid()}})
     if time.time()-snapshot.get('at',0)>12:return {'at':0,'bots':public_status(root,{})['bots']}
     # Re-project even a modified status file through the explicit public schema.
-    allowed=('name','username','enabled','running','ready','primary')
-    return {'at':snapshot.get('at',0),'bots':[{k:row.get(k) for k in allowed} for row in snapshot.get('bots',[]) if isinstance(row,dict) and NAME.fullmatch(str(row.get('name','')))]}
+    # Rebuild the public schema from authoritative metadata; renames apply immediately.
+    workers={row['name']:{'pid':read_json(root/row['name']/'worker.json').get('pid')} for row in snapshot.get('bots',[])
+             if isinstance(row,dict) and NAME.fullmatch(str(row.get('name',''))) and row.get('running')}
+    return public_status(root,workers)
+
+
+def clean_name(value):
+    if not isinstance(value,str):return ''
+    import unicodedata
+    return ' '.join(''.join(ch for ch in value if not unicodedata.category(ch).startswith('C')).split())[:64]
+
+
+def profile(name):
+    root=require_root()
+    if not NAME.fullmatch(name or ''):raise ValueError('Unknown profile')
+    path=root/name
+    if path not in profile_dirs(root):raise ValueError('Unknown profile')
+    return path
+
+
+def rename_account(name, value):
+    path=profile(name);value=clean_name(value)
+    if not value:raise ValueError('Empty name')
+    with registry_lock(path.parent):
+        cfg=read_json(path/'account.json');cfg['display_name']=value;atomic_json(path/'account.json',cfg)
+
+
+def set_archive_limit(name, limit):
+    from core.archive_storage import MAX_LIMIT
+    if isinstance(limit,bool) or not isinstance(limit,int) or not 0<=limit<=MAX_LIMIT:raise ValueError('Invalid quota')
+    path=profile(name)
+    with registry_lock(path.parent):
+        cfg=read_json(path/'account.json');cfg['archive_limit_bytes']=limit;atomic_json(path/'account.json',cfg)
+
+
+def storage_info(name):
+    from core.archive_storage import account_limit
+    path=profile(name);usage=read_json(path/'data/archive_usage.json')
+    def number(key):
+        value=usage.get(key,0)
+        return value if isinstance(value,int) and not isinstance(value,bool) and value>=0 else 0
+    return {'media_bytes':number('media_bytes'),'text_db_bytes':number('text_db_bytes'),
+            'files':number('files'),'limit_bytes':account_limit(path),'at':usage.get('at',0)}
+
+
+def storage_totals():
+    root=require_root();result={'media_bytes':0,'text_db_bytes':0,'files':0}
+    for path in profile_dirs(root):
+        usage=storage_info(path.name)
+        for key in result:result[key]+=usage[key]
+    disk=shutil.disk_usage(root)
+    return {**result,'disk_free':disk.free,'disk_used':disk.used,'disk_total':disk.total}

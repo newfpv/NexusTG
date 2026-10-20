@@ -93,7 +93,7 @@ class CompactTests(SettingsTests):
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         tree = ast.parse(Path('/app/main.py').read_text())
         function = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'generate_settings_menu_content')
-        scope = {'InlineKeyboardMarkup': InlineKeyboardMarkup, 'InlineKeyboardButton': InlineKeyboardButton, '_': keys._}
+        scope = {'InlineKeyboardMarkup': InlineKeyboardMarkup, 'InlineKeyboardButton': InlineKeyboardButton, '_': keys._, 'plugins': NS(core_settings_buttons=[])}
         exec(compile(ast.Module(body=[function], type_ignores=[]), 'menu', 'exec'), scope)
         _, kb = await scope['generate_settings_menu_content']()
         callbacks = [b.callback_data for row in kb.inline_keyboard for b in row]

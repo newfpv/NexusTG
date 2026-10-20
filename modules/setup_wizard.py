@@ -15,8 +15,7 @@ active = False
 current_step = 0
 # Each editor remains the single source of truth for its settings.
 STEPS = [
-    ('account', 'my_info'), ('keys', 'set_edit_keys'), ('models', 'set_edit_models'),
-    ('timezone', 'set_edit_tz'), ('prompt', 'ai_g_set_prompt'), ('history', 'ai_history_budget'),
+    ('account', 'my_info'), ('prompt', 'ai_g_set_prompt'), ('history', 'ai_history_budget'),
     ('ai_scope', 'ai_global_settings'), ('human', 'ai_human_settings_global'),
     ('delays', 'ai_g_set_delays'), ('typing', 'ai_g_set_typing'), ('sleep', 'ai_settings_sleep'),
     ('search', 'ai_toggle_search_global'), ('debug', 'ai_toggle_debug'),
@@ -35,7 +34,19 @@ async def on_startup():
     global active, current_step
     cfg = await _config()
     active = bool(cfg.get('active', False))
-    current_step = _step_index(cfg.get('step', 0))
+    current_step = _resume_index(cfg)
+
+
+def _resume_index(cfg):
+    index = _step_index(cfg.get('step', 0))
+    saved_key=cfg.get('step_key')
+    if saved_key:
+        index=next((position for position,(key,_) in enumerate(STEPS) if key==saved_key),index)
+    elif not cfg.get('version'):
+        # Migrate old 25-step bookmarks without restarting the walkthrough.
+        old_index=max(0,int(cfg.get('step',0))) if str(cfg.get('step',0)).isdigit() else 0
+        index=_step_index(max(1,old_index-3) if old_index else 0)
+    return index
 
 
 def _step_index(value):
@@ -117,7 +128,7 @@ async def show_step(message, state, index):
     if index >= len(STEPS):
         return await finish(message, state)
     index = max(0, index)
-    await _save(step=index, active=True, completed=False)
+    await _save(step=index, step_key=STEPS[index][0], version=2, active=True, completed=False)
     cfg = await plugins.db.get_global_config()
     key, callback = STEPS[index]
     if key == 'online':
@@ -140,7 +151,7 @@ async def show_step(message, state, index):
 
 async def begin(message, state):
     cfg = await _config()
-    index = 0 if cfg.get('completed') else _step_index(cfg.get('step', 0))
+    index = 0 if cfg.get('completed') else _resume_index(cfg)
     await show_step(message, state, index)
 
 

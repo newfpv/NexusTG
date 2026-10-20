@@ -74,6 +74,11 @@ class PyrogramFSM:
 
 class CoreAPI:
     @staticmethod
+    async def claim_owner(user_id):
+        from core.db import claim_owner
+        return await claim_owner(user_id)
+
+    @staticmethod
     async def get_global_config():
         async with AsyncSessionLocal() as session:
             repo = CoreRepository(session)
@@ -157,6 +162,7 @@ class PluginManager:
         self.main_menu_buttons = []
         self.chat_menu_buttons = []
         self.settings_buttons = []
+        self.core_settings_buttons = []
         self.startup_tasks = []
         self.bot = None
         self.api_id = None

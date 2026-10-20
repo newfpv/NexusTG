@@ -119,14 +119,22 @@ NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 
 ## Primary bot and independent added bots
 
-Fresh Linux installations create the primary bot with owner-only **Add bot** and **My bots** buttons. Add another BotFather token, assign its owner, and let that owner open the new bot to complete setup. Added bots never receive bot-management controls. Statistics show only public bot usernames, counts and operating status; they do not include user IDs, phone numbers, API keys, conversations or account settings.
+Fresh Linux installations create a primary controller. Only its owner can open **Core settings → My bots** and add another BotFather token there. The first person to send `/start` to a new bot becomes its owner; existing owners are preserved. Added bots never receive bot-management controls. The list uses the connected account’s name, with an editable management label. Each entry provides archive quotas and a bounded diagnostic log that excludes messages, phone numbers, keys, sessions and raw exception text.
 
 For a manual Linux installation, run `python3 accounts.py add main` and then `/start` in that bot. Existing standalone installations can migrate with `accounts.py adopt`; see [account management](docs/accounts.md). Native Windows single-account startup remains available.
 
 ## Guided setup and independent accounts
 
-After Telegram login, a resumable 25-step wizard explains every settings section, including prompts, history, cookies and modules. Reopen it from Settings > Guided setup.
+After Telegram login, a resumable 22-step wizard explains every settings section, including prompts, history, cookies and modules. Keys, models and time zone remain in core settings and are not repeated in the walkthrough. Reopen it from Settings > Guided setup.
 
 Linux servers can run independent accounts from one installation with preloaded dependencies and shared memory pages. Each account has a separate process, environment, database, Telegram session, archive and media directory. A single account runs directly without an extra supervisor process.
 
 See [installation, adding accounts and migration](docs/accounts.md).
+
+## Archive storage and chat pages
+
+Each account has a separate local media quota (2 GiB by default), editable by the primary owner in **Core settings → My bots → account → Archive media limit**. Forwarded media is evicted first, old heavy attachments next, other attachments after that, and original voice messages / round videos last. Within a class the oldest files go first. Text and edit versions have no age expiry and are never removed by the media quota. Text databases can therefore continue growing independently. Setting the media limit to zero removes existing local media and stops new media caching; Telegram dump-chat copies remain untouched. A lower limit is applied by the account worker within 30 seconds after an active download finishes. Usage shows local archive media, text database size and the server filesystem’s used/free space. Other applications are included in the filesystem figures.
+
+**My chats** shows ten private chats per page, one button per row. Next-page arrows load more dialogs, including archived private chats, without truncating the first 30 mixed dialogs. Groups, bots and Telegram service messages remain excluded from this AI conversation picker.
+
+[Telegram module risk review and remedies](docs/telegram-risk-review.md) covers every module, shared request pacing, session ownership, online timing and API-terms limitations.

@@ -1,166 +1,259 @@
-"""Owner-only account management, exposed exclusively by the primary bot."""
+"""Primary-owner controls: named profiles, quotas, and safe diagnostics."""
 import asyncio
 import html
 import io
-from aiogram import Bot,F,Router,types
+from decimal import Decimal, InvalidOperation
+from aiogram import Bot, F, Router, types
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State,StatesGroup
-from aiogram.types import InlineKeyboardButton as Button,InlineKeyboardMarkup as Markup
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup
 from core import managed_accounts as service
-from core.config import _,LANG_FILE
-from core.utils import plugins,safe_edit
+from core.archive_storage import GIB, MAX_LIMIT
+from core.config import _, LANG_FILE
+from core.diagnostics import recent, format_rows
+from core.utils import plugins, safe_edit
 
-router=Router()
+router = Router()
 
 
 class AddBot(StatesGroup):
-    token=State()
-    owner=State()
+    token = State()
 
 
-async def allowed(user_id,chat_id):
-    if not service.is_manager() or user_id!=chat_id:return False
-    cfg=await plugins.db.get_global_config()
-    return user_id==cfg.admin_id
+class EditBot(StatesGroup):
+    name = State()
+    quota = State()
 
 
-async def get_settings_buttons():
-    if not service.is_manager():return []
-    return [[Button(text=_('managed_add_button'),callback_data='managed_add'),Button(text=_('managed_stats_button'),callback_data='managed_stats_0')]]
+async def allowed(user_id, chat_id):
+    if not service.is_manager() or user_id != chat_id:
+        return False
+    cfg = await plugins.db.get_global_config()
+    return user_id == cfg.admin_id
 
 
-def back():return Markup(inline_keyboard=[[Button(text=_('btn_cancel'),callback_data='managed_cancel')]])
+async def get_core_settings_buttons():
+    if not service.is_manager():
+        return []
+    return [[Button(text=_('managed_stats_button'), callback_data='managed_stats_0')]]
+
+
+def back(name=None):
+    return Markup(inline_keyboard=[[Button(text=_('btn_cancel'), callback_data='managed_bot_' + name if name else 'managed_cancel')]])
+
+
+def label(row, number=1):
+    return row.get('display_name') or ('@' + row['username'] if row.get('username') else _('managed_bot_number', number=number))
+
+
+def gib(value):
+    return f'{value / GIB:.3f}'
 
 
 async def validate_token(token):
-    if not service.TOKEN.fullmatch(token):raise ValueError('Invalid token')
-    bot=None
+    if not service.TOKEN.fullmatch(token):
+        raise ValueError('Invalid token')
+    bot = None
     try:
-        bot=Bot(token=token)
+        bot = Bot(token=token)
         async with asyncio.timeout(15):
-            me=await bot.get_me()
-            hook=await bot.get_webhook_info()
-        if hook.url:raise RuntimeError('webhook')
+            me = await bot.get_me()
+            hook = await bot.get_webhook_info()
+        if hook.url:
+            raise RuntimeError('webhook')
         return me
     finally:
-        if bot:await bot.session.close()
+        if bot:
+            await bot.session.close()
 
 
-async def show_stats(message,state,page=0):
-    snapshot=service.status();bots=snapshot['bots'];total=len(bots)
-    working=sum(bool(row['running'] and row['ready'] and row['enabled']) for row in bots)
-    disabled=sum(not row['enabled'] for row in bots)
-    text=_('managed_stats',total=total,working=working,disabled=disabled)
-    if not snapshot['at']:text+='\n'+_('managed_status_stale')
-    page=max(0,min(page,max(0,(total-1)//8)));rows=[]
-    for index,row in enumerate(bots[page*8:page*8+8],start=page*8+1):
-        status_key='managed_disabled' if not row['enabled'] else 'managed_running' if row['running'] and row['ready'] else 'managed_starting'
-        label='@'+row['username'] if row['username'] else _('managed_bot_number',number=index)
-        suffix=' · '+_('managed_primary') if row['primary'] else ''
-        text+='\n'+html.escape(label)+suffix+' — '+_(status_key)
-        if not row['primary']:rows.append([Button(text=label,callback_data='managed_bot_'+row['name'])])
-    if total>8:
-        rows.append([Button(text='‹',callback_data=f'managed_stats_{max(0,page-1)}'),Button(text=f'{page+1}/{(total+7)//8}',callback_data=f'managed_stats_{page}'),Button(text='›',callback_data=f'managed_stats_{min((total-1)//8,page+1)}')])
-    rows.append([Button(text=_('managed_add_button'),callback_data='managed_add'),Button(text=_('managed_refresh'),callback_data=f'managed_stats_{page}')])
-    rows.append([Button(text=_('btn_back_main'),callback_data='main_menu')])
-    await safe_edit(message,state,text,Markup(inline_keyboard=rows))
+async def show_stats(message, state, page=0):
+    snapshot = service.status()
+    bots, total = snapshot['bots'], len(snapshot['bots'])
+    working = sum(bool(row['running'] and row['ready'] and row['enabled']) for row in bots)
+    disabled = sum(not row['enabled'] for row in bots)
+    text = _('managed_stats', total=total, working=working, disabled=disabled)
+    totals = await asyncio.to_thread(service.storage_totals)
+    text += '\n\n' + _('managed_storage_summary', media=gib(totals['media_bytes']), text=gib(totals['text_db_bytes']), free=gib(totals['disk_free']), used=gib(totals['disk_used']))
+    if not snapshot['at']:
+        text += '\n' + _('managed_status_stale')
+    page = max(0, min(page, max(0, (total - 1) // 8)))
+    rows = []
+    for index, row in enumerate(bots[page * 8:page * 8 + 8], start=page * 8 + 1):
+        icon = '⏸' if not row['enabled'] else '🟢' if row['running'] and row['ready'] else '🟡'
+        suffix = ' · ' + _('managed_primary') if row['primary'] else ''
+        rows.append([Button(text=icon + ' ' + label(row, index) + suffix, callback_data='managed_bot_' + row['name'])])
+    if total > 8:
+        rows.append([Button(text='‹', callback_data=f'managed_stats_{max(0,page-1)}'), Button(text=f'{page+1}/{(total+7)//8}', callback_data=f'managed_stats_{page}'), Button(text='›', callback_data=f'managed_stats_{min((total-1)//8,page+1)}')])
+    rows.append([Button(text=_('managed_add_button'), callback_data='managed_add')])
+    rows.append([Button(text=_('managed_refresh'), callback_data=f'managed_stats_{page}')])
+    rows.append([Button(text=_('btn_back'), callback_data='global_settings')])
+    await safe_edit(message, state, text, Markup(inline_keyboard=rows))
 
 
-async def finish_add(message,state,owner_id):
-    data=await state.get_data()
-    if not data.get('managed_token'):return await show_stats(message,state)
-    try:
-        service.create_account(data['managed_token'],data['managed_id'],data['managed_username'],owner_id,'EN' if 'language_EN' in LANG_FILE else 'RU')
-    except FileExistsError:
-        return await safe_edit(message,state,_('managed_duplicate'),back())
-    except (ValueError,PermissionError,OSError):
-        return await safe_edit(message,state,_('managed_create_error'),back())
-    username=data['managed_username']
-    await state.update_data(managed_token=None,managed_id=None,managed_username=None)
-    await state.set_state(None)
-    kb=Markup(inline_keyboard=[[Button(text=_('managed_open'),url='https://t.me/'+username+'?start=setup')],
-                              [Button(text=_('managed_stats_button'),callback_data='managed_stats_0')]])
-    await safe_edit(message,state,_('managed_added',username=html.escape(username)),kb)
-    service.request_promotion()
+async def show_bot(message, state, name):
+    row = next((r for r in service.status()['bots'] if r['name'] == name), None)
+    if not row:
+        return await show_stats(message, state)
+    usage = await asyncio.to_thread(service.storage_info, name)
+    text = _('managed_bot_card', name=html.escape(label(row)))
+    text += '\n\n' + _('managed_storage_card', media=gib(usage['media_bytes']), limit=gib(usage['limit_bytes']), text=gib(usage['text_db_bytes']), files=usage['files'])
+    if not usage['at']:
+        text += '\n' + _('managed_storage_pending')
+    rows = [[Button(text=_('managed_rename'), callback_data='managed_rename_' + name)],
+            [Button(text=_('managed_quota'), callback_data='managed_quota_' + name)],
+            [Button(text=_('managed_logs'), callback_data='managed_logs_' + name)]]
+    if not row['primary']:
+        action = 'disable' if row['enabled'] else 'enable'
+        toggle_key = 'managed_turn_off' if row['enabled'] else 'managed_turn_on'
+        rows.append([Button(text=_(toggle_key), callback_data=f'managed_{action}_{name}')])
+        if row['enabled']:
+            rows.append([Button(text=_('managed_restart'), callback_data=f'managed_restart_{name}')])
+    rows.append([Button(text=_('btn_back'), callback_data='managed_stats_0')])
+    await safe_edit(message, state, text, Markup(inline_keyboard=rows))
+
+
+async def show_logs(message, state, name):
+    path = service.profile(name)
+    rows = await asyncio.to_thread(recent, path, 60)
+    text = _('managed_logs_title') + '\n\n' + _('managed_logs_privacy')
+    preview = format_rows(rows[-10:])
+    text += '\n\n<pre>' + html.escape(preview[-2600:] if preview else _('managed_logs_empty')) + '</pre>'
+    kb = Markup(inline_keyboard=[[Button(text=_('managed_refresh'), callback_data='managed_logs_' + name)],
+                                [Button(text=_('managed_logs_file'), callback_data='managed_logsfile_' + name)],
+                                [Button(text=_('btn_back'), callback_data='managed_bot_' + name)]])
+    await safe_edit(message, state, text, kb)
 
 
 @router.callback_query(F.data.startswith('managed_'))
-async def callbacks(call:types.CallbackQuery,state:FSMContext):
-    if not await allowed(call.from_user.id,call.message.chat.id):return await call.answer(_('auth_not_authorized'),show_alert=True)
+async def callbacks(call: types.CallbackQuery, state: FSMContext):
+    if not await allowed(call.from_user.id, call.message.chat.id):
+        return await call.answer(_('auth_not_authorized'), show_alert=True)
     await state.update_data(menu_msg_id=call.message.message_id)
-    if call.data=='managed_add':
-        await state.update_data(managed_token=None,managed_id=None,managed_username=None)
+    data = call.data
+    if data == 'managed_add':
+        await state.update_data(managed_token=None)
         await state.set_state(AddBot.token)
-        return await safe_edit(call.message,state,_('managed_token_prompt'),back())
-    if call.data=='managed_cancel':
-        await state.update_data(managed_token=None,managed_id=None,managed_username=None)
+        return await safe_edit(call.message, state, _('managed_token_prompt'), back())
+    if data == 'managed_cancel' or data.startswith('managed_stats_'):
+        await state.update_data(managed_token=None, managed_profile=None)
         await state.set_state(None)
-        return await show_stats(call.message,state)
-    if call.data=='managed_owner_self':
-        if await state.get_state()!=AddBot.owner.state:return await call.answer()
-        return await finish_add(call.message,state,call.from_user.id)
-    if call.data=='managed_owner_other':
-        if await state.get_state()!=AddBot.owner.state:return await call.answer()
-        return await safe_edit(call.message,state,_('managed_owner_prompt'),back())
-    if call.data.startswith('managed_stats_'):
-        await state.update_data(managed_token=None,managed_id=None,managed_username=None)
-        await state.set_state(None)
-        try:page=int(call.data.rsplit('_',1)[1])
-        except ValueError:page=0
-        return await show_stats(call.message,state,page)
-    if call.data.startswith(('managed_enable_','managed_disable_','managed_restart_')):
-        prefix,action,name=call.data.split('_',2)
-        try:service.change_account(name,action)
-        except (PermissionError,ValueError,OSError):return await call.answer(_('managed_action_error'),show_alert=True)
+        try:
+            page = int(data.rsplit('_', 1)[1])
+        except ValueError:
+            page = 0
+        return await show_stats(call.message, state, page)
+    if data.startswith(('managed_enable_', 'managed_disable_', 'managed_restart_')):
+        prefix_name, action, name = data.split('_', 2)
+        try:
+            service.change_account(name, action)
+        except (PermissionError, ValueError, OSError):
+            return await call.answer(_('managed_action_error'), show_alert=True)
         await call.answer(_('managed_action_done'))
-        return await show_stats(call.message,state)
-    if call.data.startswith('managed_bot_'):
-        name=call.data[len('managed_bot_'):]
-        row=next((r for r in service.status()['bots'] if r['name']==name),None)
-        if not row or row['primary']:return await call.answer()
-        label='@'+row['username'] if row['username'] else _('managed_bot_number',number=1)
-        action='disable' if row['enabled'] else 'enable'
-        toggle_key='managed_turn_off' if row['enabled'] else 'managed_turn_on'
-        rows=[[Button(text=_(toggle_key),callback_data=f'managed_{action}_{name}')]]
-        if row['enabled']:rows.append([Button(text=_('managed_restart'),callback_data=f'managed_restart_{name}')])
-        if row['username']:rows.append([Button(text=_('managed_open'),url='https://t.me/'+row['username'])])
-        rows.append([Button(text=_('btn_back'),callback_data='managed_stats_0')])
-        await safe_edit(call.message,state,_('managed_bot_card',name=html.escape(label)),Markup(inline_keyboard=rows))
+        return await show_bot(call.message, state, name)
+    operations = ('bot', 'rename', 'quota', 'logs', 'logsfile')
+    for operation in operations:
+        prefix = 'managed_' + operation + '_'
+        if not data.startswith(prefix):
+            continue
+        name = data[len(prefix):]
+        try:
+            path = service.profile(name)
+        except (PermissionError, ValueError, OSError):
+            return await call.answer(_('managed_action_error'), show_alert=True)
+        if operation == 'bot':
+            await state.set_state(None)
+            await state.update_data(managed_profile=None)
+            return await show_bot(call.message, state, name)
+        if operation == 'rename':
+            await state.update_data(managed_profile=name)
+            await state.set_state(EditBot.name)
+            return await safe_edit(call.message, state, _('managed_name_prompt'), back(name))
+        if operation == 'quota':
+            await state.update_data(managed_profile=name)
+            await state.set_state(EditBot.quota)
+            return await safe_edit(call.message, state, _('managed_quota_prompt'), back(name))
+        if operation == 'logs':
+            return await show_logs(call.message, state, name)
+        if operation == 'logsfile':
+            rows = await asyncio.to_thread(recent, path, 100)
+            document = types.BufferedInputFile((format_rows(rows) or _('managed_logs_empty')).encode('utf-8'), filename='diagnostics.txt')
+            return await call.message.answer_document(document, caption=_('managed_logs_privacy'))
 
 
 @router.message(AddBot.token)
-async def receive_token(message:types.Message,state:FSMContext):
-    if not await allowed(message.from_user.id,message.chat.id):return
-    try:await message.delete()
-    except Exception:pass
-    token=(message.text or '').strip()
-    if message.document:
-        if not (message.document.file_name or '').lower().endswith('.txt') or (message.document.file_size or 0)>8192:
-            return await safe_edit(message,state,_('managed_token_error'),back())
-        buffer=io.BytesIO()
-        await plugins.bot.download(message.document,destination=buffer)
-        token=buffer.getvalue().decode('utf-8-sig',errors='replace').strip()
+async def receive_token(message: types.Message, state: FSMContext):
+    if not await allowed(message.from_user.id, message.chat.id):
+        return
     try:
-        me=await validate_token(token)
-    except RuntimeError:
-        return await safe_edit(message,state,_('managed_webhook_error'),back())
+        await message.delete()
     except Exception:
-        return await safe_edit(message,state,_('managed_token_error'),back())
-    await state.update_data(managed_token=token,managed_id=me.id,managed_username=me.username)
-    await state.set_state(AddBot.owner)
-    rows=[[Button(text=_('managed_owner_self'),callback_data='managed_owner_self'),Button(text=_('managed_owner_other'),callback_data='managed_owner_other')],
-          [Button(text=_('btn_cancel'),callback_data='managed_cancel')]]
-    await safe_edit(message,state,_('managed_owner_choice',username=html.escape(me.username)),Markup(inline_keyboard=rows))
+        pass
+    token = (message.text or '').strip()
+    if message.document:
+        if not (message.document.file_name or '').lower().endswith('.txt') or (message.document.file_size or 0) > 8192:
+            return await safe_edit(message, state, _('managed_token_error'), back())
+        buffer = io.BytesIO()
+        try:
+            async with asyncio.timeout(15):
+                await plugins.bot.download(message.document, destination=buffer)
+            token = buffer.getvalue().decode('utf-8-sig', errors='replace').strip()
+        except Exception:
+            return await safe_edit(message, state, _('managed_token_error'), back())
+    try:
+        me = await validate_token(token)
+    except RuntimeError:
+        return await safe_edit(message, state, _('managed_webhook_error'), back())
+    except Exception:
+        return await safe_edit(message, state, _('managed_token_error'), back())
+    try:
+        service.create_account(token, me.id, me.username, language='EN' if 'language_EN' in LANG_FILE else 'RU', display_name=getattr(me, 'full_name', None))
+    except FileExistsError:
+        return await safe_edit(message, state, _('managed_duplicate'), back())
+    except (ValueError, PermissionError, OSError):
+        return await safe_edit(message, state, _('managed_create_error'), back())
+    await state.update_data(managed_token=None, managed_profile=None)
+    await state.set_state(None)
+    kb = Markup(inline_keyboard=[[Button(text=_('managed_stats_button'), callback_data='managed_stats_0')]])
+    await safe_edit(message, state, _('managed_added', username=html.escape(me.username)), kb)
+    service.request_promotion()
 
 
-@router.message(AddBot.owner)
-async def receive_owner(message:types.Message,state:FSMContext):
-    if not await allowed(message.from_user.id,message.chat.id):return
-    origin=getattr(message,'forward_origin',None)
-    sender=getattr(origin,'sender_user',None) or getattr(message,'forward_from',None)
-    text=(message.text or '').strip()
-    owner_id=sender.id if sender and not sender.is_bot else int(text) if text.isdigit() and 0<len(text)<20 else 0
-    try:await message.delete()
-    except Exception:pass
-    if not 0<owner_id<2**63:return await safe_edit(message,state,_('managed_owner_prompt'),back())
-    await finish_add(message,state,owner_id)
+@router.message(EditBot.name)
+async def receive_name(message: types.Message, state: FSMContext):
+    if not await allowed(message.from_user.id, message.chat.id):
+        return
+    name = (await state.get_data()).get('managed_profile')
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        value = service.clean_name(message.text)
+        if not value or len(message.text or '') > 128:
+            raise ValueError('Invalid name')
+        service.rename_account(name, value)
+    except (ValueError, PermissionError, OSError):
+        return await safe_edit(message, state, _('managed_name_prompt'), back(name))
+    await state.set_state(None)
+    await show_bot(message, state, name)
+
+
+@router.message(EditBot.quota)
+async def receive_quota(message: types.Message, state: FSMContext):
+    if not await allowed(message.from_user.id, message.chat.id):
+        return
+    name = (await state.get_data()).get('managed_profile')
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        amount = Decimal((message.text or '').strip().replace(',', '.'))
+        if not amount.is_finite() or not 0 <= amount <= MAX_LIMIT / GIB:
+            raise ValueError('Invalid quota')
+        service.set_archive_limit(name, int(amount * GIB))
+    except (InvalidOperation, ValueError, PermissionError, OSError):
+        return await safe_edit(message, state, _('managed_quota_prompt'), back(name))
+    await state.set_state(None)
+    await show_bot(message, state, name)

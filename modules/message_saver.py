@@ -4,6 +4,8 @@ import random
 import logging
 import html
 import time
+import tempfile
+import shutil
 from datetime import datetime, timedelta
 import aiosqlite
 
@@ -15,11 +17,14 @@ from aiogram.fsm.state import StatesGroup, State
 from pyrogram import Client, filters
 from pyrogram.types import User, ChatPrivileges
 from pyrogram.enums import ChatType
+from pyrogram.errors import FloodWait
 from pyrogram.raw.functions.channels import ToggleForum
 from pyrogram.raw.types import InputChannel
 
 from core.utils import safe_edit, CoreAPI, get_cancel_kb, get_back_kb
 from core.config import _
+from core.archive_storage import account_limit, prune_media, publish_usage, cleanup_staging, repair_media_path
+from pathlib import Path
 
 DB_FILE = "data/saver_cache.sqlite"
 CACHE_DIR = "data/spy_cache/"
@@ -31,6 +36,8 @@ db_conn = None
 db_lock = asyncio.Lock()
 alert_queue = asyncio.Queue()
 background_tasks = set()
+cache_lock = asyncio.Lock()
+cache_slots = asyncio.Semaphore(1)
 
 class SaverStates(StatesGroup):
     wait_dump_chat = State()
@@ -42,35 +49,130 @@ class SaverStates(StatesGroup):
 async def cache_garbage_collector():
     while True:
         try:
-            if not os.path.exists(CACHE_DIR):
-                await asyncio.sleep(12 * 3600)
-                continue
-
-            valid_files = set()
-            async with db_lock:
-                if db_conn:
-                    async with db_conn.execute("SELECT file_path FROM msg_cache WHERE file_path IS NOT NULL AND file_path != ''") as cursor:
-                        async for row in cursor:
-                            if row[0]:
-                                valid_files.add(os.path.basename(row[0]))
-
-            cleaned = 0
-            for filename in os.listdir(CACHE_DIR):
-                if filename not in valid_files:
-                    file_path = os.path.join(CACHE_DIR, filename)
-                    try:
-                        if os.path.isfile(file_path):
-                            os.remove(file_path)
-                            cleaned += 1
-                    except Exception:
-                        pass
-
-            if cleaned > 0:
-                logging.info(f"[Saver GC] Removed {cleaned} orphaned files.")
+            async with cache_lock:
+                await maintain_quota()
         except Exception as e:
-            logging.error(f"[Saver GC] Error: {e}")
-        
-        await asyncio.sleep(12 * 3600)
+            logging.error('[Saver GC] Quota cleanup failed: %s', type(e).__name__)
+        await asyncio.sleep(30)
+
+
+async def maintain_quota(reserve=0):
+    """Called under cache_lock; database text rows and versions are never deleted."""
+    limit=account_limit()
+    forwarded=[]
+    if db_conn:
+        async with db_lock:
+            async with db_conn.execute('SELECT file_path FROM msg_cache WHERE is_forwarded = 1 AND file_path IS NOT NULL') as cursor:
+                forwarded=[row[0] for row in await cursor.fetchall() if row[0]]
+    result=await asyncio.to_thread(prune_media,CACHE_DIR,limit,reserve,forwarded=forwarded)
+    if db_conn and result['removed']:
+        async with db_lock:
+            for path in result['removed']:
+                # Existing records may use relative paths while the scanner returns
+                # the same spelling from CACHE_DIR. Match either representation.
+                await db_conn.execute("UPDATE msg_cache SET file_path = '' WHERE file_path IN (?, ?)", (path,str(Path(path).resolve())))
+            await db_conn.commit()
+        logging.warning('[Saver] Media quota cleanup completed')
+    return await asyncio.to_thread(publish_usage,CACHE_DIR,DB_FILE,limit)
+
+
+async def cache_media(message, media_type, media_obj, cfg, is_ttl):
+    if not media_obj:return ''
+    try:
+        cap=max(0,int(float(cfg['limit_ttl'] if is_ttl else cfg['limit_reg'])*1024*1024))
+        expected=max(0,int(getattr(media_obj,'file_size',0) or 0))
+    except (TypeError,ValueError,OverflowError):return ''
+    cap=min(cap,account_limit())
+    if not cap or expected>cap:return ''
+    async with cache_lock:
+        await maintain_quota()
+        free=(await asyncio.to_thread(shutil.disk_usage,CACHE_DIR)).free
+        if free<(expected or cap)+64*1024**2:
+            logging.warning('[Saver] Media download skipped: storage quota')
+            return ''
+        shared='_fwd' if is_forwarded(message) else ''
+        target=Path(CACHE_DIR)/f'{message.chat.id}_{message.id}{shared}_{media_type}'
+        temporary_root=Path(CACHE_DIR).parent/'tmp'
+        temporary_root.mkdir(parents=True,exist_ok=True)
+        async def progress(current,total):
+            if current>cap:raise ValueError('Archive media quota exceeded')
+        # Stage one bounded file separately, then apply priority eviction with the
+        # new file included. Reserving quota by evicting first would discard old
+        # original voice messages just to admit a low-priority forwarded post.
+        with tempfile.TemporaryDirectory(prefix='saver_',dir=temporary_root) as temporary:
+            path=''
+            try:
+                async with asyncio.timeout(180):
+                    path=await message.download(file_name=str(Path(temporary)/target.name),progress=progress) or ''
+                candidate=Path(path) if path else None
+                if candidate and candidate.is_file() and not candidate.is_symlink() and candidate.resolve().is_relative_to(Path(temporary).resolve()) and candidate.stat().st_size<=cap:
+                    os.replace(candidate,target)
+                    path=str(target)
+                else:path=''
+            except Exception as exc:
+                logging.warning('[Saver] Media download failed: %s',type(exc).__name__)
+            await maintain_quota()
+            return path if path and Path(path).is_file() else ''
+
+
+def is_forwarded(message):
+    return any(getattr(message,key,None) is not None for key in
+               ('forward_origin','forward_date','forward_from','forward_from_chat','forward_sender_name'))
+
+
+async def classify_old_media(app):
+    """Resume a low-rate metadata migration without downloading attachments."""
+    while True:
+        if app is not userbot_app:return
+        if not getattr(app,'is_initialized',False) or not getattr(app,'is_connected',False):
+            await asyncio.sleep(5);continue
+        async with db_lock:
+            async with db_conn.execute('''SELECT chat_id FROM msg_cache WHERE is_forwarded IS NULL
+                    AND file_path IS NOT NULL AND file_path != '' ORDER BY timestamp LIMIT 1''') as cursor:
+                first=await cursor.fetchone()
+            if not first:return
+            async with db_conn.execute('''SELECT message_id,file_path FROM msg_cache WHERE chat_id = ?
+                    AND is_forwarded IS NULL AND file_path IS NOT NULL AND file_path != '' ORDER BY timestamp LIMIT 50''',(first[0],)) as cursor:
+                rows=await cursor.fetchall()
+        existing=[mid for mid,path in rows if Path(path).is_file() and not Path(path).is_symlink()]
+        try:
+            if existing:
+                async with asyncio.timeout(30):
+                    messages=await app.get_messages(first[0],existing)
+                messages=messages if isinstance(messages,list) else [messages]
+            else:messages=[]
+        except FloodWait as exc:
+            logging.warning('[Saver] Metadata migration FloodWait')
+            await asyncio.sleep(max(5,float(exc.value)+1));continue
+        except Exception as exc:
+            logging.warning('[Saver] Metadata migration failed: %s',type(exc).__name__)
+            if type(exc).__name__ in {'PeerIdInvalid','ChannelPrivate','ChatIdInvalid','UserIdInvalid','UserDeactivated'}:
+                messages=[]
+            else:
+                await asyncio.sleep(60);continue
+        found={m.id:m for m in messages if m and not getattr(m,'empty',False)}
+        async with db_lock:
+            for mid,path in rows:
+                value=int(is_forwarded(found[mid])) if mid in found else -1
+                await db_conn.execute('UPDATE msg_cache SET is_forwarded = ? WHERE chat_id = ? AND message_id = ? AND is_forwarded IS NULL',(value,first[0],mid))
+            await db_conn.commit()
+        await asyncio.sleep(5)
+
+
+async def repair_cache_paths():
+    """Rebase old /app/data paths without touching text or another profile."""
+    async with db_lock:
+        async with db_conn.execute("SELECT chat_id,message_id,file_path FROM msg_cache WHERE file_path IS NOT NULL AND file_path != ''") as cursor:
+            rows=await cursor.fetchall()
+        def resolve_rows():
+            return [(chat,mid,path,*repair_media_path(CACHE_DIR,path,chat,mid)) for chat,mid,path in rows]
+        for chat,mid,old,new,reset in await asyncio.to_thread(resolve_rows):
+            if old!=new:
+                await db_conn.execute('''UPDATE msg_cache SET file_path = ?,
+                    is_forwarded = CASE WHEN is_forwarded = -1 AND ? THEN NULL ELSE is_forwarded END
+                    WHERE chat_id = ? AND message_id = ?''',(new,int(reset),chat,mid))
+        await db_conn.commit()
+    logging.info('[Saver] Archive startup paths checked')
 
 async def alert_worker(bot: Bot, app: Client):
     while True:
@@ -100,6 +202,7 @@ async def on_startup():
     global db_conn
     os.makedirs("data", exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
+    await asyncio.to_thread(cleanup_staging,CACHE_DIR)
 
     db_conn = await aiosqlite.connect(DB_FILE, timeout=30.0)
     await db_conn.execute("PRAGMA busy_timeout=30000;")
@@ -123,8 +226,20 @@ async def on_startup():
                             user_id INTEGER PRIMARY KEY,
                             topic_id INTEGER,
                             user_name TEXT)""")
+        async with db_conn.execute('PRAGMA table_info(msg_cache)') as cursor:
+            columns={row[1] async for row in cursor}
+        if 'is_deleted' not in columns:
+            await db_conn.execute('ALTER TABLE msg_cache ADD COLUMN is_deleted INTEGER DEFAULT 0')
+        if 'is_forwarded' not in columns:
+            await db_conn.execute('ALTER TABLE msg_cache ADD COLUMN is_forwarded INTEGER')
+        await db_conn.execute('CREATE INDEX IF NOT EXISTS idx_msg_cache_file ON msg_cache(file_path)')
+        await db_conn.execute('CREATE INDEX IF NOT EXISTS idx_msg_cache_forward ON msg_cache(is_forwarded,chat_id)')
+        await db_conn.execute('''CREATE TABLE IF NOT EXISTS msg_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, chat_id INTEGER,
+            text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         await db_conn.commit()
 
+    await repair_cache_paths()
     gc_task = asyncio.create_task(cache_garbage_collector())
     background_tasks.add(gc_task)
     gc_task.add_done_callback(background_tasks.discard)
@@ -184,7 +299,13 @@ async def get_saver_kb():
 @router.callback_query(F.data == "saver_main")
 async def saver_menu(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(menu_msg_id=call.message.message_id)
-    await safe_edit(call.message, state, _("menu_saver_title"), await get_saver_kb(), parse_mode="HTML")
+    from core.archive_storage import GIB
+    try:
+        async with cache_lock:
+            usage=await asyncio.to_thread(publish_usage,CACHE_DIR,DB_FILE,account_limit())
+        text=_("menu_saver_title")+'\n\n'+_('saver_storage_status',used=f"{usage['media_bytes']/GIB:.3f}",limit=f"{usage['limit_bytes']/GIB:.3f}")
+    except OSError:text=_("menu_saver_title")
+    await safe_edit(call.message, state, text, await get_saver_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("saver_tgl_"))
 async def saver_toggles(call: types.CallbackQuery, state: FSMContext):
@@ -551,8 +672,10 @@ async def execute_alert(bot: Bot, app: Client, chat_id: int, user_id: int, topic
             if msg_txt.strip():
                 return await bot.send_message(chat_id=chat_id, message_thread_id=t_id, text=msg_txt, parse_mode="HTML")
 
+    sent = False
     try:
         await _send(topic_id)
+        sent = True
     except Exception as e:
         if any(x in str(e).upper() for x in ["THREAD", "TOPIC", "PEER_ID_INVALID"]):
             async with db_lock:
@@ -562,18 +685,15 @@ async def execute_alert(bot: Bot, app: Client, chat_id: int, user_id: int, topic
             if new_topic_id:
                 try: 
                     await _send(new_topic_id)
+                    sent = True
                 except Exception as ex: 
                     logging.error(f"[Saver] Failed to send even after recreating topic: {ex}")
         else:
             logging.error(f"[Saver] Error sending alert to topic: {e}")
-    finally:
-        if delete_file_after and file_path and os.path.exists(file_path):
-            try: 
-                os.remove(file_path)
-                dir_path = os.path.dirname(file_path)
-                if os.path.exists(dir_path) and not os.listdir(dir_path): os.rmdir(dir_path)
-            except Exception: 
-                pass
+    # Local archive copies are retained until media-quota eviction. In
+    # particular, forwarding a deleted voice message must not erase its local
+    # copy immediately. The legacy delete_file_after argument is ignored.
+
 
 def register_userbot(app: Client, bot: Bot):
     global userbot_app
@@ -582,58 +702,40 @@ def register_userbot(app: Client, bot: Bot):
     worker_task = asyncio.create_task(alert_worker(bot, app))
     background_tasks.add(worker_task)
     worker_task.add_done_callback(background_tasks.discard)
+    migration_task=asyncio.create_task(classify_old_media(app))
+    background_tasks.add(migration_task)
+    migration_task.add_done_callback(background_tasks.discard)
     
     async def process_caching(client, message, cfg):
         user = message.from_user
         text = message.text or message.caption or ""
         is_ttl, media_type, media_obj = False, None, None
-        
         for m_type in ["photo", "video", "voice", "video_note", "document"]:
             obj = getattr(message, m_type, None)
             if obj:
                 media_type, media_obj = m_type, obj
-                if getattr(obj, "ttl_seconds", None) or getattr(message, "ttl_seconds", None): is_ttl = True
-                if getattr(obj, "view_once", False) or getattr(message, "view_once", False): is_ttl = True
+                is_ttl = bool(getattr(obj, "ttl_seconds", None) or getattr(message, "ttl_seconds", None)
+                              or getattr(obj, "view_once", False) or getattr(message, "view_once", False))
                 break
-                
-        size_mb = 0
-        if media_obj and hasattr(media_obj, "file_size") and media_obj.file_size:
-            size_mb = media_obj.file_size / (1024 * 1024)
-            
-        limit_mb = cfg["limit_ttl"] if is_ttl else cfg["limit_reg"]
-        file_path = ""
-        
-        if media_obj and size_mb <= limit_mb:
-            try: 
-                target_path = os.path.join(CACHE_DIR, f"{message.chat.id}_{message.id}_{media_type}")
-                file_path = await message.download(file_name=target_path)
-            except Exception:
-                pass
-            
-        if not is_ttl:
-            async with db_lock:
-                await db_conn.execute("INSERT OR REPLACE INTO msg_cache (message_id, chat_id, user_id, user_name, text, media_type, file_path, is_ttl) VALUES (?, ?, ?, ?, ?, ?, ?, 0)", 
-                                 (message.id, message.chat.id, user.id, user.first_name, text, media_type, file_path))
-                
-                if random.randint(1, 100) == 1:
-                    await db_conn.execute("DELETE FROM msg_cache WHERE timestamp < datetime('now', '-180 days')")
-                await db_conn.commit()
-                
+        # Commit the text before waiting for media/network work. No age-based
+        # cleanup, no deletion of text rows after forwarding to the dump chat.
+        async with db_lock:
+            await db_conn.execute("INSERT OR IGNORE INTO msg_cache (message_id,chat_id,user_id,user_name,text,media_type,file_path,is_ttl,is_forwarded) VALUES (?,?,?,?,?,?,?,?,?)",
+                                  (message.id,message.chat.id,user.id,user.first_name,text,media_type,'',int(is_ttl),int(is_forwarded(message))))
+            await db_conn.commit()
+        async with cache_slots:
+            file_path = await cache_media(message,media_type,media_obj,cfg,is_ttl)
+        async with db_lock:
+            await db_conn.execute("UPDATE msg_cache SET file_path = ? WHERE message_id = ? AND chat_id = ?",(file_path,message.id,message.chat.id))
+            await db_conn.commit()
         if is_ttl and cfg["save_ttl"]:
-            try: dump_chat_id = int(cfg["dump_chat_id"])
-            except Exception: return
-            
-            async with db_lock:
-                await db_conn.execute("INSERT OR REPLACE INTO msg_cache (message_id, chat_id, user_id, user_name, text, media_type, file_path, is_ttl) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", 
-                                 (message.id, message.chat.id, user.id, user.first_name, text, media_type, file_path))
-                await db_conn.commit()
-
+            try:dump_chat_id = int(cfg["dump_chat_id"])
+            except (TypeError,ValueError):return
             if dump_chat_id:
-                topic_id = await get_or_create_topic(app, bot, dump_chat_id, user.id, user_obj=user)
+                topic_id = await get_or_create_topic(app,bot,dump_chat_id,user.id,user_obj=user)
                 if topic_id:
-                    safe_ttl_txt = html.escape(text) if text else ""
-                    await alert_queue.put((dump_chat_id, user.id, topic_id, safe_ttl_txt, file_path, media_type, True, is_ttl))
-                    logging.info(f"[Saver] Saved TTL media {message.id} from user {user.id}")
+                    await alert_queue.put((dump_chat_id,user.id,topic_id,html.escape(text),file_path,media_type,True,is_ttl))
+                    logging.info('[Saver] TTL media cached')
 
     @app.on_message(filters.private & ~filters.bot & ~filters.me, group=1)
     async def incoming_messages_handler(client, message):
@@ -668,15 +770,17 @@ def register_userbot(app: Client, bot: Bot):
             for msg in messages:
                 if msg.chat and msg.chat.type != ChatType.PRIVATE: continue
                 
-                if msg.chat: cursor = await db_conn.execute("SELECT user_id, text, media_type, file_path, is_ttl FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, msg.chat.id))
-                else: cursor = await db_conn.execute("SELECT user_id, text, media_type, file_path, is_ttl FROM msg_cache WHERE message_id = ? ORDER BY timestamp DESC LIMIT 1", (msg.id,))
+                if msg.chat: cursor = await db_conn.execute("SELECT user_id, text, media_type, file_path, is_ttl, chat_id FROM msg_cache WHERE message_id = ? AND chat_id = ? AND is_deleted = 0", (msg.id, msg.chat.id))
+                else: cursor = await db_conn.execute("SELECT user_id, text, media_type, file_path, is_ttl, chat_id FROM msg_cache WHERE message_id = ? AND is_deleted = 0 ORDER BY timestamp DESC LIMIT 2", (msg.id,))
                 
-                row = await cursor.fetchone()
-                if row:
-                    msgs_to_process.append((msg, row))
+                rows = await cursor.fetchall()
+                # Without a chat ID, a message ID can belong to multiple chats.
+                # Do not attribute an ambiguous deletion to the wrong person.
+                if len(rows) == 1:
+                    msgs_to_process.append((msg, rows[0]))
                         
         for msg, row in msgs_to_process:
-            u_id, txt, m_type, f_path, db_is_ttl = row
+            u_id, txt, m_type, f_path, db_is_ttl, cached_chat_id = row
             
             if db_is_ttl == 1:
                 continue
@@ -688,10 +792,10 @@ def register_userbot(app: Client, bot: Bot):
                 await alert_queue.put((dump_id, u_id, topic_id, safe_txt, f_path, m_type, True, False))
                 logging.info(f"[Saver] Saved deleted message {msg.id} from user {u_id}")
                 
-                c_id = getattr(msg.chat, 'id', None)
+                c_id = cached_chat_id
                 if c_id: 
                     async with db_lock:
-                        await db_conn.execute("DELETE FROM msg_cache WHERE message_id = ? AND chat_id = ?", (msg.id, c_id))
+                        await db_conn.execute("UPDATE msg_cache SET is_deleted = 1 WHERE message_id = ? AND chat_id = ?", (msg.id, c_id))
                         await db_conn.commit()
 
     @app.on_edited_message(filters.private & ~filters.bot & ~filters.me, group=3)
@@ -713,14 +817,15 @@ def register_userbot(app: Client, bot: Bot):
                 
         if row:
             old_t, m_type, f_path = row
+            old_t=old_t or ''
             new_t = message.text or message.caption or ""
             if old_t != new_t:
+                async with db_lock:
+                    await db_conn.execute("INSERT INTO msg_versions (message_id,chat_id,text) VALUES (?,?,?)", (message.id,message.chat.id,old_t))
+                    await db_conn.execute("UPDATE msg_cache SET text = ? WHERE message_id = ? AND chat_id = ?", (new_t, message.id, message.chat.id))
+                    await db_conn.commit()
                 topic_id = await get_or_create_topic(app, bot, dump_id, user.id, user_obj=user)
                 if topic_id:
                     alert_txt = _("saver_alert_edited", old=html.escape(old_t), new=html.escape(new_t))
                     await alert_queue.put((dump_id, user.id, topic_id, alert_txt, f_path, m_type, False, False))
                     logging.info(f"[Saver] Saved edited message {message.id} from user {user.id}")
-                    
-                async with db_lock:
-                    await db_conn.execute("UPDATE msg_cache SET text = ? WHERE message_id = ? AND chat_id = ?", (new_t, message.id, message.chat.id))
-                    await db_conn.commit()

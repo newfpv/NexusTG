@@ -90,6 +90,8 @@ def run_worker(profile, code_root):
     sys.path.insert(0, str(code_root))
     import asyncio
     import main as application
+    from core.diagnostics import install
+    install()
     async def start():
         await application.bot.me()  # Validate this controller before declaring it ready.
         if read_json(root/'runtime.json').get('mode')!='single' or manager_name(root)!=profile.name:
@@ -120,7 +122,12 @@ def run_worker(profile, code_root):
         if database is not None:
             async with asyncio.timeout(5):await database.engine.dispose()
         return True
-    return asyncio.run(start())
+    try:
+        return asyncio.run(start())
+    except Exception:
+        import logging
+        logging.exception('[Runtime] Worker startup failed')
+        raise
 
 
 class Supervisor:

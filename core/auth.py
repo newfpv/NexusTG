@@ -305,7 +305,7 @@ async def process_numpad(call: types.CallbackQuery, state: FSMContext):
         if len(current_code) < 5: current_code += action
     await state.update_data(entered_code=current_code)
     display_code = " ".join(list(current_code)) + " _" * (5 - len(current_code))
-    phone = data.get("phone", "Неизвестно")
+    phone = data.get("phone", _("status_unknown"))
     await safe_edit(call.message, state, _("auth_enter_code_display", display_code=display_code, phone=phone), get_numpad_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data == "auth_qr_start", AuthFSM.code)

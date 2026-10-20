@@ -14,7 +14,26 @@ def load_environment():
     os.environ.update(selected)
 
 
-def mark_ready(bot_id, userbot_id=None, bot_username=None):
+def bind_claimed_owner(owner_id):
+    """Persist the first managed owner independently of resettable settings."""
+    selected=os.environ.get('NEXUS_PROFILE_DIR')
+    if not selected:return
+    from pathlib import Path
+    from core.managed_accounts import atomic_json,read_json,registry_lock
+    profile=Path(selected).resolve()
+    root=Path(os.environ['NEXUS_ACCOUNTS_DIR']).resolve()
+    if profile.parent!=root or profile.name!=os.environ.get('NEXUS_ACCOUNT_NAME') or not (profile/'account.json').is_file():
+        raise RuntimeError('Invalid selected account profile')
+    with registry_lock(root):
+        path=profile/'account.json';metadata=read_json(path)
+        if metadata.get('owner_id') not in (None,owner_id):
+            raise RuntimeError('Profile owner does not match its database')
+        metadata['owner_id']=owner_id
+        atomic_json(path,metadata)
+    os.environ['NEXUS_PROFILE_OWNER_ID']=str(owner_id)
+
+
+def mark_ready(bot_id, userbot_id=None, bot_username=None, account_name=None):
     profile = os.environ.get('NEXUS_PROFILE_DIR')
     if not profile:
         return
@@ -22,5 +41,5 @@ def mark_ready(bot_id, userbot_id=None, bot_username=None):
     path = Path(profile) / 'worker.json'
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps({'pid': os.getpid(), 'ready': True, 'bot_id': bot_id,
-        'userbot_id': userbot_id, 'bot_username': bot_username, 'at': time.time()}), encoding='utf-8')
+        'userbot_id': userbot_id, 'bot_username': bot_username, 'account_name': account_name, 'at': time.time()}), encoding='utf-8')
     os.replace(temporary, path)

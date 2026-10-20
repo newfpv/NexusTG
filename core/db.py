@@ -282,3 +282,21 @@ async def bind_profile_owner():
         else:
             cfg.admin_id = owner_id
         await session.commit()
+
+
+async def claim_owner(user_id):
+    """Only the first private /start wins, even with concurrent updates."""
+    if isinstance(user_id,bool) or not isinstance(user_id,int) or not 0<user_id<2**63:
+        return False
+    pinned=int(os.environ.get('NEXUS_PROFILE_OWNER_ID') or 0)
+    if pinned and pinned!=user_id:return False
+    from sqlalchemy.dialects.sqlite import insert
+    async with AsyncSessionLocal() as session:
+        await session.execute(insert(GlobalConfig).values(id=1).on_conflict_do_nothing(index_elements=['id']))
+        await session.execute(text('UPDATE global_config SET admin_id = :owner WHERE id = 1 AND (admin_id IS NULL OR admin_id = 0)'), {'owner':user_id})
+        owner=(await session.execute(select(GlobalConfig.admin_id).where(GlobalConfig.id==1))).scalar_one()
+        if owner==user_id:
+            from core.environment import bind_claimed_owner
+            bind_claimed_owner(user_id)
+        await session.commit()
+        return owner==user_id

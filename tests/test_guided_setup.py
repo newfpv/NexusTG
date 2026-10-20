@@ -50,6 +50,13 @@ class WizardTests(unittest.IsolatedAsyncioTestCase):
         await wizard.begin(self.message,self.state)
         self.assertEqual(wizard.current_step,14)
 
+    async def test_legacy_bookmark_resumes_same_setting_after_removed_steps(self):
+        self.record={'active':True,'completed':False,'step':4}
+        await wizard.on_startup()
+        self.assertEqual(wizard.current_step,1)
+        await wizard.begin(self.message,self.state)
+        self.assertEqual(wizard.STEPS[wizard.current_step][0],'prompt')
+
     async def test_native_direct_editor_keeps_navigation_only_on_owner_menu(self):
         storage=MemoryStorage();key=StorageKey(bot_id=11,chat_id=7,user_id=7)
         await storage.set_data(key,{'menu_msg_id':10})

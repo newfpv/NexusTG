@@ -60,3 +60,20 @@ async def main():
         print('PASS: direct primary promotes to shared runtime; added bot has its own owner, token and data; role spoof rejected; status excludes private fields; worker controls do not restart primary.',flush=True)
     finally:
         process.terminate();process.wait(timeout=20)
+
+    # A failure before polling must still be available in the safe manager log.
+    failure=root/'failure';failure.mkdir();(failure/'data').mkdir()
+    (failure/'.env').write_text('TG_BOT_TOKEN=333:private-failure-token\n')
+    service.atomic_json(failure/'account.json',{'enabled':True})
+    (code/'main.py').write_text('''import os
+from core.environment import load_environment
+load_environment()
+class Bot:
+    async def me(self):raise ConnectionError(os.environ['TG_BOT_TOKEN'])
+bot=Bot()
+''')
+    failed=subprocess.run([sys.executable,'/app/account_runtime.py','--worker',str(failure),'--code-root',str(code)],cwd='/app',capture_output=True,text=True)
+    assert failed.returncode!=0
+    safe=(failure/'data/logs/diagnostics.jsonl').read_text()
+    assert 'ConnectionError' in safe and 'private-failure-token' not in safe and '333:' not in safe
+    print('PASS: startup failures before polling are recorded without token/exception contents.',flush=True)

@@ -71,6 +71,8 @@ def load_modules(dispatcher: Dispatcher):
                     plugins.chat_menu_buttons.append(mod.get_chat_menu_buttons)
                 if hasattr(mod, "get_settings_buttons"):
                     plugins.settings_buttons.append(mod.get_settings_buttons)
+                if hasattr(mod, "get_core_settings_buttons"):
+                    plugins.core_settings_buttons.append(mod.get_core_settings_buttons)
                 if hasattr(mod, "on_startup"):
                     plugins.startup_tasks.append(mod.on_startup)
                     
@@ -117,22 +119,38 @@ async def generate_settings_menu_content():
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_models"), callback_data="set_edit_models")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_tz"), callback_data="set_edit_tz")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_yt_cookies_menu"), callback_data="yt_cookies_menu")])
+    for btn_func in plugins.core_settings_buttons:
+        extra_buttons = await btn_func()
+        if extra_buttons:
+            kb.inline_keyboard.extend(extra_buttons)
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_full_reset"), callback_data="full_reset")])
             
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")])
     return text, kb
 
-@dp.callback_query(F.data.in_({"chats_list", "chats_refresh"}))
+@dp.callback_query(F.data.in_({"chats_list", "chats_refresh"}) | F.data.startswith("chats_page_") | F.data.startswith("chats_refresh_"))
 async def cb_chats_list(call: types.CallbackQuery, state: FSMContext):
     text = _("menu_chats_list")
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     
-    dialogs = await chat_directory.get_dialogs(userbot_app, force=call.data == "chats_refresh")
-    for chat_id, name in dialogs:
-        kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_chat_name", name=name), callback_data=f"chat_{chat_id}")])
+    force=call.data.startswith('chats_refresh')
+    try:page=max(0,int(call.data.rsplit('_',1)[1]))
+    except ValueError:page=0
+    dialogs = await chat_directory.get_dialogs(userbot_app, force=force, page=page)
+    page=min(page,max(0,(len(dialogs)-1)//10))
+    for chat_id, name in dialogs[page*10:page*10+10]:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_chat_name", name=name[:60]), callback_data=f"chat_{chat_id}")])
     if not dialogs:
         text += "\n\n" + _("menu_chats_unavailable")
-    kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_menu_refresh"), callback_data="chats_refresh")])
+    pages=max(1,(len(dialogs)+9)//10)
+    if len(dialogs)>10 or chat_directory.has_more:
+        nav=[]
+        if page>0:nav.append(InlineKeyboardButton(text='‹',callback_data=f'chats_page_{page-1}'))
+        nav.append(InlineKeyboardButton(text=f'{page+1}/{pages}' + ('+' if chat_directory.has_more else ''),callback_data=f'chats_page_{page}'))
+        if page+1<pages or chat_directory.has_more:nav.append(InlineKeyboardButton(text='›',callback_data=f'chats_page_{page+1}'))
+        kb.inline_keyboard.append(nav)
+    if chat_directory.has_more:text+='\n\n'+_('menu_chats_more_loading')
+    kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_menu_refresh"), callback_data=f"chats_refresh_{page}")])
 
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")])
     
@@ -166,9 +184,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
     config = await plugins.db.get_global_config()
     
     if not config.admin_id:
-        await plugins.db.update_global_config(admin_id=message.from_user.id)
+        if not await plugins.db.claim_owner(message.from_user.id):
+            return await message.answer(_("auth_not_authorized"))
         config.admin_id = message.from_user.id
-        logging.info("[Auth] Admin claimed: %s", message.from_user.id)
+        logging.info("[Auth] Owner assigned on first start")
         
     if message.from_user.id != config.admin_id:
         return await message.answer(_("auth_not_authorized"))
@@ -245,6 +264,11 @@ async def start_userbot(session_string):
             logging.error("[Core] Module startup failed: %s", e)
 
     await userbot_app.start()
+    if getattr(plugins,'bot',None):
+        from core.environment import mark_ready
+        me=getattr(userbot_app,'me',None)
+        account_name=' '.join(filter(None,(getattr(me,'first_name',None),getattr(me,'last_name',None))))
+        mark_ready(plugins.bot.id,getattr(me,'id',None),(await plugins.bot.me()).username,account_name)
     logging.info("[Core] Userbot started")
 
 async def stop_userbot():
@@ -301,6 +325,8 @@ async def userbot_health_monitor():
                         logging.error("[Health] Failed to cancel task %s: %s", chat_id, e)
 
 async def main():
+    from core.diagnostics import install
+    install()
     await init_db()
     
     plugins.bot = bot
@@ -333,7 +359,9 @@ async def main():
     asyncio.create_task(plugins.cleanup_media_cache())
     
     from core.environment import mark_ready
-    mark_ready(bot.id, getattr(getattr(userbot_app, "me", None), "id", None), (await bot.me()).username)
+    me=getattr(userbot_app,'me',None)
+    account_name=' '.join(filter(None,(getattr(me,'first_name',None),getattr(me,'last_name',None))))
+    mark_ready(bot.id, getattr(me, "id", None), (await bot.me()).username, account_name)
     logging.info("[Core] Polling started")
     await dp.start_polling(bot)
 

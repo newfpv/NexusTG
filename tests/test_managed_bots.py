@@ -33,34 +33,31 @@ class ManagedTests(unittest.IsolatedAsyncioTestCase):
         return p
 
     async def test_management_only_primary_and_only_its_owner(self):
-        self.assertTrue(await ui.get_settings_buttons())
+        self.assertTrue(await ui.get_core_settings_buttons())
         self.assertTrue(await ui.allowed(7,7))
         self.assertFalse(await ui.allowed(8,8));self.assertFalse(await ui.allowed(7,8))
         with patch.dict(os.environ,{'NEXUS_ACCOUNT_ROLE':'worker','NEXUS_ACCOUNT_NAME':'second'}):
-            self.assertFalse(await ui.get_settings_buttons())
+            self.assertFalse(await ui.get_core_settings_buttons())
             self.call.data='managed_disable_main'
             await ui.callbacks(self.call,self.state)
             self.edit.assert_not_awaited()
             with self.assertRaises(PermissionError):service.create_account(TOKEN,12345,'other_bot',8)
 
-    async def test_add_assigns_owner_and_copies_no_parent_data(self):
+    async def test_add_leaves_owner_for_first_start_and_copies_no_parent_data(self):
         await ui.callbacks(self.call,self.state)
         with patch.object(ui,'validate_token',AsyncMock(return_value=NS(id=12345,username='other_bot'))):
             await ui.receive_token(self.message,self.state)
         self.message.delete.assert_awaited_once()
-        self.call.data='managed_owner_self';await ui.callbacks(self.call,self.state)
         p=self.root/'bot_12345';cfg=json.loads((p/'account.json').read_text())
-        self.assertEqual(cfg['owner_id'],7)
+        self.assertNotIn('owner_id',cfg)
         self.assertEqual(list((p/'data').iterdir()),[])
         self.assertEqual(stat.S_IMODE((p/'.env').stat().st_mode),0o600)
         self.assertIsNone((await self.state.get_data())['managed_token'])
         for call in self.edit.await_args_list:
             self.assertNotIn(TOKEN,call.args[2]);self.assertNotIn('secret-ai-key',call.args[2])
 
-    async def test_another_owner_can_be_assigned_by_forward(self):
-        await self.state.update_data(managed_token=TOKEN,managed_id=12345,managed_username='other_bot')
-        self.message.text=None;self.message.forward_origin=NS(sender_user=NS(id=99,is_bot=False))
-        await ui.receive_owner(self.message,self.state)
+    async def test_explicit_owner_still_supported_for_existing_cli_workflows(self):
+        service.create_account(TOKEN,12345,'other_bot',99)
         cfg=json.loads((self.root/'bot_12345/account.json').read_text())
         self.assertEqual(cfg['owner_id'],99)
 
@@ -76,7 +73,8 @@ class ManagedTests(unittest.IsolatedAsyncioTestCase):
         (self.root/'runtime.json').write_text('{"mode":"shared"}')
         await ui.show_stats(self.message,self.state)
         text=self.edit.await_args.args[2]
-        self.assertIn('@public_bot',text)
+        buttons=self.edit.await_args.args[3]
+        self.assertTrue(any('@public_bot' in b.text for row in buttons.inline_keyboard for b in row))
         self.assertNotIn('second',text);self.assertNotIn('999',text)
 
     async def test_duplicate_token_never_creates_another_profile(self):
