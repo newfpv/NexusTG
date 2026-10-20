@@ -116,3 +116,11 @@ Parts of NexusTG's methods and development approach were inspired by [SpyBot](ht
 The latest tagged release is **v2.2.1**. The `main` branch includes additional post-release Text Structurer and Voice Transcriber fixes. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+## Guided setup and independent accounts
+
+After Telegram login, a resumable 25-step wizard explains every settings section, including prompts, history, cookies and modules. Reopen it from Settings > Guided setup.
+
+Linux servers can run independent accounts from one installation with preloaded dependencies and shared memory pages. Each account has a separate process, environment, database, Telegram session, archive and media directory. A single account runs directly without an extra supervisor process.
+
+See [installation, adding accounts and migration](docs/accounts.md).

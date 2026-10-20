@@ -1,0 +1,20 @@
+name: nexustg-accounts
+services:
+  accounts:
+    build: .
+    image: nexustg:accounts
+    container_name: NexusTG_Accounts
+    restart: unless-stopped
+    command: ["python", "account_runtime.py", "--root", "/accounts", "--code-root", "/app"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./accounts:/accounts
+    stop_grace_period: 15s
+    mem_limit: ${NEXUS_MEMORY_LIMIT:-1536m}
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"

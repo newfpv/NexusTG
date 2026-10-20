@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 import aiohttp
 from google.genai import types
+from core.shared_resources import media_slot
 
 INLINE_LIMIT = 4 * 1024 * 1024
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -41,7 +42,8 @@ async def bounded_media_request(path):
     if path:
         request_slots()
         async with _loop_slots[asyncio.get_running_loop()][2]:
-            yield
+            async with media_slot():
+                yield
     else:
         yield
 

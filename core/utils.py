@@ -288,6 +288,8 @@ def safe_userbot_handler(func):
 async def safe_edit(message: types.Message, state: FSMContext, text: str, reply_markup=None, parse_mode="HTML"):
     if not menu_request_is_current():
         return
+    from modules.setup_wizard import attach_navigation
+    reply_markup = attach_navigation(reply_markup)
     data = await state.get_data()
     menu_msg_id = data.get("menu_msg_id")
     bot = plugins.bot

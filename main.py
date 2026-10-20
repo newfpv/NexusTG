@@ -6,12 +6,12 @@ import inspect
 import html
 import zoneinfo
 from datetime import datetime
-from dotenv import load_dotenv
+from core.environment import load_environment
 import time
 
 logging.basicConfig(level=logging.INFO, force=True)
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
-load_dotenv(override=True)
+load_environment()
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -36,6 +36,8 @@ API_HASH = os.getenv("API_HASH")
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(auth_router)
+from modules.setup_wizard import WizardNavigationMiddleware
+bot.session.middleware(WizardNavigationMiddleware(dp.storage))
 dp.callback_query.middleware(MenuMiddleware())
 bot.session.middleware(CallbackAckTracker())
 userbot_app = None
@@ -107,6 +109,7 @@ async def generate_settings_menu_content():
     text = _("menu_settings_title")
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     
+    kb.inline_keyboard.append([InlineKeyboardButton(text=_("wizard_menu_button"), callback_data="wizard_start")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("api_section_title"), callback_data="set_edit_keys")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_models"), callback_data="set_edit_models")])
     kb.inline_keyboard.append([InlineKeyboardButton(text=_("btn_edit_tz"), callback_data="set_edit_tz")])
@@ -174,6 +177,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_login_userbot"), callback_data="auth_start")]])
         await safe_edit(message, state, _("setup_configured_not_logged"), kb)
     else:
+        from modules import setup_wizard
+        wizard_cfg = await plugins.db.get_module_cfg("setup_wizard")
+        if wizard_cfg.get("active"):
+            return await setup_wizard.begin(message, state)
         text, kb = await generate_main_menu_content()
         await safe_edit(message, state, text, kb)
 
@@ -318,6 +325,8 @@ async def main():
     asyncio.create_task(userbot_health_monitor())
     asyncio.create_task(plugins.cleanup_media_cache())
     
+    from core.environment import mark_ready
+    mark_ready(bot.id, getattr(getattr(userbot_app, "me", None), "id", None))
     logging.info("[Core] Polling started")
     await dp.start_polling(bot)
 

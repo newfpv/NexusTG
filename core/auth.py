@@ -171,6 +171,10 @@ async def _finish_authorized_client(client: Client, phone: str, message, state: 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_back_main"), callback_data="main_menu")]])
     await safe_edit(message, state, _("auth_success_restart"), kb, parse_mode="HTML")
     await state.set_state(None)
+    from modules.setup_wizard import begin
+    wizard_cfg = await plugins.db.get_module_cfg("setup_wizard")
+    if not wizard_cfg.get("completed", False):
+        await begin(message, state)
 
 @router.callback_query(F.data == "setup_ready")
 async def setup_ready(call: types.CallbackQuery, state: FSMContext):
@@ -209,16 +213,15 @@ async def setup_api_keys(message: types.Message, state: FSMContext):
 @router.message(SetupFSM.tz)
 async def setup_timezone(message: types.Message, state: FSMContext):
     try: await message.delete()
-    except: pass
-    new_tz = message.text.strip()
+    except Exception: pass
+    new_tz = (message.text or "").strip()
     try:
         zoneinfo.ZoneInfo(new_tz)
-        await plugins.db.update_global_config(tz=new_tz)
-        await state.set_state(SetupFSM.yt_cookies)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=_("btn_skip"), callback_data="skip_yt_setup")]])
-        await safe_edit(message, state, _("setup_ask_yt_cookies"), kb, parse_mode="HTML")
-    except Exception:
-        await safe_edit(message, state, _("tz_error_setup"), parse_mode="HTML")
+    except (ValueError, KeyError):
+        return await safe_edit(message, state, _("tz_error_setup"), parse_mode="HTML")
+    await plugins.db.update_global_config(tz=new_tz)
+    # Optional cookies and the remaining settings are covered after Telegram login.
+    await finish_setup(message, state)
 
 @router.message(SetupFSM.yt_cookies, F.document)
 async def setup_yt_cookies(message: types.Message, state: FSMContext):

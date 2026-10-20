@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import re
-from dotenv import load_dotenv
+from core.environment import load_environment
 
-load_dotenv(override=True)
+load_environment()
 
 class AFCFilter(logging.Filter):
     def filter(self, record):
@@ -23,6 +23,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 LANG_FILE = os.getenv("LANG_FILE", "language_RU.json")
+if not os.path.isabs(LANG_FILE) and not os.path.isfile(LANG_FILE) and os.getenv("NEXUS_CODE_ROOT"):
+    LANG_FILE = os.path.join(os.environ["NEXUS_CODE_ROOT"], LANG_FILE)
+
 DB_PATH = "sqlite+aiosqlite:///data/core_database.db"
 
 os.makedirs("data", exist_ok=True)

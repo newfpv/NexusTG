@@ -75,6 +75,24 @@ else
     echo -e "${GREEN}✔ Docker is ready!${NC}"
 fi
 
+# Optional Linux multi-account mode; a single account uses no supervisor process.
+if [ "${1:-}" = "--accounts" ]; then
+    if [ -f "$INSTALL_DIR/data/core_database.db" ]; then
+        echo "Existing account detected. Use accounts.py adopt with its container name; see docs/accounts.md."
+        exit 1
+    fi
+    if ! command -v python3 &> /dev/null; then
+        sudo apt-get install -y python3
+    fi
+    if [ -d "$INSTALL_DIR/accounts/main" ]; then
+        sudo python3 accounts.py start
+    else
+        sudo python3 accounts.py add main
+    fi
+    echo "Open your bot in Telegram and send /start. Add another with: sudo python3 accounts.py add NAME"
+    exit 0
+fi
+
 draw_progress_bar 4 "Configuring your bot..."
 
 LANG_FILES=(language_*.json)

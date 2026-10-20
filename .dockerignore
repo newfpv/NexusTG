@@ -7,3 +7,7 @@ __pycache__/
 *.session*
 .sixth
 *.bak
+
+# Independent account profiles and generated mounts
+/accounts
+.accounts.mounts.json
