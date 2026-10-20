@@ -1,7 +1,7 @@
 from core.durable_cleanup import delete_batch, recover as recover_cleanup
 _cleanup_task = None
 from core.job_queue import serial_events
-from core.telegram_guard import delivery_failure
+from core.telegram_guard import delivery_failure, retain_result, delivery_context
 import os
 import re
 import asyncio
@@ -22,6 +22,22 @@ router = Router()
 MODULE_NAME = "text_struct"
 BATCH_FIX_MAX_MESSAGES = 20
 BATCH_FIX_FETCH_LIMIT = 100
+STRUCT_GENERATION_TIMEOUT = 180.0
+
+async def _generate_struct_response(*args, **kwargs):
+    return await asyncio.wait_for(generate_ai_response(*args, **kwargs),timeout=STRUCT_GENERATION_TIMEOUT)
+
+
+def _split_plain(text, limit):
+    parts=[];current=[];length=0
+    for char in text:
+        width=2 if ord(char)>0xffff else 1
+        if current and length+width>limit:
+            parts.append(''.join(current));current=[];length=0
+        current.append(char);length+=width
+    if current:parts.append(''.join(current))
+    return parts
+
 
 class TextStructFSM(StatesGroup):
     wait_cmd = State()
@@ -109,7 +125,7 @@ async def _transcribe_struct_media(client: Client, message: Message, file_stem: 
             file_name=f"data/{safe_stem}{_media_ext(message)}",
             timeout=90.0,
         )
-        text = await transcribe_media(media_path)
+        text = await asyncio.wait_for(transcribe_media(media_path),timeout=STRUCT_GENERATION_TIMEOUT)
         if not text or text == _("status_waiting"):
             return ""
         return text.strip()
@@ -272,45 +288,64 @@ async def ts_save_input(message: types.Message, state: FSMContext):
     await state.set_state(None)
     await _ret_menu(message, state)
 
-async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str):
-    ai_ok = bool(ai_text and ai_text != "⏳" and ai_text != _("status_waiting"))
-    if not ai_ok:
-        logging.warning("[Struct] AI returned empty or waiting status, applying fallback error text")
-        html_text = f"{original_text}\n\n{_('ts_error')}"
-        fallback_text = html_text
-    else:
-        logging.debug("[Struct] Formatting AI text to HTML")
-        html_text = md_to_html(ai_text)
-        fallback_text = ai_text
-
-    no_preview = LinkPreviewOptions(is_disabled=True)
-
-    try:
+async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str, client=None):
+    ai_ok=bool(ai_text and ai_text not in ('⏳',_('status_waiting'),_('err_no_api_keys')))
+    plain=ai_text if ai_ok else f"{original_text}\n\n{_('ts_error')}"
+    formatted=md_to_html(ai_text) if ai_ok else md_to_html(plain)
+    cap=900 if msg_to_edit.media else 3600
+    chunks=_split_plain(plain,cap)
+    if not chunks:return False
+    retained=retain_result(f'struct:{msg_to_edit.chat.id}:{msg_to_edit.id}',plain)
+    token=delivery_context.set('struct-result')
+    no_preview=LinkPreviewOptions(is_disabled=True)
+    client=client or getattr(msg_to_edit,'_client',None)
+    async def edit(value,mode):
         if msg_to_edit.media:
-            await msg_to_edit.edit_caption(html_text, parse_mode=enums.ParseMode.HTML)
-        else:
-            await msg_to_edit.edit_text(html_text, parse_mode=enums.ParseMode.HTML, link_preview_options=no_preview)
-        logging.info(f"[Struct] Successfully applied edit to message {msg_to_edit.id}")
-        return ai_ok
-    except Exception as e:
-        if delivery_failure(e):raise
-        logging.warning(f"[Struct] Failed to edit message with HTML parse mode: {e}. Attempting fallback.")
+            return await msg_to_edit.edit_caption(value,parse_mode=mode)
+        return await msg_to_edit.edit_text(value,parse_mode=mode,link_preview_options=no_preview)
+    async def send(value,mode):
+        if client is None:raise RuntimeError('No client available for structured result delivery')
+        return await client.send_message(chat_id=msg_to_edit.chat.id,text=value,parse_mode=mode,
+            link_preview_options=no_preview,message_thread_id=getattr(msg_to_edit,'message_thread_id',None))
+    try:
+        # Large results must not be retried as another oversized edit. Plain
+        # chunks respect UTF-16 limits and cannot split an HTML entity/tag.
+        single=len(formatted.encode('utf-16-le'))//2<=cap
+        first=formatted if single else chunks[0]
+        mode=enums.ParseMode.HTML if single else enums.ParseMode.DISABLED
         try:
-            if msg_to_edit.media:
-                await msg_to_edit.edit_caption(fallback_text)
-            else:
-                await msg_to_edit.edit_text(fallback_text, link_preview_options=no_preview)
-            logging.info(f"[Struct] Successfully applied fallback edit to message {msg_to_edit.id}")
-            return ai_ok
-        except Exception as fallback_e:
-            logging.error(f"[Struct] Critical failure during message editing: {fallback_e}")
-            return False
+            await edit(first,mode)
+        except Exception as exc:
+            if delivery_failure(exc):raise
+            missing=type(exc).__name__ in {'MessageIdInvalid','MessageEditTimeExpired','MessageAuthorRequired'}
+            if not missing:
+                try:await edit(chunks[0],enums.ParseMode.DISABLED)
+                except Exception as fallback:
+                    if delivery_failure(fallback):raise
+                    if type(fallback).__name__ not in {'MessageIdInvalid','MessageEditTimeExpired','MessageAuthorRequired'}:raise
+                    missing=True
+            if missing:
+                await send(chunks[0],enums.ParseMode.DISABLED)
+            single=False
+        if not single:
+            for chunk in chunks[1:]:await send(chunk,enums.ParseMode.DISABLED)
+        retained.unlink(missing_ok=True)
+        logging.info('[Struct] Structured result delivered')
+        return ai_ok
+    finally:
+        delivery_context.reset(token)
+
 
 def register_userbot(app: Client):
     global _cleanup_task
     if _cleanup_task and not _cleanup_task.done():_cleanup_task.cancel()
     _cleanup_task=asyncio.create_task(recover_cleanup(app),name='batch-cleanup-recovery')
-    @app.on_message(filters.me & (filters.text | filters.caption), group=-5)
+    async def struct_command_filter(flt,client,message):
+        cfg=await _get_cfg()
+        command=str(cfg.get('command') or '.fix').strip()
+        return bool(cfg.get('is_active') and re.match(rf'^{re.escape(command)}(?:\s+|$)',_extract_message_text(message)))
+
+    @app.on_message(filters.me & (filters.text | filters.caption) & filters.create(struct_command_filter), group=-5)
     @safe_userbot_handler
     @serial_events
     async def handle_struct_cmd(client: Client, message: Message):
@@ -357,14 +392,14 @@ def register_userbot(app: Client):
                     raise ValueError("batch source text is empty")
 
                 prompt_to_use = _build_batch_prompt(cfg.get("prompt"), modifier_prompt)
-                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+                ai_text = await _generate_struct_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed for batch fix: {e}")
                 ai_text = None
             finally:
                 typing_task.cancel()
 
-            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text)
+            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text, client=client)
             if edit_success:
                 await _delete_source_messages(source_messages)
             return
@@ -378,23 +413,23 @@ def register_userbot(app: Client):
             
             try:
                 if message.media:
-                    await message.edit_caption(query)
+                    await message.edit_caption(_("ts_processing")+"\n\n"+query)
                 else:
-                    await message.edit_text(query, link_preview_options=LinkPreviewOptions(is_disabled=True))
+                    await message.edit_text(_("ts_processing")+"\n\n"+query, link_preview_options=LinkPreviewOptions(is_disabled=True))
             except Exception as e:
                 logging.debug(f"[Struct] Pre-edit failed: {e}")
 
             logging.info("[Struct] Generating structured response for self message")
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             try:
-                ai_text = await generate_ai_response(query, custom_prompt=cfg.get("prompt"), search_enabled=False)
+                ai_text = await _generate_struct_response(query, custom_prompt=cfg.get("prompt"), search_enabled=False)
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed: {e}")
                 ai_text = None
             finally:
                 typing_task.cancel()
 
-            await _apply_edit(message, query, ai_text)
+            await _apply_edit(message, query, ai_text, client=client)
             return
 
         target_msg = message.reply_to_message
@@ -420,14 +455,14 @@ def register_userbot(app: Client):
                 text_to_process = await _transcribe_struct_media(client, target_msg)
                 if not text_to_process:
                     raise ValueError("media transcription returned empty text")
-                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+                ai_text = await _generate_struct_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed for media message: {e}")
                 ai_text = None
             finally:
                 typing_task.cancel()
 
-            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text)
+            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text, client=client)
             if edit_success:
                 try:
                     await target_msg.delete()
@@ -451,38 +486,39 @@ def register_userbot(app: Client):
 
         if is_ours:
             try:
-                await message.delete()
-                logging.debug("[Struct] Trigger message deleted successfully")
+                await message.edit_text(_("ts_processing"),link_preview_options=LinkPreviewOptions(is_disabled=True))
             except Exception as e:
                 logging.debug(f"[Struct] Failed to delete trigger message: {e}")
 
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             try:
-                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+                ai_text = await _generate_struct_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed for our message: {e}")
                 ai_text = None
             finally:
                 typing_task.cancel()
 
-            await _apply_edit(target_msg, text_to_process, ai_text)
+            await _apply_edit(target_msg, text_to_process, ai_text, client=client)
+            try:await message.delete()
+            except Exception:logging.debug('[Struct] Could not remove completed command')
             
         else:
             try:
                 if message.media:
-                    await message.edit_caption(text_to_process)
+                    await message.edit_caption(_("ts_processing")+"\n\n"+text_to_process)
                 else:
-                    await message.edit_text(text_to_process, link_preview_options=LinkPreviewOptions(is_disabled=True))
+                    await message.edit_text(_("ts_processing")+"\n\n"+text_to_process, link_preview_options=LinkPreviewOptions(is_disabled=True))
             except Exception as e:
                 logging.debug(f"[Struct] Pre-edit failed for others message: {e}")
 
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             try:
-                ai_text = await generate_ai_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
+                ai_text = await _generate_struct_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed for other's message: {e}")
                 ai_text = None
             finally:
                 typing_task.cancel()
 
-            await _apply_edit(message, text_to_process, ai_text)
+            await _apply_edit(message, text_to_process, ai_text, client=client)

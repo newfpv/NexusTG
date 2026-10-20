@@ -1130,6 +1130,16 @@ async def process_reply(client, message, force=False):
             logging.info(_("log_llm_res_main", reply=reply[:200] + "..."))
 
         reply_upper = reply.upper().strip()
+        # Reaction-only replies return early below, so acknowledge the
+        # processed message before either a reaction or a textual response.
+        # A newer incoming message must keep its own unread state.
+        if re.sub(r'(?i)\[LIKE\]', '', reply).strip() or ('[LIKE]' in reply_upper and not force):
+            try:
+                await client.read_chat_history(chat_id, max_id=message.id)
+            except FloodWait:
+                raise
+            except Exception as e:
+                logging.debug(f"read_chat_history error: {e}")
         if reply_upper.startswith("[LIKE]") and not force:
             try: 
                 await client.send_reaction(chat_id=chat_id, message_id=message.id, emoji=(int(g_cfg["reaction"]) if g_cfg["reaction"].isdigit() else g_cfg["reaction"]))
@@ -1156,13 +1166,6 @@ async def process_reply(client, message, force=False):
         if not reply:
             set_reply_status(chat_id, "no_text" if force else "reaction")
             return 
-
-        try:
-            await client.read_chat_history(chat_id)
-        except FloodWait:
-            raise
-        except Exception as e:
-            logging.debug(f"read_chat_history error: {e}")
 
         c_db_min = c_cfg["db_min"] if c_cfg["db_min"] is not None else g_cfg["db_min"]
         c_db_max = c_cfg["db_max"] if c_cfg["db_max"] is not None else g_cfg["db_max"]

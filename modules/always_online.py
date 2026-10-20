@@ -14,7 +14,8 @@ from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
-from pyrogram.raw.functions.account import UpdateStatus
+from pyrogram.raw.functions.account import UpdateStatus, GetPrivacy
+from pyrogram.raw.types import InputPrivacyKeyStatusTimestamp
 
 from core.config import _
 from core.utils import plugins, safe_edit
@@ -53,6 +54,7 @@ async def _heartbeat(app):
     observed = None
     inspect_at = 0
     metrics = {}
+    successful_updates = 0
     while app is userbot_app:
         low, high = heartbeat_range(recommendation, observed)
         delay = random.uniform(low, high)
@@ -73,16 +75,31 @@ async def _heartbeat(app):
                         config_at=time.time())
                 await app.invoke(UpdateStatus(offline=False), sleep_threshold=0)
                 failures = 0
+                successful_updates += 1
+                low,high=heartbeat_range(recommendation,observed)
+                metrics.update(interval_min_seconds=low,interval_max_seconds=high,
+                    last_status_update_at=time.time(),successful_updates=successful_updates,updated_at=time.time())
+                _save_presence(metrics)
                 if time.time() >= inspect_at:
-                    users = await app.invoke(GetUsers(id=[InputUserSelf()]), sleep_threshold=0)
-                    status = getattr(users[0], 'status', None) if users else None
-                    expires = getattr(status, 'expires', None)
-                    if expires:
-                        # Server clock is derived from help.getConfig rather
-                        # than assuming the host's wall clock is identical.
-                        observed = max(0, int(expires) - (server_now + int(time.time()-metrics['config_at'])))
-                        metrics['observed_expiry_seconds'] = observed
                     inspect_at = time.time()+3600
+                    try:
+                        async with asyncio.timeout(10):
+                            users = await app.invoke(GetUsers(id=[InputUserSelf()]),sleep_threshold=0)
+                            status=getattr(users[0],'status',None) if users else None
+                            metrics['observed_status_type']=type(status).__name__
+                            expires=getattr(status,'expires',None)
+                            if expires:
+                                observed=max(0,int(expires)-(server_now+int(time.time()-metrics['config_at'])))
+                                metrics['observed_expiry_seconds']=observed
+                                metrics['observed_expires_at']=int(expires)
+                            privacy=await app.invoke(GetPrivacy(key=InputPrivacyKeyStatusTimestamp()),sleep_threshold=0)
+                            metrics['privacy_rule_types']=[type(rule).__name__ for rule in getattr(privacy,'rules',[])]
+                    except FloodWait:
+                        raise
+                    except Exception as exc:
+                        # Optional inspection must not turn a successful status
+                        # update into a five-minute heartbeat failure/backoff.
+                        logging.warning('[Always Online] Optional status inspection failed: %s',type(exc).__name__)
                 low, high = heartbeat_range(recommendation, observed)
                 metrics.update(interval_min_seconds=low, interval_max_seconds=high, updated_at=time.time())
                 _save_presence(metrics)
