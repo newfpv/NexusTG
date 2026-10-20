@@ -264,3 +264,21 @@ async def init_db():
             await conn.commit()
         except Exception:
             pass
+
+    await bind_profile_owner()
+
+
+async def bind_profile_owner():
+    """Bind new profiles before any controller update can claim the account."""
+    owner_id = int(os.environ.get("NEXUS_PROFILE_OWNER_ID") or 0)
+    if not owner_id:
+        return
+    async with AsyncSessionLocal() as session:
+        cfg = await session.get(GlobalConfig, 1)
+        if cfg is None:
+            session.add(GlobalConfig(id=1, admin_id=owner_id))
+        elif cfg.admin_id not in (None, owner_id):
+            raise RuntimeError("Profile owner does not match its database")
+        else:
+            cfg.admin_id = owner_id
+        await session.commit()

@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from core.managed_accounts import atomic_json, manager_name, public_status, read_json
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9_-]{0,39}$')
 DEPENDENCIES = ('aiogram', 'pyrogram', 'sqlalchemy', 'google.genai', 'aiohttp',
@@ -69,8 +70,12 @@ def run_worker(profile, code_root):
     os.chdir(profile)
     for key in ('TG_BOT_TOKEN', 'API_ID', 'API_HASH', 'LANG_FILE'):
         os.environ.pop(key, None)
+    root=profile.parent
+    metadata=read_json(profile/'account.json')
     os.environ.update(NEXUS_ENV_FILE=str(profile / '.env'), NEXUS_PROFILE_DIR=str(profile),
-                      NEXUS_CODE_ROOT=str(code_root), NEXUS_ACCOUNT_NAME=profile.name)
+                      NEXUS_CODE_ROOT=str(code_root), NEXUS_ACCOUNT_NAME=profile.name,
+                      NEXUS_ACCOUNTS_DIR=str(root), NEXUS_ACCOUNT_ROLE='manager' if manager_name(root)==profile.name else 'worker',
+                      NEXUS_PROFILE_OWNER_ID=str(metadata.get('owner_id') or ''))
     for name in ('core', 'modules'):
         link = profile / name
         if not link.exists():
@@ -87,8 +92,35 @@ def run_worker(profile, code_root):
     import main as application
     async def start():
         await application.bot.me()  # Validate this controller before declaring it ready.
-        await application.main()
-    asyncio.run(start())
+        if read_json(root/'runtime.json').get('mode')!='single' or manager_name(root)!=profile.name:
+            await application.main()
+            return False
+        async def promotion():
+            while True:
+                await asyncio.sleep(1)
+                if (root/'promote.request').exists() and len(read_profiles(root))>1:
+                    return
+        task=asyncio.create_task(application.main());watcher=asyncio.create_task(promotion())
+        done,_=await asyncio.wait([task,watcher],return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            watcher.cancel();await asyncio.gather(watcher,return_exceptions=True)
+            await task
+            return False
+        try:
+            if hasattr(application,'dp'):
+                async with asyncio.timeout(3):await application.dp.stop_polling()
+        except (RuntimeError,TimeoutError):pass
+        task.cancel();await asyncio.gather(task,return_exceptions=True)
+        if hasattr(application,'stop_userbot'):
+            try:
+                async with asyncio.timeout(5):await application.stop_userbot()
+            except Exception:pass
+        if hasattr(application.bot,'session'):await application.bot.session.close()
+        database=sys.modules.get('core.db')
+        if database is not None:
+            async with asyncio.timeout(5):await database.engine.dispose()
+        return True
+    return asyncio.run(start())
 
 
 class Supervisor:
@@ -189,6 +221,7 @@ class Supervisor:
                     for name, (profile, version) in desired.items():
                         if name not in self.workers and now >= self.retries.get(name, (0, 0))[1]:
                             self._start(name, profile, version)
+                    atomic_json(self.root/'status.json',public_status(self.root,self.workers))
                 for _, worker in list(self.workers.items()):
                     if worker['stop_at'] is not None and now - worker['stop_at'] > 10:
                         self._signal_worker(worker, signal.SIGKILL)
@@ -219,11 +252,19 @@ def main():
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     profiles = read_profiles(root)
+    if profiles and manager_name(root) is None:
+        primary='main' if 'main' in profiles else next(iter(profiles))
+        atomic_json(root/'manager.json',{'profile':primary})
+    (root/'promote.request').unlink(missing_ok=True)
     if len(profiles) == 1:
         name, (profile, _) = next(iter(profiles.items()))
         (root / 'runtime.json').write_text(json.dumps({'mode':'single','pid':os.getpid()}))
         print(f'[supervisor] Single account: {name}; no extra supervisor process', flush=True)
-        return run_worker(profile, args.code_root)
+        if run_worker(profile, args.code_root):
+            # Replace the direct worker only after its UI confirmed the addition.
+            # exec closes its clients; the new supervisor then starts both profiles.
+            os.execv(sys.executable,[sys.executable,str(Path(__file__).resolve()),'--root',str(root),'--code-root',args.code_root])
+        return
     shared = preload_dependencies()
     resource_root = root / '.resources'
     resource_root.mkdir(exist_ok=True)

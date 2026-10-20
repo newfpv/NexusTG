@@ -50,3 +50,13 @@ An offline three-account test with all modules imported measured about **387 MiB
 The Compose default memory ceiling is 1536 MiB for the whole group, not a reserved allocation. Set `NEXUS_MEMORY_LIMIT` in the installation `.env` to size it for the server. Do not lower it below measured peak load. `NEXUS_GLOBAL_MEDIA_SLOTS` can be set in the Compose environment to adjust the default of two heavy operations. Rotating Docker logs and per-account media caches remain enabled.
 
 For more accounts on a small server, first limit automatic video downloads, unused modules and history budgets. Keep enough disk space for archives and SQLite. CPU and network demand still grow with active conversations; idle account count alone cannot predict capacity.
+
+## Primary bot controls
+
+The first registered profile is the primary controller (`main` is preferred on existing installations). Its assignment is stored in `accounts/manager.json`. Only the primary bot's assigned Telegram owner sees or can use **Add bot** and **My bots**. Additional bots always run with the worker role, even if their environment file tries to override it.
+
+To add a bot, send its BotFather token as text or a small `.txt` file. The token message is deleted and the token is not echoed. Assign your own account or a different numeric Telegram owner ID; forwarding a message with a visible sender also works. Only that owner can initialize and configure the new bot. No keys, prompts, sessions or conversations are copied from the primary profile.
+
+The compact list shows public bot usernames and running/disabled status. Open an added bot's entry to enable, disable or restart it; disabling preserves all data. The primary bot cannot be disabled from this panel. The panel does not expose owner IDs, phone numbers, Telegram sessions, Gemini keys, settings or message contents, and does not read other profiles' conversation databases.
+
+Adding the second bot through Telegram briefly replaces the direct worker with the supervisor, then starts both profiles. Further additions start without restarting existing bots. The Linux installer uses this mode by default for fresh installations. Existing standalone Docker or native installations need the documented adoption step before using managed account controls.

@@ -162,7 +162,15 @@ fi
 
 echo -e "${YELLOW}⚡ Building and launching container (this might take a minute)...${NC}"
 
-sudo docker compose up -d --build
+if [ -f "$INSTALL_DIR/accounts/manager.json" ]; then
+    sudo python3 accounts.py update
+elif [ ! -f "$INSTALL_DIR/data/core_database.db" ]; then
+    if ! command -v python3 &> /dev/null; then sudo apt-get install -y python3; fi
+    sudo python3 accounts.py add main --env-file "$ENV_PATH"
+else
+    # Existing installations keep their current data mounts until explicitly adopted.
+    sudo docker compose up -d --build
+fi
 
 echo -e "\n${CYAN}====================================================${NC}"
 echo -e "${GREEN} 🎉 INSTALLATION COMPLETED SUCCESSFULLY! 🎉${NC}"
@@ -172,9 +180,16 @@ echo -e "${GREEN}📌 The bot is now running in the background via Docker.${NC}"
 echo -e "${DARKGRAY}You can safely close this terminal window.\n${NC}"
 
 echo -e "${CYAN}🛠️  HOW TO MANAGE YOUR BOT NOW:${NC}"
+if [ -f "$INSTALL_DIR/accounts/manager.json" ]; then
+    echo "Logs: cd ~/NexusTG && sudo python3 accounts.py logs -f"
+    echo "Add bots: use Add bot in your primary Telegram bot (owner only)."
+    echo "Stop: cd ~/NexusTG && sudo python3 accounts.py stop"
+else
 echo -e "1. ${YELLOW}View Logs:${NC}      cd ~/NexusTG && sudo docker compose logs -f"
 echo -e "2. ${YELLOW}Restart Bot:${NC}    cd ~/NexusTG && sudo docker compose restart"
 echo -e "3. ${YELLOW}Stop Bot:${NC}       cd ~/NexusTG && sudo docker compose down\n"
+fi
+
 echo -e "👉 Open Telegram and send /start to your bot."
 echo -e "👉 After pressing the button, wait a minute. The bot creates a database."
 

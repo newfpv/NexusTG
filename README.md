@@ -117,6 +117,12 @@ The latest tagged release is **v2.2.1**. The `main` branch includes additional p
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 
+## Primary bot and independent added bots
+
+Fresh Linux installations create the primary bot with owner-only **Add bot** and **My bots** buttons. Add another BotFather token, assign its owner, and let that owner open the new bot to complete setup. Added bots never receive bot-management controls. Statistics show only public bot usernames, counts and operating status; they do not include user IDs, phone numbers, API keys, conversations or account settings.
+
+For a manual Linux installation, run `python3 accounts.py add main` and then `/start` in that bot. Existing standalone installations can migrate with `accounts.py adopt`; see [account management](docs/accounts.md). Native Windows single-account startup remains available.
+
 ## Guided setup and independent accounts
 
 After Telegram login, a resumable 25-step wizard explains every settings section, including prompts, history, cookies and modules. Reopen it from Settings > Guided setup.

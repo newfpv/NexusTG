@@ -90,6 +90,9 @@ def add_account(name, raw_env, start_bot=True, enabled=True):
     (target/'data').mkdir(mode=0o700)
     write_private(target/'.env', raw_env.rstrip()+'\n')
     write_config(target, {'enabled': enabled, 'generation': 0})
+    if not (ROOT/'manager.json').exists():
+        primary='main' if any(p.name=='main' for p in account_dirs()) else account_dirs()[0].name
+        (ROOT/'manager.json').write_text(json.dumps({'profile':primary}),encoding='utf-8')
     print(f'Created {name}. Open this Telegram bot and send /start; the setup wizard will guide you.')
     if start_bot:
         start(force=runtime_mode()=='single' and enabled_count()>1)

@@ -36,6 +36,9 @@ API_HASH = os.getenv("API_HASH")
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(auth_router)
+from core.owner_middleware import OwnerMiddleware
+dp.message.outer_middleware(OwnerMiddleware())
+dp.callback_query.outer_middleware(OwnerMiddleware())
 from modules.setup_wizard import WizardNavigationMiddleware
 bot.session.middleware(WizardNavigationMiddleware(dp.storage))
 dp.callback_query.middleware(MenuMiddleware())
@@ -208,7 +211,11 @@ async def start_userbot(session_string):
     if userbot_app:
         await userbot_app.stop()
     
-    userbot_app = Client("userbot", session_string=session_string, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+    account_config = await plugins.db.get_global_config()
+    account_api_id = account_config.api_id or API_ID
+    account_api_hash = account_config.api_hash or API_HASH
+    plugins.api_id, plugins.api_hash = account_api_id, account_api_hash
+    userbot_app = Client("userbot", session_string=session_string, api_id=account_api_id, api_hash=account_api_hash, in_memory=True)
 
     @userbot_app.on_message(filters.group & ~filters.me, group=-100)
     async def block_foreign_group_messages(_client, message):
@@ -326,7 +333,7 @@ async def main():
     asyncio.create_task(plugins.cleanup_media_cache())
     
     from core.environment import mark_ready
-    mark_ready(bot.id, getattr(getattr(userbot_app, "me", None), "id", None))
+    mark_ready(bot.id, getattr(getattr(userbot_app, "me", None), "id", None), (await bot.me()).username)
     logging.info("[Core] Polling started")
     await dp.start_polling(bot)
 
