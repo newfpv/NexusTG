@@ -83,13 +83,16 @@ The `./data` directory is mounted into the container and keeps the database, Tel
 | `.fact claim` | Search-backed fact check |
 | `.text` | Reply to supported audio/video media to transcribe it |
 | `.fix text` | Rewrite and structure text; the module is off by default |
-| `.fix 5` | Merge and structure up to five earlier messages (maximum 20) |
+| `.fix 5` | Process exactly five earlier messages, including attachments (maximum 20) |
+| `.fix 2 transcribe both conversations` | Read two earlier messages and apply the task after the count |
 | `.sum URL` | Summarize a YouTube video |
 | `.dl` | Reply to a supported TikTok/Instagram Reel URL to download it |
 | `.shop items` | Create or update a Telegram shopping checklist |
 | `.save` | Forward a replied message to a configured chat/topic |
 
 Commands and access rules are configurable. See the [complete module and settings reference](https://neewfpv.com/wiki/nexustg#commands).
+
+The `.fix` count includes text and attachments from either sender, in chronological order before the command in the same chat/topic. MP3 and other audio files also work when sent as documents. Photos, video, PDF and common text/Office documents are read before the final task runs. Unsupported files, missing messages and failed attachments stop the batch with an explicit error and preserve all sources; a caption alone never substitutes for an unread file. Large text extractions are rejected rather than silently truncated (256 KiB per text/Office file, 512 KiB of extracted batch text). A successful batch retains the existing behavior of replacing its source messages after the complete result is delivered.
 
 ## Operations
 
@@ -113,7 +116,7 @@ Parts of NexusTG's methods and development approach were inspired by [SpyBot](ht
 
 ## Version and license
 
-The latest tagged release is **v2.2.1**. The `main` branch includes additional post-release Text Structurer and Voice Transcriber fixes. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
+The latest tagged release is **v2.9.2**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 
