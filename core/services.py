@@ -694,7 +694,7 @@ async def download_context_media(client, message, file_name, timeout=MEDIA_DOWNL
         raise
 
 
-async def _describe_message_media(client, message, media_paths: list[str]) -> tuple[str, int, bool]:
+async def _describe_message_media(client, message, media_paths: list[str], on_progress=None) -> tuple[str, int, bool]:
     media_type = None
     duration = 0
     too_long = False
@@ -730,6 +730,8 @@ async def _describe_message_media(client, message, media_paths: list[str]) -> tu
 
     path = None
     try:
+        if on_progress:
+            on_progress('download', kind=media_type)
         path = await download_context_media(
             client,
             message,
@@ -738,6 +740,8 @@ async def _describe_message_media(client, message, media_paths: list[str]) -> tu
         )
         if path:
             media_paths.append(path)
+        if on_progress:
+            on_progress('recognize', kind=media_type)
         if media_type in {"voice", "video_note", "audio"}:
             description = await transcribe_media(path)
         else:
@@ -764,7 +768,16 @@ async def build_dialog_context(
     target_message=None,
     retain_target_media: list[str] | None = None,
     token_budget: int | None = None,
+    on_progress=None,
 ) -> tuple[str, list[str], int, bool]:
+    def report(phase, **details):
+        if on_progress:
+            try:
+                on_progress(phase, **details)
+            except Exception:
+                logging.warning('[Services] Progress observer failed', exc_info=False)
+
+    report('history')
     messages = []
     history_kwargs = {"limit": limit}
     if target_msg_id is not None:
@@ -796,6 +809,7 @@ async def build_dialog_context(
     messages.sort(key=lambda item: item.id)
     if limit > 0:
         messages = messages[-limit:]
+    report('prepare', messages=len(messages))
     media_paths: list[str] = []
     latest_media_duration = 0
     video_too_long = False
@@ -867,6 +881,18 @@ async def build_dialog_context(
     if structured:
         media_messages.reverse()  # Recognize the most recent attachments first.
     total_batches = (len(media_messages) + CONTEXT_MEDIA_BATCH_SIZE - 1) // CONTEXT_MEDIA_BATCH_SIZE
+    cached_ids = set(media_results)
+
+    def media_progress(phase, **details):
+        selected = {msg.id for msg in context_messages}
+        selected_media = [msg for msg in media_messages if msg.id in selected]
+        done = [msg.id for msg in selected_media if msg.id in media_results]
+        skipped = sum(media_results[mid][0] in {'', _('ai_msg_file'), _('status_waiting'), _('err_no_api_keys')}
+                      or media_results[mid][2] for mid in done)
+        report(phase, total=len(selected_media), done=len(done), cached=len(cached_ids & set(done)),
+               skipped=skipped, **details)
+
+    media_progress('media')
     for offset in range(0, len(media_messages), CONTEXT_MEDIA_BATCH_SIZE):
         allowed = {msg.id for msg in context_messages}
         batch = [msg for msg in media_messages[offset:offset + CONTEXT_MEDIA_BATCH_SIZE] if msg.id in allowed]
@@ -874,13 +900,22 @@ async def build_dialog_context(
             continue
         batch_paths = []
         batch_number = offset // CONTEXT_MEDIA_BATCH_SIZE + 1
+        batch_deadline = time.time() + CONTEXT_MEDIA_BATCH_TIMEOUT
         logging.info("[Services] Chat %s: media batch %s/%s (%s attachments)",
                      chat_id, batch_number, total_batches, len(batch))
 
         async def describe_batch(batch_messages, paths):
             for media_message in batch_messages:
                 if media_message.id not in media_results:
-                    media_results[media_message.id] = await _describe_message_media(client, media_message, paths)
+                    def item_progress(phase, **details):
+                        media_progress(phase, batch=batch_number, batches=total_batches,
+                                       deadline=batch_deadline, **details)
+                    if on_progress:
+                        media_results[media_message.id] = await _describe_message_media(
+                            client, media_message, paths, on_progress=item_progress)
+                    else:
+                        media_results[media_message.id] = await _describe_message_media(client, media_message, paths)
+                    item_progress('media')
 
         try:
             await asyncio.wait_for(describe_batch(batch, batch_paths), timeout=CONTEXT_MEDIA_BATCH_TIMEOUT)
@@ -901,6 +936,7 @@ async def build_dialog_context(
                     logging.warning("[Services] Could not remove context media %s", path, exc_info=True)
         if structured and batch_number % 5 == 0:
             await prune_history()
+    media_progress('pack')
     for msg in context_messages:
         sender = _message_sender(msg, chat_name)
         text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
@@ -933,4 +969,5 @@ async def build_dialog_context(
 
     history = (await _bounded_dialog_context(structured_records, target_msg_id, owner_id, chat_id, chat_name, token_budget)
                if structured else "\n".join(lines))
+    report('ready')
     return history, media_paths, latest_media_duration, video_too_long

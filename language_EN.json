@@ -554,8 +554,8 @@
     "btn_ai_force_reply": "▶️ Reply to latest messages",
     "btn_ai_refresh_status": "🔄 Refresh status",
     "ai_runtime_unknown": "📡 No incoming messages recorded in this chat since startup. Use “Reply to latest messages” to process a missed message.",
-    "ai_runtime_status": "📡 <b>Status:</b> {stage}\nLast received message: <code>{message_id}</code> ({age}s ago).\nSnapshot taken when this menu was refreshed.",
-    "ai_runtime_remaining": "\n⏱ Approximately {seconds}s remaining.",
+    "ai_runtime_status": "📡 <b>{stage}</b>\n#{message_id} · total {age}s",
+    "ai_runtime_remaining": "\n⏱ Pause: {seconds}s remaining.",
     "ai_force_disconnected": "Telegram account is disconnected.",
     "ai_force_busy": "A reply is already running or being sent. Refresh the status.",
     "ai_force_checking": "Checking recent messages…",
@@ -769,5 +769,27 @@
   "ts_batch_generating": "✨ Applying your task to {count} messages…",
   "media_download_error": "❌ Could not download the recording or attachment from Telegram. Transcription has not started. The source message was preserved — try the command again.",
   "managed_storage_delayed": "Archive usage calculation is taking longer. Refresh the list in a few seconds."
+},
+  "reply_progress": {
+    "ai_progress_history": " · history: {count} messages",
+    "ai_progress_counts": "\nMedia: {done}/{total} · cached {cached} · skipped {skipped}",
+    "ai_progress_changed": "\nLast change: {seconds}s ago.",
+    "ai_progress_batch_limit": "\nBatch timeout in {seconds}s.",
+    "ai_progress_generation_limit": "\nResponse wait limit: {seconds}s remaining (not an ETA).",
+    "ai_progress_eta_unknown": "\nCompletion time depends on the API.",
+    "ai_progress_snapshot": "\n↻ Snapshot: press Refresh status to update.",
+    "ai_progress_history_label": "Loading history",
+    "ai_progress_prepare": "Selecting history",
+    "ai_progress_media": "Processing attachments",
+    "ai_progress_download": "Downloading",
+    "ai_progress_recognize": "Recognizing",
+    "ai_progress_pack": "Building context",
+    "ai_progress_ready": "Context ready",
+    "ai_progress_target": "Preparing current attachment",
+    "ai_media_kind_photo": "photo",
+    "ai_media_kind_video": "video",
+    "ai_media_kind_voice": "voice message",
+    "ai_media_kind_video_note": "video note",
+    "ai_media_kind_audio": "audio"
 }
 }

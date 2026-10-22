@@ -101,6 +101,7 @@ def set_reply_status(chat_id, stage, message=None, seconds=0):
         "received_at": time.time() if message is not None else previous.get("received_at", time.time()),
         "updated_at": time.time(),
         "until": time.time() + seconds if seconds else None,
+        "progress": {},
     }
     logging.info("[AI Twin] Chat %s message %s: %s%s", chat_id,
                  reply_statuses[chat_id]["message_id"], stage,
@@ -111,14 +112,45 @@ def set_reply_status(chat_id, stage, message=None, seconds=0):
             reply_statuses.pop(oldest, None)
 
 
+def update_context_progress(chat_id, message_id, phase, **details):
+    status = reply_statuses.get(chat_id)
+    if not status or status['message_id'] != message_id or status['stage'] != 'context':
+        return
+    previous = status.get('progress', {})
+    progress = {**previous, **details, 'phase': phase}
+    if progress != previous:
+        progress['changed_at'] = time.time()
+    status['progress'] = progress
+
+
 def reply_status_text(chat_id):
     status = reply_statuses.get(chat_id)
     if not status:
         return _("ai_runtime_unknown")
-    text = _("ai_runtime_status", stage=_(f"ai_stage_{status['stage']}"),
+    stage = _(f"ai_stage_{status['stage']}")
+    progress = status.get('progress', {})
+    if status['stage'] == 'context' and progress:
+        stage = _('ai_progress_history_label' if progress['phase'] == 'history' else 'ai_progress_' + progress['phase'])
+        if progress.get('kind') and progress['phase'] in {'download', 'recognize'}:
+            stage += ' · ' + _('ai_media_kind_' + progress['kind'])
+    text = _("ai_runtime_status", stage=stage,
              message_id=status["message_id"], age=int(time.time() - status["received_at"]))
+    if status['stage'] == 'context' and progress:
+        if 'total' in progress:
+            text += _('ai_progress_counts', done=progress['done'], total=progress['total'],
+                      cached=progress['cached'], skipped=progress['skipped'])
+        elif 'messages' in progress:
+            text += _('ai_progress_history', count=progress['messages'])
+        text += _('ai_progress_changed', seconds=max(0, int(time.time()-progress.get('changed_at',status['updated_at']))))
+        if progress.get('deadline') and progress['phase'] in {'download', 'recognize', 'media'}:
+            text += _('ai_progress_batch_limit', seconds=max(0,int(progress['deadline']-time.time())))
+        text += _('ai_progress_eta_unknown')
     if status["until"]:
-        text += _("ai_runtime_remaining", seconds=max(0, int(status["until"] - time.time() + 0.999)))
+        key = 'ai_progress_generation_limit' if status['stage'] == 'generating' else 'ai_runtime_remaining'
+        text += _(key, seconds=max(0, int(status["until"] - time.time() + 0.999)))
+    if status['stage'] == 'generating':
+        text += _('ai_progress_changed', seconds=max(0,int(time.time()-status['updated_at'])))
+    text += _('ai_progress_snapshot')
     return text
 
 
@@ -1048,7 +1080,8 @@ async def process_reply(client, message, force=False):
                 client, chat_id, limit=AI_TWIN_HISTORY_LIMIT, target_msg_id=message.id,
                 chat_name=chat_name, played_media_ids=played_media_ids,
                 structured=True, target_message=message, retain_target_media=media_paths_to_cleanup,
-                token_budget=g_cfg.get("history_token_budget")
+                token_budget=g_cfg.get("history_token_budget"),
+                on_progress=lambda phase, **details: update_context_progress(chat_id, message.id, phase, **details)
             )
             media_paths_to_cleanup.extend(new_paths)
         except asyncio.TimeoutError:
@@ -1072,6 +1105,7 @@ async def process_reply(client, message, force=False):
         if (message.photo or message.video) and not live_media_path and not (
                 message.video and getattr(message.video, "duration", 0) > 600):
             try:
+                update_context_progress(chat_id, message.id, 'target')
                 ext = ".jpg" if message.photo else ".mp4"
                 live_media_path = await download_context_media(
                     client, message, file_name=f"data/live_{message.id}{ext}", timeout=300.0
@@ -1098,7 +1132,7 @@ async def process_reply(client, message, force=False):
                 logging.info(_("log_attached_live_media", path=live_media_path))
             logging.info("="*50)
 
-        set_reply_status(chat_id, "generating")
+        set_reply_status(chat_id, "generating", seconds=1200)
         try:
             ai_generate_task = asyncio.create_task(
                 generate_ai_response(

@@ -558,8 +558,8 @@
     "btn_ai_force_reply": "▶️ Ответить на последние сообщения",
     "btn_ai_refresh_status": "🔄 Обновить статус",
     "ai_runtime_unknown": "📡 После запуска ещё не зафиксировано входящих сообщений в этом чате. Если сообщение было пропущено, нажмите «Ответить на последние сообщения».",
-    "ai_runtime_status": "📡 <b>Статус:</b> {stage}\nПоследнее полученное сообщение: <code>{message_id}</code> ({age} сек. назад).\nСнимок на момент обновления меню.",
-    "ai_runtime_remaining": "\n⏱ Осталось примерно {seconds} сек.",
+    "ai_runtime_status": "📡 <b>{stage}</b>\n#{message_id} · всего {age} с",
+    "ai_runtime_remaining": "\n⏱ Пауза: ещё {seconds} с.",
     "ai_force_disconnected": "Аккаунт Telegram не подключён.",
     "ai_force_busy": "Ответ уже запущен или отправляется. Обновите статус.",
     "ai_force_checking": "Проверяю последние сообщения…",
@@ -769,5 +769,27 @@
   "ts_batch_generating": "✨ Применяю задание к {count} сообщениям…",
   "media_download_error": "❌ Не удалось скачать запись или вложение из Telegram. До расшифровки дело не дошло. Исходное сообщение сохранено — попробуй повторить команду.",
   "managed_storage_delayed": "Подсчёт архива задержался. Обнови список через несколько секунд."
+},
+  "reply_progress": {
+    "ai_progress_history": " · история: {count} сообщ.",
+    "ai_progress_counts": "\nМедиа: {done}/{total} · кэш {cached} · пропущено {skipped}",
+    "ai_progress_changed": "\nПоследнее изменение: {seconds} с назад.",
+    "ai_progress_batch_limit": "\nТайм-аут пакета через {seconds} с.",
+    "ai_progress_generation_limit": "\nЛимит ожидания ответа: ещё {seconds} с (не прогноз).",
+    "ai_progress_eta_unknown": "\nТочное время готовности зависит от API.",
+    "ai_progress_snapshot": "\n↻ Снимок по кнопке «Обновить статус».",
+    "ai_progress_history_label": "Загружаю историю",
+    "ai_progress_prepare": "Отбираю историю",
+    "ai_progress_media": "Обрабатываю вложения",
+    "ai_progress_download": "Скачиваю",
+    "ai_progress_recognize": "Распознаю",
+    "ai_progress_pack": "Собираю контекст",
+    "ai_progress_ready": "Контекст готов",
+    "ai_progress_target": "Готовлю текущее вложение",
+    "ai_media_kind_photo": "фото",
+    "ai_media_kind_video": "видео",
+    "ai_media_kind_voice": "голосовое",
+    "ai_media_kind_video_note": "кружок",
+    "ai_media_kind_audio": "аудио"
 }
 }

@@ -66,3 +66,7 @@ Complaints about unwanted messages remain a separate risk even when timing is co
 ### Deployment observation
 
 On the primary running account, the server returned a 210-second recommended refresh interval and a 30-second client idle timeout. One sampled status had 163 seconds remaining by the server-config clock estimate. The active random range was 60–90 seconds. This is an observation, not a fixed expiration guarantee; the account was not deliberately left without refresh to test a gap. All four independent accounts became ready after deployment. The runtime image was flattened from 121 layers to three while retaining the installed dependencies.
+
+## AI Twin progress (v2.9.4)
+
+The owner-only chat card reports history selection, media download, recognition and context assembly separately. Media counts include cached and skipped items; failed or overlong media is not represented as successful recognition. The last-change age measures actual phase/counter changes, not a synthetic heartbeat. Batch and response deadlines are labeled as timeout limits, not completion estimates. Refresh status takes a new snapshot; no periodic Telegram edits or additional model requests are made. Callbacks from older message targets cannot overwrite the newer target or a terminal reply stage.
