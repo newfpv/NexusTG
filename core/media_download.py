@@ -117,15 +117,20 @@ def _remove(paths):
         except FileNotFoundError:pass
 
 
-async def _download(message, file_name, idle_timeout):
+async def _download(message, file_name, idle_timeout, on_progress=None):
     last_progress = time.monotonic()
     transferred = 0
     started = last_progress
+    last_report = 0.0
     async def progress(current, total):
-        nonlocal last_progress, transferred
+        nonlocal last_progress, transferred, last_report
         if current > transferred:
             transferred = current
             last_progress = time.monotonic()
+            if on_progress and (last_progress-last_report>=1 or current==total):
+                last_report=last_progress
+                try:on_progress(current,total)
+                except Exception:logging.debug('[Media] Progress observer failed')
     task = asyncio.create_task(message.download(file_name=file_name, progress=progress))
     try:
         while not task.done():
@@ -140,7 +145,7 @@ async def _download(message, file_name, idle_timeout):
             except (Exception, asyncio.CancelledError):pass
 
 
-async def download_media_checked(client, message, file_name, timeout=90.0, retries=2):
+async def download_media_checked(client, message, file_name, timeout=90.0, retries=2, on_progress=None):
     """Timeout means no byte progress; active large downloads have a total cap."""
     file_name = os.fspath(file_name)
     current = message
@@ -151,7 +156,7 @@ async def download_media_checked(client, message, file_name, timeout=90.0, retri
         for attempt in range(1, retries+1):
             _remove(paths)
             try:
-                path = await _download(current, file_name, timeout)
+                path = await _download(current, file_name, timeout, on_progress=on_progress)
                 actual = os.path.getsize(path) if path and os.path.isfile(path) else 0
                 if actual > 0 and (not expected or actual == expected):return path
                 last_error = MediaDownloadError('incomplete_file')

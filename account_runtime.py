@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import time
-from core.managed_accounts import atomic_json, manager_name, public_status, read_json
+from core.managed_accounts import atomic_json, manager_name, public_status, read_json, purge_deleted
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9_-]{0,39}$')
 DEPENDENCIES = ('aiogram', 'pyrogram', 'sqlalchemy', 'google.genai', 'aiohttp',
@@ -218,6 +218,8 @@ class Supervisor:
             while not self.stopping:
                 now = time.monotonic()
                 if now >= next_scan:
+                    try:purge_deleted(self.root, set(self.workers))
+                    except (OSError,ValueError):print('[supervisor] Profile removal deferred; retrying',flush=True)
                     desired = read_profiles(self.root)
                     next_scan = now + 2
                     for name, worker in list(self.workers.items()):
@@ -258,6 +260,8 @@ def main():
         return run_worker(args.worker, args.code_root)
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    try:purge_deleted(root,set())
+    except (OSError,ValueError):print('[supervisor] Pending cleanup deferred',flush=True)
     profiles = read_profiles(root)
     if profiles and manager_name(root) is None:
         primary='main' if 'main' in profiles else next(iter(profiles))

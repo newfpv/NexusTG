@@ -201,7 +201,7 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_timer(self):
         ai.set_reply_status(42, 'delay_before', seconds=60)
-        self.assertIn('7', ai.reply_status_text(42))
+        self.assertNotIn('#7', ai.reply_status_text(42))
         self.assertIn('60', ai.reply_status_text(42))
 
 

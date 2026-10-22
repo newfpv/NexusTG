@@ -558,7 +558,7 @@
     "btn_ai_force_reply": "▶️ Ответить на последние сообщения",
     "btn_ai_refresh_status": "🔄 Обновить статус",
     "ai_runtime_unknown": "📡 После запуска ещё не зафиксировано входящих сообщений в этом чате. Если сообщение было пропущено, нажмите «Ответить на последние сообщения».",
-    "ai_runtime_status": "📡 <b>{stage}</b>\n#{message_id} · всего {age} с",
+    "ai_runtime_status": "📡 <b>{stage}</b> · {age} с",
     "ai_runtime_remaining": "\n⏱ Пауза: ещё {seconds} с.",
     "ai_force_disconnected": "Аккаунт Telegram не подключён.",
     "ai_force_busy": "Ответ уже запущен или отправляется. Обновите статус.",
@@ -772,12 +772,12 @@
 },
   "reply_progress": {
     "ai_progress_history": " · история: {count} сообщ.",
-    "ai_progress_counts": "\nМедиа: {done}/{total} · кэш {cached} · пропущено {skipped}",
-    "ai_progress_changed": "\nПоследнее изменение: {seconds} с назад.",
+    "ai_progress_counts": "\nВложения: {done}/{total} · кэш {cached} · пропуск {skipped}",
+    "ai_progress_changed": "\nПрогресс: {seconds} с назад",
     "ai_progress_batch_limit": "\nТайм-аут пакета через {seconds} с.",
     "ai_progress_generation_limit": "\nЛимит ожидания ответа: ещё {seconds} с (не прогноз).",
     "ai_progress_eta_unknown": "\nТочное время готовности зависит от API.",
-    "ai_progress_snapshot": "\n↻ Снимок по кнопке «Обновить статус».",
+    "ai_progress_snapshot": "\n↻ На момент обновления",
     "ai_progress_history_label": "Загружаю историю",
     "ai_progress_prepare": "Отбираю историю",
     "ai_progress_media": "Обрабатываю вложения",
@@ -791,5 +791,12 @@
     "ai_media_kind_voice": "голосовое",
     "ai_media_kind_video_note": "кружок",
     "ai_media_kind_audio": "аудио"
-}
+},
+    "managed_delete": "🗑 Удалить бота",
+    "managed_delete_confirm": "🗑 <b>Удалить «{name}»?</b>\n\nБот остановится. Его настройки, сессия и локальный архив будут удалены без восстановления. Другие аккаунты останутся.\n\nСам бот в Telegram и сообщения в чатах не удаляются.",
+    "managed_delete_yes": "🗑 Да, удалить данные бота",
+    "managed_deleting": "🗑 Удаляю: сначала останавливаю бота. Затем он исчезнет из списка.",
+    "managed_delete_error": "Не удалось удалить. Для аккаунта с внешним хранилищем требуется удаление на сервере.",
+    "ai_progress_parallel": "\n↓ Скачивание {downloading} · ИИ {recognizing} · очередь {queued}",
+    "ai_progress_bytes": "\nЗагрузка: {current}/{total} МиБ"
 }

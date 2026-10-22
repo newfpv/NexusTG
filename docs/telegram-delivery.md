@@ -70,3 +70,14 @@ On the primary running account, the server returned a 210-second recommended ref
 ## AI Twin progress (v2.9.4)
 
 The owner-only chat card reports history selection, media download, recognition and context assembly separately. Media counts include cached and skipped items; failed or overlong media is not represented as successful recognition. The last-change age measures actual phase/counter changes, not a synthetic heartbeat. Batch and response deadlines are labeled as timeout limits, not completion estimates. Refresh status takes a new snapshot; no periodic Telegram edits or additional model requests are made. Callbacks from older message targets cannot overwrite the newer target or a terminal reply stage.
+
+
+## Parallel history media and key scheduling (v2.10.0)
+
+AI Twin processes up to three attachments concurrently inside each bounded batch, newest first. Completion order does not change the chronological JSONL history or its speaker/reply labels. Completed descriptions are cached per file. Cancellation and batch timeout join all child tasks before temporary-file cleanup, and the next reply reuses completed cache entries.
+
+All distinct configured Gemini keys participate in a fair per-account rotation. Each in-flight request leases one free key; a busy key does not block another free key. Existing model fallback order and quota cooldowns are preserved. This applies to both normal and streaming generation. A key is released on success, failure, stream closure or cancellation. Keys, pools and task data are never shared between account processes. Multiple keys from one Google project still share project quotas.
+
+Each account admits three heavy media jobs, with two uploads and four inference slots. Managed profiles share four heavy media slots by default across the installation; `NEXUS_GLOBAL_MEDIA_SLOTS` can override that server ceiling. These are concurrency ceilings, not promises of quota or linear speedup. Text calls do not acquire the heavy-media ceiling.
+
+The chat status shows processed/total, cache/skipped counts, concurrent downloads/recognition, queued media, elapsed time and time since the last progress event. Recognition includes upload and waiting for an available API slot. After a minute without progress it also shows the remaining batch timeout; that timeout is not a completion estimate. The display is a snapshot refreshed by its button, not a live ticker. Message IDs and API-key values are not displayed.

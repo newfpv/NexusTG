@@ -109,14 +109,14 @@ class MediaBatchTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(set(mid for mid, _ in self.cache), {1, 2, 3, 4})
+        self.assertEqual(set(mid for mid, _ in self.cache), {1, 2, 3, 4, 6})
         self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
         self.messages.append(self.message(8, 'text'))
         self.release.set()
         result = await self.build()
-        self.assertEqual(self.recognized, list(range(1, 8)))
+        self.assertCountEqual(self.recognized, list(range(1, 8)))
         self.assertIn('text-8', result[0])
-        self.assertEqual(self.downloads, [1, 2, 3, 4, 5, 5, 6, 7])
+        self.assertCountEqual(self.downloads, [1, 2, 3, 4, 5, 5, 6, 7])
 
     async def test_batch_deadline_cleans_files_and_keeps_completed_cache(self):
         self.messages = [self.message(i) for i in range(1, 8)]
@@ -124,7 +124,7 @@ class MediaBatchTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(services, 'CONTEXT_MEDIA_BATCH_TIMEOUT', 0.05):
             with self.assertRaises(asyncio.TimeoutError):
                 await self.build()
-        self.assertEqual(set(mid for mid, _ in self.cache), {1, 2, 3, 4})
+        self.assertEqual(set(mid for mid, _ in self.cache), {1, 2, 3, 4, 6})
         self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
 
     async def test_timeout_is_per_batch_rather_than_entire_album(self):

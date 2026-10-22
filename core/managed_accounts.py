@@ -7,6 +7,8 @@ import re
 import shlex
 import time
 import shutil
+import uuid
+import logging
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9_-]{0,39}$')
 TOKEN = re.compile(r'^\d+:[A-Za-z0-9_-]{20,}$')
@@ -107,9 +109,51 @@ def change_account(name, action):
     if action not in {'enable','disable','restart'}:raise ValueError('Unknown operation')
     with registry_lock(root):
         cfg=read_json(path/'account.json')
+        if cfg.get('delete_requested'):raise ValueError('Profile removal pending')
         if action=='restart':cfg['generation']=int(cfg.get('generation',0))+1
         else:cfg['enabled']=action=='enable'
         atomic_json(path/'account.json',cfg)
+
+
+def request_delete(name, expected_bot_id):
+    root=require_root()
+    if name==manager_name(root):raise PermissionError('Cannot remove the primary bot')
+    path=profile(name)
+    with registry_lock(root):
+        cfg=read_json(path/'account.json')
+        if not expected_bot_id or token_identity(path/'.env')!=expected_bot_id:
+            raise ValueError('The profile changed; reopen its confirmation')
+        # External legacy bind mounts must be handled on the server, never traversed.
+        if cfg.get('host_data_dir') or (path/'data').is_symlink() or os.path.ismount(path/'data'):
+            raise ValueError('External account storage')
+        cfg['enabled']=False
+        cfg['delete_requested']=cfg.get('delete_requested') or uuid.uuid4().hex
+        atomic_json(path/'account.json',cfg)
+
+
+def purge_deleted(root, running):
+    """Supervisor only: remove a stopped profile, never its symlink targets."""
+    root=Path(root).resolve()
+    if manager_name(root) is None:return
+    trash=root/'.deleted'
+    if trash.is_symlink():raise ValueError('Invalid removal directory')
+    with registry_lock(root):
+        for path in profile_dirs(root):
+            cfg=read_json(path/'account.json');nonce=cfg.get('delete_requested')
+            if path.name==manager_name(root) or path.name in running or not nonce:continue
+            if not isinstance(nonce,str) or not re.fullmatch('[0-9a-f]{32}',nonce):continue
+            if cfg.get('enabled',True) or cfg.get('host_data_dir') or (path/'data').is_symlink() or os.path.ismount(path/'data'):continue
+            assert path.resolve().parent==root
+            trash.mkdir(mode=0o700,exist_ok=True)
+            target=trash/nonce
+            if target.exists():continue
+            path.rename(target)
+    if trash.exists():
+        for path in trash.iterdir():
+            if path.is_symlink() or not path.is_dir() or not re.fullmatch('[0-9a-f]{32}',path.name):continue
+            assert path.resolve().parent==trash.resolve()
+            try:shutil.rmtree(path)
+            except OSError:logging.warning('[Runtime] Local profile removal will be retried')
 
 
 def public_status(root, workers, restarts=None):
@@ -124,7 +168,7 @@ def public_status(root, workers, restarts=None):
         if not re.fullmatch(r'[A-Za-z0-9_]{5,32}',username or ''):username=None
         display=clean_name(cfg.get('display_name') or record.get('account_name') or cfg.get('account_name') or cfg.get('bot_name') or '')
         result.append({'name':path.name,'username':username,'display_name':display,'enabled':bool(cfg.get('enabled',True)),
-                       'running':running,'ready':ready,'primary':path.name==manager_name(root)})
+                       'running':running,'ready':ready,'primary':path.name==manager_name(root),'deleting':bool(cfg.get('delete_requested'))})
     return {'at':time.time(),'bots':result}
 
 

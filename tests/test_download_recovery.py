@@ -94,6 +94,19 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_byte_progress_reaches_observer_and_observer_error_is_nonfatal(self):
+        events=[]
+        async def download(file_name,progress):
+            self.path.write_bytes(b'good')
+            await progress(1,4);await progress(4,4)
+            return str(self.path)
+        def observer(current,total):
+            events.append((current,total))
+            if current==1:raise ValueError('UI observer')
+        result=await media.download_media_checked(self.client,self.msg(download),self.path,on_progress=observer)
+        self.assertEqual(Path(result).read_bytes(),b'good')
+        self.assertEqual(events,[(1,4),(4,4)])
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.path=Path(self.temp.name)/'recording.mp3'

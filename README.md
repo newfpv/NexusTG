@@ -21,12 +21,12 @@ NexusTG connects to your Telegram account through Kurigram and uses an Aiogram b
 ## Highlights
 
 - AI Twin with global and per-chat activation, prompts, search, sleep hours, delays, typing simulation, reactions, and manual override.
-- Manual streaming AI, search-backed fact checking, YouTube summaries, and text restructuring.
+- Manual streaming AI, optional Google Search, YouTube summaries, and text restructuring.
 - Voice, audio, video-note, and video transcription with optional summaries.
 - TikTok and Instagram Reel downloads through yt-dlp and optional cookies.
 - Native Telegram shopping checklists with command and selected-chat automation.
 - Deleted, edited, and self-destructing message preservation to a private forum group.
-- Local SQLite state, Gemini key/model fallback chains, cooldown tracking, and per-chat overrides.
+- Local SQLite state, fair Gemini key rotation, model fallback chains, cooldown tracking, and per-chat overrides.
 - Drop-in Python modules loaded from `modules/` at startup.
 
 ## Requirements
@@ -116,7 +116,7 @@ Parts of NexusTG's methods and development approach were inspired by [SpyBot](ht
 
 ## Version and license
 
-The latest tagged release is **v2.9.4**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
+The latest tagged release is **v2.10.0**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 

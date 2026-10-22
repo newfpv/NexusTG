@@ -57,6 +57,13 @@ async def main():
         assert record(primary)['pid']==m['pid']
         service.change_account(name,'enable');wait(lambda:record(child).get('pid') not in {None,c['pid']})
         assert record(primary)['pid']==m['pid']
+        child_pid=record(child)['pid']
+        service.request_delete(name,'22222')
+        wait(lambda:not child.exists())
+        assert not Path(f'/proc/{child_pid}').exists()
+        assert record(primary)['pid']==m['pid']
+        assert (primary/'data/private').read_text()=='private-main-archive'
+        print('PASS: additional bot removal waits for worker exit and preserves the primary process and data.',flush=True)
         print('PASS: direct primary promotes to shared runtime; added bot has its own owner, token and data; role spoof rejected; status excludes private fields; worker controls do not restart primary.',flush=True)
     finally:
         process.terminate();process.wait(timeout=20)

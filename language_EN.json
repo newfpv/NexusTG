@@ -554,7 +554,7 @@
     "btn_ai_force_reply": "▶️ Reply to latest messages",
     "btn_ai_refresh_status": "🔄 Refresh status",
     "ai_runtime_unknown": "📡 No incoming messages recorded in this chat since startup. Use “Reply to latest messages” to process a missed message.",
-    "ai_runtime_status": "📡 <b>{stage}</b>\n#{message_id} · total {age}s",
+    "ai_runtime_status": "📡 <b>{stage}</b> · {age}s",
     "ai_runtime_remaining": "\n⏱ Pause: {seconds}s remaining.",
     "ai_force_disconnected": "Telegram account is disconnected.",
     "ai_force_busy": "A reply is already running or being sent. Refresh the status.",
@@ -772,12 +772,12 @@
 },
   "reply_progress": {
     "ai_progress_history": " · history: {count} messages",
-    "ai_progress_counts": "\nMedia: {done}/{total} · cached {cached} · skipped {skipped}",
-    "ai_progress_changed": "\nLast change: {seconds}s ago.",
+    "ai_progress_counts": "\nAttachments: {done}/{total} · cached {cached} · skipped {skipped}",
+    "ai_progress_changed": "\nProgress: {seconds}s ago",
     "ai_progress_batch_limit": "\nBatch timeout in {seconds}s.",
     "ai_progress_generation_limit": "\nResponse wait limit: {seconds}s remaining (not an ETA).",
     "ai_progress_eta_unknown": "\nCompletion time depends on the API.",
-    "ai_progress_snapshot": "\n↻ Snapshot: press Refresh status to update.",
+    "ai_progress_snapshot": "\n↻ As of refresh",
     "ai_progress_history_label": "Loading history",
     "ai_progress_prepare": "Selecting history",
     "ai_progress_media": "Processing attachments",
@@ -791,5 +791,12 @@
     "ai_media_kind_voice": "voice message",
     "ai_media_kind_video_note": "video note",
     "ai_media_kind_audio": "audio"
-}
+},
+    "managed_delete": "🗑 Remove bot",
+    "managed_delete_confirm": "🗑 <b>Remove “{name}”?</b>\n\nThe bot will stop. Its settings, session and local archive will be permanently deleted. Other accounts will remain.\n\nThis does not delete the Telegram bot or messages in chats.",
+    "managed_delete_yes": "🗑 Yes, delete this bot’s local data",
+    "managed_deleting": "🗑 Removing: stopping the bot first. It will then disappear from the list.",
+    "managed_delete_error": "Could not remove. Accounts with external storage must be removed on the server.",
+    "ai_progress_parallel": "\n↓ Downloading {downloading} · AI {recognizing} · queued {queued}",
+    "ai_progress_bytes": "\nDownloading: {current}/{total} MiB"
 }

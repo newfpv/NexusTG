@@ -131,7 +131,7 @@ def reply_status_text(chat_id):
     progress = status.get('progress', {})
     if status['stage'] == 'context' and progress:
         stage = _('ai_progress_history_label' if progress['phase'] == 'history' else 'ai_progress_' + progress['phase'])
-        if progress.get('kind') and progress['phase'] in {'download', 'recognize'}:
+        if progress.get('kind') and 'active' not in progress and progress['phase'] in {'download', 'recognize'}:
             stage += ' · ' + _('ai_media_kind_' + progress['kind'])
     text = _("ai_runtime_status", stage=stage,
              message_id=status["message_id"], age=int(time.time() - status["received_at"]))
@@ -139,12 +139,19 @@ def reply_status_text(chat_id):
         if 'total' in progress:
             text += _('ai_progress_counts', done=progress['done'], total=progress['total'],
                       cached=progress['cached'], skipped=progress['skipped'])
+            if 'active' in progress:
+                text += _('ai_progress_parallel',downloading=progress.get('downloading',0),
+                          recognizing=progress.get('recognizing',0),
+                          queued=max(0,progress['total']-progress['done']-progress['active']))
+                if progress.get('bytes_total'):
+                    text += _('ai_progress_bytes',current=f"{progress.get('bytes_current',0)/1048576:.1f}",total=f"{progress['bytes_total']/1048576:.1f}")
         elif 'messages' in progress:
             text += _('ai_progress_history', count=progress['messages'])
         text += _('ai_progress_changed', seconds=max(0, int(time.time()-progress.get('changed_at',status['updated_at']))))
-        if progress.get('deadline') and progress['phase'] in {'download', 'recognize', 'media'}:
+        stalled=time.time()-progress.get('changed_at',status['updated_at'])>=60
+        if stalled and progress.get('deadline') and progress['phase'] in {'download', 'recognize', 'media'}:
             text += _('ai_progress_batch_limit', seconds=max(0,int(progress['deadline']-time.time())))
-        text += _('ai_progress_eta_unknown')
+        if stalled:text += _('ai_progress_eta_unknown')
     if status["until"]:
         key = 'ai_progress_generation_limit' if status['stage'] == 'generating' else 'ai_runtime_remaining'
         text += _(key, seconds=max(0, int(status["until"] - time.time() + 0.999)))

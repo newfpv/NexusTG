@@ -17,6 +17,7 @@ from google.genai import types as genai_types
 
 from core.gemini_media import (prepare_contents, request_slots, count_text_tokens,
                                MediaPreparationError, INLINE_LIMIT, bounded_media_request)
+from core.ai_pool import key_lease
 from core.config import _
 from core.db import AsyncSessionLocal, CoreRepository, YoutubeCache, AIKeyState
 from core.utils import download_media_checked, is_bot_dialog, plugins
@@ -244,51 +245,54 @@ async def _run_with_fallbacks(prompt_context: str, media_path: str | None, custo
             models = sorted(models, key=lambda name: "-lite" not in name)
 
         last_error: Exception | None = None
-        for api_key in api_keys:
-            async with AsyncSessionLocal() as session:
-                repo = CoreRepository(session)
-                usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
-            if not usable_models:
-                continue
-
-            client = genai.Client(api_key=api_key)
-            try:
-                contents = await prepare_contents(prompt_context, media_path, api_key,
-                                                  _guess_mime(media_path) if media_path else "")
-            except MediaPreparationError as exc:
-                logging.warning("[Services] Media preparation failed: %s", exc)
-                await _mark_failure(api_key, usable_models[0], search_enabled, exc)
-                continue
-            for model in usable_models:
+        pending_keys = list(dict.fromkeys(api_keys))
+        while pending_keys:
+            async with key_lease(pending_keys) as api_key:
+                pending_keys.remove(api_key)
                 async with AsyncSessionLocal() as session:
-                    if not await _is_available(CoreRepository(session), api_key, model, search_enabled):
-                        continue
+                    repo = CoreRepository(session)
+                    usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
+                if not usable_models:
+                    continue
+
+                client = genai.Client(api_key=api_key)
                 try:
-                    async with request_slots():
-                        response = await asyncio.wait_for(
-                            client.aio.models.generate_content(
-                                model=model,
-                                contents=contents,
-                                config=_build_config(custom_prompt, search_enabled),
-                            ),
-                            timeout=GEMINI_TIMEOUT * (2 if media_path else 1),
-                        )
-                    usage = getattr(response, "usage_metadata", None)
-                    if isinstance(getattr(response, "model_version", None), str):
-                        _MODEL_CANONICAL[model] = response.model_version
-                    logging.info("[Services] Gemini success: requested=%s resolved=%s input_tokens=%s output_tokens=%s",
-                                 model, getattr(response, "model_version", model),
-                                 getattr(usage, "prompt_token_count", None), getattr(usage, "candidates_token_count", None))
-                    text = _response_text(response)
-                    if text:
-                        return text
-                except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
-                    last_error = exc
-                    logging.warning("[Services] Gemini request failed on %s: %s", model, exc)
-                    await _mark_failure(api_key, model, search_enabled, exc)
-                except Exception as exc:
-                    last_error = exc
-                    logging.exception("[Services] Unexpected Gemini request failure on %s", model)
+                    contents = await prepare_contents(prompt_context, media_path, api_key,
+                                                      _guess_mime(media_path) if media_path else "")
+                except MediaPreparationError as exc:
+                    logging.warning("[Services] Media preparation failed: %s", exc)
+                    await _mark_failure(api_key, usable_models[0], search_enabled, exc)
+                    continue
+                for model in usable_models:
+                    async with AsyncSessionLocal() as session:
+                        if not await _is_available(CoreRepository(session), api_key, model, search_enabled):
+                            continue
+                    try:
+                        async with request_slots():
+                            response = await asyncio.wait_for(
+                                client.aio.models.generate_content(
+                                    model=model,
+                                    contents=contents,
+                                    config=_build_config(custom_prompt, search_enabled),
+                                ),
+                                timeout=GEMINI_TIMEOUT * (2 if media_path else 1),
+                            )
+                        usage = getattr(response, "usage_metadata", None)
+                        if isinstance(getattr(response, "model_version", None), str):
+                            _MODEL_CANONICAL[model] = response.model_version
+                        logging.info("[Services] Gemini success: requested=%s resolved=%s input_tokens=%s output_tokens=%s",
+                                     model, getattr(response, "model_version", model),
+                                     getattr(usage, "prompt_token_count", None), getattr(usage, "candidates_token_count", None))
+                        text = _response_text(response)
+                        if text:
+                            return text
+                    except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
+                        last_error = exc
+                        logging.warning("[Services] Gemini request failed on %s: %s", model, exc)
+                        await _mark_failure(api_key, model, search_enabled, exc)
+                    except Exception as exc:
+                        last_error = exc
+                        logging.exception("[Services] Unexpected Gemini request failure on %s", model)
 
         if last_error:
             logging.error("[Services] All Gemini fallbacks failed: %s", last_error)
@@ -319,53 +323,56 @@ async def generate_ai_response_stream(
         if not models:
             models = ["gemini-2.5-flash"]
 
-        for api_key in api_keys:
-            async with AsyncSessionLocal() as session:
-                repo = CoreRepository(session)
-                usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
-            if not usable_models:
-                continue
-
-            client = genai.Client(api_key=api_key)
-            try:
-                contents = await prepare_contents(prompt_context, media_path, api_key,
-                                                  _guess_mime(media_path) if media_path else "")
-            except MediaPreparationError as exc:
-                logging.warning("[Services] Media preparation failed: %s", exc)
-                await _mark_failure(api_key, usable_models[0], search_enabled, exc)
-                continue
-            for model in usable_models:
+        pending_keys = list(dict.fromkeys(api_keys))
+        while pending_keys:
+            async with key_lease(pending_keys) as api_key:
+                pending_keys.remove(api_key)
                 async with AsyncSessionLocal() as session:
-                    if not await _is_available(CoreRepository(session), api_key, model, search_enabled):
-                        continue
+                    repo = CoreRepository(session)
+                    usable_models = [model for model in models if await _is_available(repo, api_key, model, search_enabled)]
+                if not usable_models:
+                    continue
+
+                client = genai.Client(api_key=api_key)
                 try:
-                    async with request_slots():
-                        stream = client.aio.models.generate_content_stream(
-                            model=model,
-                            contents=contents,
-                            config=_build_config(custom_prompt, search_enabled),
-                        )
-                        if inspect.isawaitable(stream):
-                            stream = await asyncio.wait_for(stream, timeout=GEMINI_TIMEOUT)
+                    contents = await prepare_contents(prompt_context, media_path, api_key,
+                                                      _guess_mime(media_path) if media_path else "")
+                except MediaPreparationError as exc:
+                    logging.warning("[Services] Media preparation failed: %s", exc)
+                    await _mark_failure(api_key, usable_models[0], search_enabled, exc)
+                    continue
+                for model in usable_models:
+                    async with AsyncSessionLocal() as session:
+                        if not await _is_available(CoreRepository(session), api_key, model, search_enabled):
+                            continue
+                    try:
+                        async with request_slots():
+                            stream = client.aio.models.generate_content_stream(
+                                model=model,
+                                contents=contents,
+                                config=_build_config(custom_prompt, search_enabled),
+                            )
+                            if inspect.isawaitable(stream):
+                                stream = await asyncio.wait_for(stream, timeout=GEMINI_TIMEOUT)
 
-                        got_response = False
-                        while True:
-                            try:
-                                chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
-                            except StopAsyncIteration:
-                                break
+                            got_response = False
+                            while True:
+                                try:
+                                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=GEMINI_TIMEOUT * 2)
+                                except StopAsyncIteration:
+                                    break
 
-                            text = _response_text(chunk)
-                            if text:
-                                got_response = True
-                                yield text
-                        if got_response:
-                            return
-                except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
-                    logging.warning("[Services] Gemini stream failed on %s: %s", model, exc)
-                    await _mark_failure(api_key, model, search_enabled, exc)
-                except Exception:
-                    logging.exception("[Services] Unexpected Gemini stream failure on %s", model)
+                                text = _response_text(chunk)
+                                if text:
+                                    got_response = True
+                                    yield text
+                            if got_response:
+                                return
+                    except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError, asyncio.TimeoutError) as exc:
+                        logging.warning("[Services] Gemini stream failed on %s: %s", model, exc)
+                        await _mark_failure(api_key, model, search_enabled, exc)
+                    except Exception:
+                        logging.exception("[Services] Unexpected Gemini stream failure on %s", model)
         yield _("status_waiting")
 
 
@@ -681,9 +688,10 @@ async def _bounded_dialog_context(records, target_id, owner_id=None, chat_id=Non
     return payload
 
 
-async def download_context_media(client, message, file_name, timeout=MEDIA_DOWNLOAD_TIMEOUT):
+async def download_context_media(client, message, file_name, timeout=MEDIA_DOWNLOAD_TIMEOUT, on_progress=None):
     try:
-        return await download_media_checked(client, message, file_name=file_name, timeout=timeout)
+        kwargs={'on_progress':on_progress} if on_progress else {}
+        return await download_media_checked(client, message, file_name=file_name, timeout=timeout, **kwargs)
     except BaseException:
         for candidate in (file_name, file_name + ".temp"):
             try:
@@ -737,6 +745,7 @@ async def _describe_message_media(client, message, media_paths: list[str], on_pr
             message,
             file_name=f"data/context_{message.id}{ext}",
             timeout=MEDIA_DOWNLOAD_TIMEOUT,
+            on_progress=(lambda current,total:on_progress('download',kind=media_type,bytes_current=current,bytes_total=total)) if on_progress else None,
         )
         if path:
             media_paths.append(path)
@@ -905,17 +914,40 @@ async def build_dialog_context(
                      chat_id, batch_number, total_batches, len(batch))
 
         async def describe_batch(batch_messages, paths):
-            for media_message in batch_messages:
-                if media_message.id not in media_results:
-                    def item_progress(phase, **details):
-                        media_progress(phase, batch=batch_number, batches=total_batches,
-                                       deadline=batch_deadline, **details)
+            active = {}
+
+            def report_active(phase='media'):
+                media_progress(phase, batch=batch_number, batches=total_batches,
+                               deadline=batch_deadline, active=len(active),
+                               downloading=sum(value['phase'] == 'download' for value in active.values()),
+                               recognizing=sum(value['phase'] == 'recognize' for value in active.values()),
+                               bytes_current=sum(value.get('bytes_current',0) for value in active.values() if value['phase']=='download'),
+                               bytes_total=sum(value.get('bytes_total',0) for value in active.values() if value['phase']=='download'))
+
+            async def describe_one(media_message):
+                if media_message.id in media_results:
+                    return
+                def item_progress(phase, **details):
+                    active[media_message.id] = {**active.get(media_message.id,{}),**details,'phase':phase}
+                    report_active(phase)
+                try:
                     if on_progress:
                         media_results[media_message.id] = await _describe_message_media(
                             client, media_message, paths, on_progress=item_progress)
                     else:
                         media_results[media_message.id] = await _describe_message_media(client, media_message, paths)
-                    item_progress('media')
+                finally:
+                    active.pop(media_message.id, None)
+                    report_active()
+
+            tasks = [asyncio.create_task(describe_one(message)) for message in batch_messages]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                # Never clean files until every cancelled download/model task has stopped.
+                for task in tasks:
+                    if not task.done(): task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
             await asyncio.wait_for(describe_batch(batch, batch_paths), timeout=CONTEXT_MEDIA_BATCH_TIMEOUT)

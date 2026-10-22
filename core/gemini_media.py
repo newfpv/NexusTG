@@ -34,7 +34,7 @@ class MediaPreparationError(Exception):
 
 def request_slots():
     loop = asyncio.get_running_loop()
-    return _loop_slots.setdefault(loop, (asyncio.Semaphore(1), asyncio.Semaphore(2), asyncio.Semaphore(2)))[1]
+    return _loop_slots.setdefault(loop, (asyncio.Semaphore(2), asyncio.Semaphore(4), asyncio.Semaphore(3)))[1]
 
 
 @asynccontextmanager

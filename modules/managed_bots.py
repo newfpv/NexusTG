@@ -3,6 +3,7 @@ import asyncio
 import html
 import io
 import logging
+import secrets
 from decimal import Decimal, InvalidOperation
 from aiogram import Bot, F, Router, types
 from aiogram.fsm.context import FSMContext
@@ -98,7 +99,7 @@ async def show_stats(message, state, page=0):
     page = max(0, min(page, max(0, (total - 1) // 8)))
     rows = []
     for index, row in enumerate(bots[page * 8:page * 8 + 8], start=page * 8 + 1):
-        icon = '⏸' if not row['enabled'] else '🟢' if row['running'] and row['ready'] else '🟡'
+        icon = '🗑' if row.get('deleting') else '⏸' if not row['enabled'] else '🟢' if row['running'] and row['ready'] else '🟡'
         suffix = ' · ' + _('managed_primary') if row['primary'] else ''
         rows.append([Button(text=icon + ' ' + label(row, index) + suffix, callback_data='managed_bot_' + row['name'])])
     if total > 8:
@@ -121,12 +122,15 @@ async def show_bot(message, state, name):
     rows = [[Button(text=_('managed_rename'), callback_data='managed_rename_' + name)],
             [Button(text=_('managed_quota'), callback_data='managed_quota_' + name)],
             [Button(text=_('managed_logs'), callback_data='managed_logs_' + name)]]
+    if row.get('deleting'):
+        return await safe_edit(message,state,text+'\n\n'+_('managed_deleting'),Markup(inline_keyboard=[[Button(text=_('managed_refresh'),callback_data='managed_bot_'+name)],[Button(text=_('btn_back'),callback_data='managed_stats_0')]]))
     if not row['primary']:
         action = 'disable' if row['enabled'] else 'enable'
         toggle_key = 'managed_turn_off' if row['enabled'] else 'managed_turn_on'
         rows.append([Button(text=_(toggle_key), callback_data=f'managed_{action}_{name}')])
         if row['enabled']:
             rows.append([Button(text=_('managed_restart'), callback_data=f'managed_restart_{name}')])
+        rows.append([Button(text=_('managed_delete'), callback_data='managed_delete_'+name)])
     rows.append([Button(text=_('btn_back'), callback_data='managed_stats_0')])
     await safe_edit(message, state, text, Markup(inline_keyboard=rows))
 
@@ -152,6 +156,31 @@ async def callbacks(call: types.CallbackQuery, state: FSMContext):
         except Exception:logging.debug('[Managed bots] Could not acknowledge navigation')
     await state.update_data(menu_msg_id=call.message.message_id)
     data = call.data
+    if data.startswith('managed_remove_'):
+        stored=await state.get_data()
+        confirmation=stored.get('managed_delete_confirmation') or {}
+        if not secrets.compare_digest(data[len('managed_remove_'):],confirmation.get('nonce','invalid')):
+            return await call.answer(_('managed_action_error'),show_alert=True)
+        await state.update_data(managed_delete_confirmation=None)
+        try:
+            await asyncio.to_thread(service.request_delete,confirmation['name'],confirmation['bot_id'])
+        except (PermissionError,ValueError,OSError,KeyError):
+            return await call.answer(_('managed_delete_error'),show_alert=True)
+        await call.answer(_('managed_deleting'))
+        return await show_bot(call.message,state,confirmation['name'])
+    if data.startswith('managed_delete_'):
+        name=data[len('managed_delete_'):]
+        try:
+            path=service.profile(name)
+            if name==service.manager_name(path.parent):raise PermissionError()
+            nonce=secrets.token_hex(8)
+            await state.update_data(managed_delete_confirmation={'name':name,'bot_id':service.token_identity(path/'.env'),'nonce':nonce})
+            row=next(row for row in service.status()['bots'] if row['name']==name)
+        except (PermissionError,ValueError,OSError,StopIteration):
+            return await call.answer(_('managed_action_error'),show_alert=True)
+        await call.answer()
+        return await safe_edit(call.message,state,_('managed_delete_confirm',name=html.escape(label(row))),Markup(inline_keyboard=[[Button(text=_('managed_delete_yes'),callback_data='managed_remove_'+nonce)],[Button(text=_('btn_cancel'),callback_data='managed_bot_'+name)]]))
+    await state.update_data(managed_delete_confirmation=None)
     if data == 'managed_add':
         await state.update_data(managed_token=None)
         await state.set_state(AddBot.token)

@@ -12,7 +12,7 @@ async def media_slot():
         yield
         return
     import fcntl
-    count = max(1, min(16, int(os.environ.get('NEXUS_GLOBAL_MEDIA_SLOTS', '2'))))
+    count = max(1, min(16, int(os.environ.get('NEXUS_GLOBAL_MEDIA_SLOTS', '4'))))
     directory = Path(root)
     directory.mkdir(parents=True, exist_ok=True)
     selected = None

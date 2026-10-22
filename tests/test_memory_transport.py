@@ -283,7 +283,7 @@ class RequestResourceTests(unittest.IsolatedAsyncioTestCase):
              patch.object(services.genai,'Client',return_value=client):
             tasks=[asyncio.create_task(services.generate_ai_response('prompt','media.mp4','persona',False)) for _ in range(10)]
             await asyncio.sleep(0.05)
-            self.assertEqual(prepared.await_count,2)
+            self.assertEqual(prepared.await_count,1)
             release.set()
             self.assertEqual(await asyncio.gather(*tasks),['ok']*10)
 

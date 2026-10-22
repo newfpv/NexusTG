@@ -36,7 +36,9 @@ class StopTests(CompactTests):
             task = asyncio.create_task(job.execute())
             await asyncio.wait_for(entered.wait(), 1)
             job.stop()
-            await asyncio.wait_for(task, 0.3)
+            await asyncio.wait_for(cancelled.wait(), 0.3)
+            # SQLite fsync on a busy VPS is separate from cancelling the RPC.
+            await asyncio.wait_for(task, 5)
         self.assertTrue(cancelled.is_set())
         report = (await self.config()).module_settings['api_keys_audit']['last_test']
         self.assertEqual(report['checked'], 1)
@@ -56,7 +58,8 @@ class StopTests(CompactTests):
             await started.wait()
             await asyncio.sleep(0)
             job.stop()
-            await asyncio.wait_for(task, 0.3)
+            self.assertTrue(job.report['cancelled'])
+            await asyncio.wait_for(task, 5)
         client.aio.models.generate_content.assert_not_awaited()
         self.assertEqual((await self.config()).module_settings['api_keys_audit']['last_test']['checked'], 0)
 
