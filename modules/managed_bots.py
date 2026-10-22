@@ -2,6 +2,7 @@
 import asyncio
 import html
 import io
+import logging
 from decimal import Decimal, InvalidOperation
 from aiogram import Bot, F, Router, types
 from aiogram.fsm.context import FSMContext
@@ -14,6 +15,16 @@ from core.diagnostics import recent, format_rows
 from core.utils import plugins, safe_edit
 
 router = Router()
+_storage_job = None
+STORAGE_SUMMARY_TIMEOUT = 2.0
+
+
+async def storage_summary():
+    global _storage_job
+    if _storage_job is None or _storage_job.done():
+        _storage_job = asyncio.create_task(asyncio.to_thread(service.storage_totals))
+        _storage_job.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+    return await asyncio.wait_for(asyncio.shield(_storage_job),STORAGE_SUMMARY_TIMEOUT)
 
 
 class AddBot(StatesGroup):
@@ -68,13 +79,20 @@ async def validate_token(token):
 
 
 async def show_stats(message, state, page=0):
-    snapshot = service.status()
+    snapshot = await asyncio.to_thread(service.status)
     bots, total = snapshot['bots'], len(snapshot['bots'])
     working = sum(bool(row['running'] and row['ready'] and row['enabled']) for row in bots)
     disabled = sum(not row['enabled'] for row in bots)
     text = _('managed_stats', total=total, working=working, disabled=disabled)
-    totals = await asyncio.to_thread(service.storage_totals)
-    text += '\n\n' + _('managed_storage_summary', media=gib(totals['media_bytes']), text=gib(totals['text_db_bytes']), free=gib(totals['disk_free']), used=gib(totals['disk_used']))
+    try:
+        totals = await storage_summary()
+    except (OSError,asyncio.TimeoutError):
+        totals = None
+        logging.warning('[Managed bots] Storage summary timed out or failed')
+    if totals:
+        text += '\n\n' + _('managed_storage_summary', media=gib(totals['media_bytes']), text=gib(totals['text_db_bytes']), free=gib(totals['disk_free']), used=gib(totals['disk_used']))
+    else:
+        text += '\n\n' + _('managed_storage_delayed')
     if not snapshot['at']:
         text += '\n' + _('managed_status_stale')
     page = max(0, min(page, max(0, (total - 1) // 8)))
@@ -129,6 +147,9 @@ async def show_logs(message, state, name):
 async def callbacks(call: types.CallbackQuery, state: FSMContext):
     if not await allowed(call.from_user.id, call.message.chat.id):
         return await call.answer(_('auth_not_authorized'), show_alert=True)
+    if call.data == 'managed_cancel' or call.data.startswith(('managed_stats_','managed_bot_','managed_logs_')):
+        try:await asyncio.wait_for(call.answer(),1)
+        except Exception:logging.debug('[Managed bots] Could not acknowledge navigation')
     await state.update_data(menu_msg_id=call.message.message_id)
     data = call.data
     if data == 'managed_add':

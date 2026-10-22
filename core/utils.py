@@ -208,66 +208,7 @@ def is_bot_dialog(message_or_chat) -> bool:
     return getattr(chat_type, "name", "") == "BOT" or str(chat_type).lower().endswith(".bot")
 
 
-def _media_file_size(message) -> int:
-    for attr in ("voice", "video_note", "video", "audio", "photo", "document", "animation", "sticker"):
-        media = getattr(message, attr, None)
-        if isinstance(media, list):
-            media = media[-1] if media else None
-        size = getattr(media, "file_size", 0) if media else 0
-        if size:
-            return int(size)
-    return 0
-
-
-async def download_media_checked(client, message, file_name: str, timeout: float = 90.0, retries: int = 2) -> str:
-    """Download media and reject the zero-byte files Kurigram can return after MTProto errors."""
-    current_message = message
-    expected_size = _media_file_size(message)
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        for candidate in (file_name, f"{file_name}.temp"):
-            try:
-                if os.path.exists(candidate):
-                    os.remove(candidate)
-            except OSError:
-                pass
-
-        try:
-            path = await asyncio.wait_for(current_message.download(file_name=file_name), timeout=timeout)
-            actual_size = os.path.getsize(path) if path and os.path.isfile(path) else 0
-            if actual_size > 0 and (not expected_size or actual_size == expected_size):
-                return path
-
-            last_error = IOError(
-                f"incomplete media download: expected={expected_size or 'unknown'}, actual={actual_size}"
-            )
-            if path and os.path.isfile(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-        except Exception as exc:
-            last_error = exc
-
-        logging.warning(
-            "[Media] Download attempt %s/%s failed for message %s: %s",
-            attempt,
-            retries,
-            getattr(message, "id", "?"),
-            last_error,
-        )
-
-        if attempt < retries:
-            try:
-                refreshed = await client.get_messages(message.chat.id, message.id)
-                if refreshed:
-                    current_message = refreshed
-            except Exception as exc:
-                logging.debug("[Media] Failed to refresh message %s: %s", getattr(message, "id", "?"), exc)
-            await asyncio.sleep(1)
-
-    raise IOError(f"media download failed after {retries} attempts: {last_error}")
+from core.media_download import download_media_checked, _media_file_size
 
 
 def safe_userbot_handler(func):

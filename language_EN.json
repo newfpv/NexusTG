@@ -766,6 +766,8 @@
   "ts_batch_limit": "Specify between 1 and {limit} messages after the command. Source messages were preserved.",
   "ts_source_too_large": "Too much text for one request. Select fewer messages. Source messages were preserved.",
   "ts_batch_progress": "📎 Processing message {index}/{total}…",
-  "ts_batch_generating": "✨ Applying your task to {count} messages…"
+  "ts_batch_generating": "✨ Applying your task to {count} messages…",
+  "media_download_error": "❌ Could not download the recording or attachment from Telegram. Transcription has not started. The source message was preserved — try the command again.",
+  "managed_storage_delayed": "Archive usage calculation is taking longer. Refresh the list in a few seconds."
 }
 }

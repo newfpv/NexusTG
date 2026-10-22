@@ -116,7 +116,7 @@ Parts of NexusTG's methods and development approach were inspired by [SpyBot](ht
 
 ## Version and license
 
-The latest tagged release is **v2.9.2**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
+The latest tagged release is **v2.9.3**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 

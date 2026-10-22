@@ -21,6 +21,7 @@ from pyrogram.types import LinkPreviewOptions, Message
 from core.utils import safe_edit, safe_delete, get_cancel_kb, CoreAPI, md_to_html, simulate_typing, safe_userbot_handler, download_media_checked
 from core.config import _
 from core.services import generate_ai_response, transcribe_media
+from core.media_download import MediaDownloadError
 
 router = Router()
 MODULE_NAME = "text_struct"
@@ -214,6 +215,8 @@ async def _read_struct_media(client: Client, message: Message, file_stem: str | 
         if not text or text in {_("status_waiting"), _("err_no_api_keys")}:
             raise StructSourceError(_("ts_media_failed"))
         return text.strip()
+    except MediaDownloadError as exc:
+        raise StructSourceError(_("media_download_error")) from exc
     finally:
         if media_path and os.path.exists(media_path):
             try:
@@ -398,9 +401,9 @@ async def ts_save_input(message: types.Message, state: FSMContext):
     await state.set_state(None)
     await _ret_menu(message, state)
 
-async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str, client=None):
+async def _apply_edit(msg_to_edit: Message, original_text: str, ai_text: str, client=None, error_text=None):
     ai_ok=bool(ai_text and ai_text not in ('⏳',_('status_waiting'),_('err_no_api_keys')))
-    plain=ai_text if ai_ok else f"{original_text}\n\n{_('ts_error')}"
+    plain=ai_text if ai_ok else error_text or f"{original_text}\n\n{_('ts_error')}"
     formatted=md_to_html(ai_text) if ai_ok else md_to_html(plain)
     cap=900 if msg_to_edit.media else 3600
     chunks=_split_plain(plain,cap)
@@ -510,7 +513,7 @@ def register_userbot(app: Client):
                 prompt_to_use = _build_batch_prompt(cfg.get("prompt"), modifier_prompt)
                 ai_text = await _generate_struct_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
             except StructSourceError as exc:
-                await _apply_edit(message,str(exc),None,client=client)
+                await _apply_edit(message,"",None,client=client,error_text=str(exc))
                 return
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed for batch fix: {e}")
@@ -570,13 +573,14 @@ def register_userbot(app: Client):
 
             typing_task = asyncio.create_task(simulate_typing(client, message.chat.id, 10))
             text_to_process = ""
+            error_text = None
             try:
                 text_to_process = await _read_struct_media(client, target_msg)
                 if not text_to_process:
                     raise ValueError("media transcription returned empty text")
                 ai_text = await _generate_struct_response(text_to_process, custom_prompt=prompt_to_use, search_enabled=False)
             except StructSourceError as exc:
-                text_to_process=str(exc)
+                error_text=str(exc)
                 ai_text=None
             except Exception as e:
                 logging.error(f"[Struct] AI Generation failed for media message: {e}")
@@ -584,7 +588,7 @@ def register_userbot(app: Client):
             finally:
                 typing_task.cancel()
 
-            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text, client=client)
+            edit_success = await _apply_edit(message, text_to_process or _("v_process_error"), ai_text, client=client,error_text=error_text)
             if edit_success:
                 try:
                     await target_msg.delete()

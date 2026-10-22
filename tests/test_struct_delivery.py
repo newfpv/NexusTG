@@ -19,6 +19,11 @@ class StructDeliveryTests(unittest.IsolatedAsyncioTestCase):
             edit_text=AsyncMock(return_value=True),delete=AsyncMock())
         self.client=NS(send_message=AsyncMock(return_value=NS(id=8)))
 
+    async def test_source_error_does_not_append_a_second_generic_error(self):
+        self.assertFalse(await struct._apply_edit(self.message,'',None,client=self.client,error_text='DOWNLOAD_FAILED'))
+        self.assertEqual(self.message.edit_text.await_args.args[0],'DOWNLOAD_FAILED')
+        self.message.delete.assert_not_awaited();self.client.send_message.assert_not_awaited()
+
     async def test_missing_target_sends_result_without_replying_to_missing_message(self):
         self.message.edit_text.side_effect=MessageIdInvalid()
         self.assertTrue(await struct._apply_edit(self.message,'old','**corrected**',client=self.client))

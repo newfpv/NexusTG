@@ -273,6 +273,8 @@ class AccountGuard:
 
 
 def install_guard(app, session_string=""):
+    from core.media_download import install_media_guard
+    install_media_guard(app)
     existing = getattr(app, "telegram_guard", None)
     if existing:
         return existing
@@ -294,6 +296,9 @@ class BotDeliveryGuard:
         self.guard = AccountGuard(path)
         self.lock = asyncio.Lock()
         self.slots = asyncio.Semaphore(3)
+        self.background = asyncio.Semaphore(2)
+        self.uploads = asyncio.Semaphore(1)
+        self.menu_locks = {}
         self.peers = {}
         self.next = 0.0
 
@@ -305,25 +310,35 @@ class BotDeliveryGuard:
         key=getattr(method,'chat_id',None) or 'account'
         entry=self.peers.setdefault(key,[asyncio.Lock(),0,0.0])
         entry[1]+=1
+        from contextlib import nullcontext
+        from core.menu_middleware import menu_request, menu_request_is_current
+        control = bool(menu_request.get()) and name in {'EditMessageText','EditMessageCaption','EditMessageReplyMarkup'}
+        heavy = name in {'SendDocument','SendPhoto','SendVideo','SendAudio','SendVoice','SendVideoNote','SendAnimation','SendMediaGroup'}
+        order = self.menu_locks.setdefault(key,asyncio.Lock()) if control else entry[0]
         try:
-            async with entry[0], self.slots:
+            async with order, (self.uploads if heavy else nullcontext()), (nullcontext() if control else self.background):
                 while True:
-                    async with self.lock:
+                    while True:
                         await self.guard.wait()
-                        delay = max(self.next,entry[2]) - time.time()
-                        if delay > 0:
-                            await asyncio.sleep(delay)
-                        self.next=time.time()+0.15
-                        # Bot API guidance: one message/second per chat and
-                        # twenty/minute per group; topics share the group limit.
-                        group=str(key).startswith('-')
-                        entry[2]=time.time()+(3.2 if group else 1.1)
+                        async with self.lock:
+                            now=time.time()
+                            delay=max(self.next,entry[2])-now
+                            if delay<=0:
+                                self.next=now+0.15
+                                entry[2]=now+(3.2 if str(key).startswith('-') else 1.1)
+                                break
+                        # A busy group's pacing must not hold the global lock
+                        # or all HTTP slots while another chat opens its menu.
+                        await asyncio.sleep(delay)
                     try:
-                        return await make_request(bot, method)
+                        if control and not menu_request_is_current():return True
+                        async with self.slots:
+                            return await make_request(bot, method)
                     except TelegramRetryAfter as exc:
                         self.guard.defer(exc.retry_after)
         finally:
             entry[1]-=1
             if len(self.peers)>512:
                 for old,value in list(self.peers.items()):
-                    if not value[1] and value[2]<time.time():self.peers.pop(old,None)
+                    if not value[1] and value[2]<time.time():
+                        self.peers.pop(old,None);self.menu_locks.pop(old,None)

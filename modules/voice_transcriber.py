@@ -13,6 +13,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import AsyncSessionLocal, CoreRepository
 from core.services import transcribe_media, generate_ai_response
+from core.media_download import MediaDownloadError
 from core.utils import download_media_checked, is_bot_dialog, safe_edit
 from core.config import _
 
@@ -387,7 +388,7 @@ def register_userbot(app: Client):
 
                 return
             logging.error(f"[Voice Transcriber] Error processing media: {e}", exc_info=True)
-            err_txt = _("v_process_error")
+            err_txt = _("media_download_error") if isinstance(e,MediaDownloadError) else _("v_process_error")
             if is_manual:
                 if is_me and status_msg: 
                     try: await status_msg.edit(err_txt)

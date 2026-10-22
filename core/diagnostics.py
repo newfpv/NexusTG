@@ -17,7 +17,7 @@ ERRORS = ('FLOOD_WAIT', 'PEER_FLOOD', 'USER_RESTRICTED', 'USER_DEACTIVATED',
           'TimeoutError', 'ConnectionError', 'OSError', 'OperationalError',
           'TelegramNetworkError', 'TelegramRetryAfter', 'TelegramBadRequest',
           'FloodWait', 'CancelledError', 'ValueError', 'TypeError', 'KeyError',
-          'TelegramUnauthorizedError', 'Unauthorized', 'AuthKeyUnregistered', 'SessionRevoked')
+          'TelegramUnauthorizedError', 'Unauthorized', 'AuthKeyUnregistered', 'SessionRevoked','MediaDownloadError')
 EVENTS = ('startup', 'connected', 'polling', 'timeout', 'retry', 'cooldown',
           'cleanup', 'quota', 'download', 'upload', 'callback', 'failed', 'error')
 IDENTIFIER = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,79}$')
