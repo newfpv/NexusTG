@@ -728,7 +728,7 @@ async def _describe_message_media(client, message, media_paths: list[str], on_pr
 
     async with AsyncSessionLocal() as session:
         repo = CoreRepository(session)
-        cached = await repo.get_media_memory(message.id, media_type)
+        cached = await repo.get_media_memory(message.id, media_type, chat_id=message.chat.id)
         if cached:
             return cached, duration, duration > 600
 
@@ -759,7 +759,7 @@ async def _describe_message_media(client, message, media_paths: list[str], on_pr
         if not description or description == _("status_waiting"):
             return _("ai_msg_file"), duration, too_long
         async with AsyncSessionLocal() as session:
-            await CoreRepository(session).save_media_memory(message.id, media_type, description)
+            await CoreRepository(session).save_media_memory(message.id, media_type, description, chat_id=message.chat.id)
         return description, duration, too_long
     except Exception as exc:
         logging.warning("[Services] Failed to describe media message %s: %s", getattr(message, "id", "?"), exc)
@@ -788,6 +788,7 @@ async def build_dialog_context(
 
     report('history')
     messages = []
+    history_ids = []
     history_kwargs = {"limit": limit}
     if target_msg_id is not None:
         history_kwargs["max_id"] = target_msg_id + 1
@@ -803,11 +804,16 @@ async def build_dialog_context(
         async for msg in history_iter:
             if target_msg_id is not None and msg.id > target_msg_id:
                 continue
+            history_ids.append(msg.id)
             if is_bot_dialog(msg):
                 continue
             messages.append(msg)
 
     await asyncio.wait_for(collect_history(), timeout=CONTEXT_HISTORY_TIMEOUT)
+    if limit >= AI_TWIN_HISTORY_LIMIT and len(history_ids) >= AI_TWIN_HISTORY_LIMIT:
+        # Full Telegram window, before token pruning or filtering media/text.
+        async with AsyncSessionLocal() as session:
+            await CoreRepository(session).advance_media_window(chat_id, sorted(history_ids)[-AI_TWIN_HISTORY_LIMIT])
 
     if (target_message is not None and getattr(target_message, "id", None) == target_msg_id
             and getattr(getattr(target_message, "chat", None), "id", None) == chat_id
@@ -877,7 +883,7 @@ async def build_dialog_context(
                 kind = next((kind for kind in ("photo", "video", "voice", "video_note", "audio")
                              if getattr(msg, kind, None)), None)
                 if kind:
-                    cached = await repo.get_media_memory(msg.id, kind)
+                    cached = await repo.get_media_memory(msg.id, kind, chat_id=chat_id)
                     if cached:
                         duration = getattr(getattr(msg, kind), "duration", 0) or 0
                         media_results[msg.id] = (cached, duration, duration > 600)

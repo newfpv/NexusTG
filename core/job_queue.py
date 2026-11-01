@@ -35,9 +35,11 @@ class JobQueue:
         while not self.queue.empty():
             key,factory=await self.queue.get()
             try:
-                await factory()
-                self.completed[key]=time.monotonic()
-                while len(self.completed)>1024:self.completed.popitem(last=False)
+                result = await factory()
+                # A failed download remains eligible for an explicit retry.
+                if result is not False:
+                    self.completed[key]=time.monotonic()
+                    while len(self.completed)>1024:self.completed.popitem(last=False)
             except asyncio.CancelledError:
                 raise
             except Exception:

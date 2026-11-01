@@ -93,6 +93,19 @@ class MediaMemoryCache(Base):
     content: Mapped[str] = mapped_column(Text)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+class DialogMediaMemory(Base):
+    __tablename__ = "dialog_media_memory"
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    msg_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    media_type: Mapped[str] = mapped_column(String, primary_key=True)
+    content: Mapped[str] = mapped_column(Text)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class DialogMediaWindow(Base):
+    __tablename__ = "dialog_media_window"
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    oldest_id: Mapped[int] = mapped_column(BigInteger)
+
 class AICmdTracker(Base):
     __tablename__ = "ai_cmd_tracker"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -185,24 +198,59 @@ class CoreRepository:
         ))
         return res.scalar_one_or_none() is not None
 
-    async def save_media_memory(self, msg_id: int, m_type: str, content: str):
+    async def save_media_memory(self, msg_id: int, m_type: str, content: str, chat_id: int | None = None):
         from sqlalchemy.dialects.sqlite import insert
+        if chat_id is not None:
+            window = await self.session.get(DialogMediaWindow, chat_id)
+            if window and msg_id < window.oldest_id:
+                return
+            stmt = insert(DialogMediaMemory).values(
+                chat_id=chat_id, msg_id=msg_id, media_type=m_type, content=content, timestamp=datetime.utcnow()
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['chat_id', 'msg_id', 'media_type'],
+                set_={'content':content, 'timestamp':datetime.utcnow()}
+            )
+            await self.session.execute(stmt)
+            # Keep even manual-only usage bounded; a full history read applies
+            # the stricter boundary including ordinary text messages below.
+            await self.session.execute(text('''DELETE FROM dialog_media_memory
+                WHERE chat_id=:chat AND msg_id NOT IN
+                (SELECT DISTINCT msg_id FROM dialog_media_memory WHERE chat_id=:chat ORDER BY msg_id DESC LIMIT 1000)'''),
+                {'chat':chat_id})
+            await self.session.commit()
+            return
         stmt = insert(MediaMemoryCache).values(
             msg_id=msg_id, media_type=m_type, content=content, timestamp=datetime.utcnow()
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=['msg_id'], 
-            set_={'content': content, 'timestamp': datetime.utcnow()}
+            set_={'media_type':m_type, 'content': content, 'timestamp': datetime.utcnow()}
         )
         await self.session.execute(stmt)
         await self.session.commit()
 
-    async def get_media_memory(self, msg_id: int, m_type: str) -> Optional[str]:
+    async def get_media_memory(self, msg_id: int, m_type: str, chat_id: int | None = None) -> Optional[str]:
+        if chat_id is not None:
+            obj = await self.session.get(DialogMediaMemory, (chat_id, msg_id, m_type))
+            return obj.content if obj else None
         res = await self.session.execute(select(MediaMemoryCache.content).where(
             MediaMemoryCache.msg_id == msg_id, 
             MediaMemoryCache.media_type == m_type
         ))
         return res.scalar_one_or_none()
+
+    async def advance_media_window(self, chat_id: int, oldest_id: int):
+        from sqlalchemy.dialects.sqlite import insert
+        stmt = insert(DialogMediaWindow).values(chat_id=chat_id, oldest_id=oldest_id)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['chat_id'],
+            set_={'oldest_id':text('MAX(dialog_media_window.oldest_id, excluded.oldest_id)')}
+        )
+        await self.session.execute(stmt)
+        await self.session.execute(text('''DELETE FROM dialog_media_memory WHERE chat_id=:chat
+            AND msg_id < (SELECT oldest_id FROM dialog_media_window WHERE chat_id=:chat)'''), {'chat':chat_id})
+        await self.session.commit()
 
     async def track_ai_message(self, chat_id: int, msg_id: int):
         self.session.add(AICmdTracker(chat_id=chat_id, msg_id=msg_id))
@@ -265,7 +313,47 @@ async def init_db():
         except Exception:
             pass
 
+    await migrate_legacy_media_memory()
     await bind_profile_owner()
+
+
+async def migrate_legacy_media_memory(archive_path='data/saver_cache.sqlite'):
+    """Recover old chat-less keys only when the local archive identifies one peer."""
+    import asyncio
+    from pathlib import Path
+    import sqlite3
+    from sqlalchemy.dialects.sqlite import insert
+    path=Path(archive_path)
+    if not path.is_file():
+        return
+    async with AsyncSessionLocal() as session:
+        legacy=(await session.execute(select(MediaMemoryCache))).scalars().all()
+        if not legacy:
+            return
+        wanted={row.msg_id for row in legacy}
+        def locate():
+            with sqlite3.connect('file:'+str(path.resolve())+'?mode=ro',uri=True) as archive:
+                # Type, message and unique peer must all match; ambiguous old
+                # entries stay untouched rather than leaking another chat's text.
+                return {(mid,kind):chat for mid,kind,chat in archive.execute('''
+                    SELECT message_id,media_type,MIN(chat_id) FROM msg_cache
+                    GROUP BY message_id HAVING COUNT(DISTINCT chat_id)=1
+                ''') if mid in wanted}
+        try:
+            mapping=await asyncio.to_thread(locate)
+        except sqlite3.Error:
+            return
+        for row in legacy:
+            chat=mapping.get((row.msg_id,row.media_type))
+            if chat is None:
+                continue
+            window=await session.get(DialogMediaWindow,chat)
+            if not window or row.msg_id>=window.oldest_id:
+                await session.execute(insert(DialogMediaMemory).values(
+                    chat_id=chat,msg_id=row.msg_id,media_type=row.media_type,content=row.content,timestamp=row.timestamp
+                ).on_conflict_do_nothing(index_elements=['chat_id','msg_id','media_type']))
+            await session.delete(row)
+        await session.commit()
 
 
 async def bind_profile_owner():

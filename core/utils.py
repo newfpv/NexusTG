@@ -178,21 +178,6 @@ class PluginManager:
         self.fsm = PyrogramFSM()
         self.db = CoreAPI()
 
-    async def cleanup_media_cache(self):
-        from datetime import datetime, timedelta
-        from sqlalchemy import delete
-        from core.db import MediaMemoryCache, AsyncSessionLocal
-        
-        while True:
-            try:
-                async with AsyncSessionLocal() as session:
-                    threshold = datetime.utcnow() - timedelta(days=2)
-                    await session.execute(delete(MediaMemoryCache).where(MediaMemoryCache.timestamp < threshold))
-                    await session.commit()
-            except Exception as e:
-                logging.error("[Cache] Cleanup failed: %s", e)
-            await asyncio.sleep(3600 * 24)
-
 plugins = PluginManager()
 
 def is_bot_dialog(message_or_chat) -> bool:

@@ -1,5 +1,7 @@
 from core.job_queue import JobQueue
 from core.telegram_guard import delivery_failure
+from core.downloader_worker import run_media_worker
+from core.shared_resources import media_slot
 import asyncio
 import html
 import logging
@@ -31,7 +33,7 @@ router = Router()
 URL_PATTERN = re.compile(
     r'(https?://(?:'
     r'(?:(?:www|m|vm|vt)\.)?tiktok\.com/'
-    r'|(?:www\.)?instagram\.com/reels?/'
+        r'|(?:www\.)?instagram\.com/(?:reels?|share/reel)/'
     r'|(?:(?:www|m)\.)?youtube\.com/shorts/'
     r'|(?:\w+\.)?pinterest\.[\w.]+/pin/'
     r'|pin\.it/'
@@ -71,7 +73,8 @@ async def _get_g_cfg():
             "enable_reels": v.get("enable_reels", True),
             "enable_shorts": v.get("enable_shorts", True),
             "enable_pinterest": v.get("enable_pinterest", True),
-            "replace_link": v.get("replace_link", True),
+            "replace_my": v.get("replace_my", v.get("replace_link", True)),
+            "replace_other": v.get("replace_other", v.get("replace_link", False)),
             "command": v.get("command", ".dl")
         }
 
@@ -102,7 +105,8 @@ async def _get_c_cfg(chat_id):
             "enable_reels": v.get("enable_reels", 2),
             "enable_shorts": v.get("enable_shorts", 2),
             "enable_pinterest": v.get("enable_pinterest", 2),
-            "replace_link": v.get("replace_link", 2)
+            "replace_my": v.get("replace_my", v.get("replace_link", 2)),
+            "replace_other": v.get("replace_other", v.get("replace_link", 2)),
         }
 
 async def _upd_c_cfg(chat_id, **kwargs):
@@ -187,7 +191,8 @@ async def get_md_kb():
     st_reels = _("status_on") if cfg["enable_reels"] else _("status_off")
     st_shorts = _("status_on") if cfg["enable_shorts"] else _("status_off")
     st_pinterest = _("status_on") if cfg["enable_pinterest"] else _("status_off")
-    st_replace_link = _("status_on") if cfg["replace_link"] else _("status_off")
+    st_replace_my = _("status_on") if cfg["replace_my"] else _("status_off")
+    st_replace_other = _("status_on") if cfg["replace_other"] else _("status_off")
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=_("btn_md_auto_my", status=st_auto_my), callback_data="md_tgl_g_auto_my"),
@@ -197,7 +202,8 @@ async def get_md_kb():
          InlineKeyboardButton(text=_("btn_md_reels", status=st_reels), callback_data="md_tgl_g_enable_reels")],
         [InlineKeyboardButton(text=_("btn_md_shorts", status=st_shorts), callback_data="md_tgl_g_enable_shorts")],
         [InlineKeyboardButton(text=_("btn_md_pinterest", status=st_pinterest), callback_data="md_tgl_g_enable_pinterest")],
-        [InlineKeyboardButton(text=_("btn_md_replace_link", status=st_replace_link), callback_data="md_tgl_g_replace_link")],
+        [InlineKeyboardButton(text=_("btn_md_replace_my", status=st_replace_my), callback_data="md_tgl_g_replace_my")],
+        [InlineKeyboardButton(text=_("btn_md_replace_other", status=st_replace_other), callback_data="md_tgl_g_replace_other")],
         [InlineKeyboardButton(text=_("btn_md_command", cmd=cfg["command"]), callback_data="md_edit_cmd")],
         [InlineKeyboardButton(text=_("btn_md_cookie_manager"), callback_data="md_cookie_menu")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data="global_settings")]
@@ -219,7 +225,8 @@ async def get_chat_md_kb(chat_id):
          InlineKeyboardButton(text=get_lbl(chat_cfg["enable_reels"], "btn_md_reels"), callback_data=f"md_c_tgl_enable_reels_{chat_id}")],
         [InlineKeyboardButton(text=get_lbl(chat_cfg["enable_shorts"], "btn_md_shorts"), callback_data=f"md_c_tgl_enable_shorts_{chat_id}")],
         [InlineKeyboardButton(text=get_lbl(chat_cfg["enable_pinterest"], "btn_md_pinterest"), callback_data=f"md_c_tgl_enable_pinterest_{chat_id}")],
-        [InlineKeyboardButton(text=get_lbl(chat_cfg["replace_link"], "btn_md_replace_link"), callback_data=f"md_c_tgl_replace_link_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["replace_my"], "btn_md_replace_my"), callback_data=f"md_c_tgl_replace_my_{chat_id}")],
+        [InlineKeyboardButton(text=get_lbl(chat_cfg["replace_other"], "btn_md_replace_other"), callback_data=f"md_c_tgl_replace_other_{chat_id}")],
         [InlineKeyboardButton(text=_("btn_back"), callback_data=f"chat_{chat_id}")]
     ])
 
@@ -379,7 +386,11 @@ async def md_save_cmd(message: types.Message, state: FSMContext):
     try: await message.delete()
     except: pass
     
-    cmd = message.text.strip().split()[0]
+    parts = (message.text or '').split()
+    if not parts:
+        await message.answer(_("md_enter_command", cmd=(await _get_g_cfg())["command"]), parse_mode="HTML")
+        return
+    cmd = parts[0]
     logging.info(f"[Media Downloader] User {message.from_user.id} updated download command to: {cmd}")
     await _upd_g_cfg(command=cmd)
     
@@ -409,7 +420,7 @@ def _platform_setting_for_url(url: str) -> tuple[str, str] | None:
     lowered = url.lower()
     if "tiktok.com/" in lowered:
         return "enable_tiktok", "TikTok"
-    if "instagram.com/reel" in lowered:
+    if "instagram.com/reel" in lowered or "instagram.com/share/reel/" in lowered:
         return "enable_reels", "Instagram Reels"
     if "youtube.com/shorts/" in lowered:
         return "enable_shorts", "YouTube Shorts"
@@ -431,7 +442,7 @@ def _is_platform_enabled(url: str, global_cfg: dict, chat_cfg: dict) -> bool:
 def _fallback_title(url: str) -> str:
     if "youtube.com/shorts/" in url.lower():
         return "YouTube Shorts"
-    if "instagram.com/reel" in url.lower():
+    if "instagram.com/reel" in url.lower() or "instagram.com/share/reel/" in url.lower():
         return "Instagram Reels"
     if _is_pinterest_url(url):
         return "Pinterest"
@@ -468,6 +479,8 @@ def _download_video_sync(url: str, workdir: str) -> DownloadedMedia | None:
         'max_filesize': 512*1024**2,
         'progress_hooks': [lambda info: _check_staging(workdir)],
         'socket_timeout': 30,
+        'retries': 2,
+        'fragment_retries': 2,
         'quiet': True,
         'noprogress': True,
         'no_warnings': True,
@@ -667,134 +680,161 @@ async def _send_downloaded_media(
             reply_parameters=reply_parameters,
         )
 
+def _is_own(message):
+    return bool(getattr(getattr(message, 'from_user', None), 'is_self', False)
+                or getattr(message, 'outgoing', False))
+
+
+def _message_url(message):
+    if message is None:
+        return None
+    text = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
+    candidates = [text]
+    candidates.extend(getattr(entity, 'url', None) or ''
+                      for entity in (getattr(message, 'entities', None) or getattr(message, 'caption_entities', None) or []))
+    for candidate in candidates:
+        match = URL_PATTERN.search(candidate)
+        if match:
+            return match.group(1).rstrip('.,!?;:)]}»')
+    return None
+
+
+def _command_argument(text, command):
+    pieces = (text or '').strip().split(maxsplit=1)
+    if not pieces or pieces[0].casefold() != command.casefold():
+        return None
+    return pieces[1] if len(pieces) > 1 else ''
+
+
+def _effective_setting(name, global_cfg, chat_cfg):
+    value = chat_cfg.get(name, 2)
+    return bool(global_cfg.get(name, False)) if value == 2 else bool(value)
+
+
+def _replace_source(target, global_cfg, chat_cfg):
+    # The original link's author matters, not the author of a .dl reply.
+    return _effective_setting('replace_my' if _is_own(target) else 'replace_other', global_cfg, chat_cfg)
+
+
 def register_userbot(app: Client):
-    downloads=JobQueue(capacity=16)
-    async def process_media_download(client, message, target_msg, url: str, replace_link: bool, is_manual=False):
-        logging.info(f"[Media Downloader] Initiating download task for {url} in chat {message.chat.id}")
+    downloads = JobQueue(capacity=16)
+
+    async def process_media_download(client, message, target_msg, url, replace_link, is_manual=False):
         status_msg = None
-        is_me = (message.from_user and message.from_user.is_self)
-
-        if is_manual and is_me:
-            status_msg = await message.edit(_("md_status_downloading"), parse_mode=enums.ParseMode.HTML)
-
-        os.makedirs("data", exist_ok=True)
-        temp_dir = tempfile.mkdtemp(prefix=f"dl_{target_msg.id}_", dir="data")
-        downloaded_media = None
-
+        temp_dir = None
+        success = False
+        sending = False
         try:
-            downloaded_media = await asyncio.to_thread(_download_media_sync, url, temp_dir)
-
-            if downloaded_media and all(os.path.exists(path) for path in downloaded_media.paths):
-                logging.info(
-                    "[Media Downloader] Uploading %s (%s file(s)) to chat %s",
-                    downloaded_media.kind,
-                    len(downloaded_media.paths),
-                    message.chat.id,
-                )
-                _check_staging(temp_dir)
-                await _send_downloaded_media(
-                    client,
-                    message.chat.id,
-                    target_msg.id,
-                    downloaded_media,
-                    url,
-                    replace_link,
-                )
-                if replace_link:
-                    try:
-                        await target_msg.delete()
-                    except Exception as delete_error:
-                        logging.warning(
-                            "[Media Downloader] Could not delete source message %s: %s",
-                            target_msg.id,
-                            delete_error,
-                        )
-                logging.info(f"[Media Downloader] Successfully sent media to chat {message.chat.id}")
-            else:
-                logging.warning(f"[Media Downloader] File not found after download attempt for {url}")
-                raise ValueError(_("err_md_download_failed"))
-
-        except Exception as e:
-
-            if delivery_failure(e):
-
-                logging.warning("[Delivery] Result retained in account journal",exc_info=True)
-
-                return
-            logging.error("[Media Downloader] Download task failed: %s", e)
-            err_txt = _("md_process_error")
-            if is_manual:
-                if is_me and status_msg: 
-                    try: await status_msg.edit(err_txt)
-                    except: await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
+            if is_manual and _is_own(message):
+                if message.id != target_msg.id:
+                    status_msg = await message.edit(_("md_status_downloading"), parse_mode=enums.ParseMode.HTML)
                 else:
-                    await client.send_message(message.chat.id, err_txt, reply_parameters=ReplyParameters(message_id=message.id))
-        finally:
-            try:
-                shutil.rmtree(temp_dir)
-                logging.debug(f"[Media Downloader] Cleaned up temporary directory: {temp_dir}")
-            except Exception as cleanup_err:
-                logging.warning(f"[Media Downloader] Failed to clean up directory {temp_dir}: {cleanup_err}")
-            if status_msg:
-                try: await status_msg.delete()
-                except: pass
-            logging.info(f"[Media Downloader] Task completed for chat {message.chat.id}")
-
-    @app.on_message(filters.regex(URL_PATTERN) & (filters.private | filters.group), group=10)
-    async def auto_download_handler(client, message):
-        is_me = bool(message.from_user and message.from_user.is_self)
-        if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
-            return
-
-        cfg = await _get_g_cfg()
-        chat_cfg = await _get_c_cfg(message.chat.id)
-        
-        c_my, c_oth = chat_cfg["auto_my"], chat_cfg["auto_other"]
-        should_my = cfg["auto_my"] if c_my == 2 else bool(c_my)
-        should_oth = cfg["auto_other"] if c_oth == 2 else bool(c_oth)
-        
-        if (is_me and should_my) or (not is_me and should_oth):
-            match = URL_PATTERN.search(message.text or message.caption)
-            if match:
-                url = match.group(1)
-                if not _is_platform_enabled(url, cfg, chat_cfg):
-                    platform = _platform_setting_for_url(url)
-                    logging.info(
-                        "[Media Downloader] Ignoring disabled platform %s in chat %s",
-                        platform[1] if platform else "unknown",
-                        message.chat.id,
+                    # Inline command is the source: leave its URL intact on error
+                    # or when replacement is disabled.
+                    status_msg = await client.send_message(
+                        message.chat.id, _("md_status_downloading"), parse_mode=enums.ParseMode.HTML,
+                        reply_parameters=ReplyParameters(message_id=message.id),
                     )
-                    return
-                logging.info(f"[Media Downloader] Auto-download match found for URL: {url} in chat {message.chat.id}")
-                replace_link = cfg["replace_link"] if chat_cfg["replace_link"] == 2 else bool(chat_cfg["replace_link"])
-                await downloads.submit((message.chat.id,message.id,url),lambda:process_media_download(client,message,message,url,replace_link,is_manual=False))
+            os.makedirs('data', exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix=f'dl_{target_msg.id}_', dir='data')
+            async with media_slot():
+                result = await run_media_worker(url, temp_dir)
+            if not result:
+                raise ValueError('No supported media extracted')
+            downloaded_media = DownloadedMedia(**result)
+            _check_staging(temp_dir)
+            sending = True
+            await _send_downloaded_media(client, message.chat.id, target_msg.id, downloaded_media, url, replace_link)
+            success = True
+            if replace_link:
+                try:
+                    await target_msg.delete()
+                except Exception as exc:
+                    logging.warning('[Media Downloader] Source retained after send: %s', type(exc).__name__)
+            logging.info('[Media Downloader] Media sent (%s files)', len(downloaded_media.paths))
+            return True
+        except Exception as exc:
+            queued = sending and delivery_failure(exc)
+            logging.warning('[Media Downloader] Download failed: %s', type(exc).__name__)
+            if is_manual:
+                text = _("md_delivery_queued" if queued else "md_process_error")
+                if status_msg:
+                    try:
+                        await status_msg.edit(text, parse_mode=enums.ParseMode.HTML)
+                    except Exception:
+                        await client.send_message(message.chat.id, text, parse_mode=enums.ParseMode.HTML,
+                                                  reply_parameters=ReplyParameters(message_id=message.id))
+                else:
+                    await client.send_message(message.chat.id, text, parse_mode=enums.ParseMode.HTML,
+                                              reply_parameters=ReplyParameters(message_id=message.id))
+            # Do not immediately duplicate an ambiguously delivered journaled send.
+            # Extraction failures, however, must allow a new explicit command.
+            return True if queued else False
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if success and status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
 
-    @app.on_message(filters.text & filters.reply & (filters.private | filters.group), group=22)
-    async def cmd_download_handler(client, message):
-        is_me = bool(message.from_user and message.from_user.is_self)
+    @app.on_message((filters.text | filters.caption) & (filters.private | filters.group), group=10)
+    async def auto_download_handler(client, message):
+        is_me = _is_own(message)
         if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
             return
-
+        # Downloaded captions can link to their source. Never feed our own
+        # uploaded media back into automatic extraction.
+        if is_me and any(getattr(message, kind, None) for kind in ('photo','video','audio','document','animation')):
+            return
+        url = _message_url(message)
+        if not url:
+            return
         cfg = await _get_g_cfg()
-        if message.text.lower().startswith(cfg["command"].lower()):
-            chat_cfg = await _get_c_cfg(message.chat.id)
-            c_allow = chat_cfg["allow_cmd"]
-            allow_others = cfg["allow_cmd"] if c_allow == 2 else bool(c_allow)
-            
-            if is_me or allow_others:
-                target = message.reply_to_message
-                if target and (target.text or target.caption):
-                    match = URL_PATTERN.search(target.text or target.caption)
-                    if match:
-                        url = match.group(1)
-                        if not _is_platform_enabled(url, cfg, chat_cfg):
-                            platform = _platform_setting_for_url(url)
-                            logging.info(
-                                "[Media Downloader] Ignoring disabled platform %s command in chat %s",
-                                platform[1] if platform else "unknown",
-                                message.chat.id,
-                            )
-                            return
-                        logging.info(f"[Media Downloader] Command trigger match found for URL: {url} in chat {message.chat.id}")
-                        replace_link = cfg["replace_link"] if chat_cfg["replace_link"] == 2 else bool(chat_cfg["replace_link"])
-                        await downloads.submit((message.chat.id,target.id,url),lambda:process_media_download(client,message,target,url,replace_link,is_manual=True))
+        if _command_argument(getattr(message, 'text', None), cfg['command']) is not None:
+            return
+        chat_cfg = await _get_c_cfg(message.chat.id)
+        if not _effective_setting('auto_my' if is_me else 'auto_other', cfg, chat_cfg):
+            return
+        if not _is_platform_enabled(url, cfg, chat_cfg):
+            return
+        replace_link = _replace_source(message, cfg, chat_cfg)
+        await downloads.submit((message.chat.id,message.id,url),
+                               lambda:process_media_download(client,message,message,url,replace_link))
+
+    @app.on_message(filters.text & (filters.private | filters.group), group=22)
+    async def cmd_download_handler(client, message):
+        is_me = _is_own(message)
+        if message.chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP) and not is_me:
+            return
+        cfg = await _get_g_cfg()
+        argument = _command_argument(message.text, cfg['command'])
+        if argument is None:
+            return
+        chat_cfg = await _get_c_cfg(message.chat.id)
+        if not is_me and not _effective_setting('allow_cmd', cfg, chat_cfg):
+            return
+        target = message if argument else getattr(message, 'reply_to_message', None)
+        url = _message_url(target)
+        reply_id = getattr(message, 'reply_to_message_id', None)
+        if not argument and not url and reply_id:
+            try:
+                target = await asyncio.wait_for(client.get_messages(message.chat.id, reply_id), timeout=30)
+                url = _message_url(target)
+            except Exception as exc:
+                logging.warning('[Media Downloader] Reply lookup failed: %s', type(exc).__name__)
+        if not url:
+            await client.send_message(message.chat.id, _("md_command_help", cmd=html.escape(cfg['command'])),
+                                      parse_mode=enums.ParseMode.HTML,
+                                      reply_parameters=ReplyParameters(message_id=message.id))
+            return
+        # Platform switches control automatic processing. An explicit supported
+        # command still works when e.g. automatic YouTube Shorts is disabled.
+        replace_link = _replace_source(target, cfg, chat_cfg)
+        key = (message.chat.id,target.id,url)
+        accepted = await downloads.submit(key,
+            lambda:process_media_download(client,message,target,url,replace_link,is_manual=True))
+        if not accepted:
+            await client.send_message(message.chat.id, _("md_already_processing" if key in downloads.pending else "md_already_sent"),
+                                      reply_parameters=ReplyParameters(message_id=message.id))

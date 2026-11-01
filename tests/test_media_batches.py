@@ -53,10 +53,10 @@ class MediaBatchTests(unittest.IsolatedAsyncioTestCase):
         for msg in reversed(self.messages):
             yield msg
 
-    async def get_cache(self, mid, kind):
+    async def get_cache(self, mid, kind, chat_id=None):
         return self.cache.get((mid, kind))
 
-    async def save_cache(self, mid, kind, content):
+    async def save_cache(self, mid, kind, content, chat_id=None):
         self.cache[(mid, kind)] = content
 
     async def download(self, client, msg, **kwargs):

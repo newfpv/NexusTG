@@ -86,7 +86,7 @@ The `./data` directory is mounted into the container and keeps the database, Tel
 | `.fix 5` | Process exactly five earlier messages, including attachments (maximum 20) |
 | `.fix 2 transcribe both conversations` | Read two earlier messages and apply the task after the count |
 | `.sum URL` | Summarize a YouTube video |
-| `.dl` | Reply to a supported TikTok/Instagram Reel URL to download it |
+| `.dl` / `.dl URL` | Download supported TikTok, Reels, Shorts or Pinterest media; reply to a link or include it |
 | `.shop items` | Create or update a Telegram shopping checklist |
 | `.save` | Forward a replied message to a configured chat/topic |
 
@@ -116,7 +116,9 @@ Parts of NexusTG's methods and development approach were inspired by [SpyBot](ht
 
 ## Version and license
 
-The latest tagged release is **v2.10.0**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
+The latest tagged release is **v2.11.0**. See [releases](https://github.com/newfpv/NexusTG/releases) and the [version guide](https://neewfpv.com/wiki/nexustg#versions).
+
+The downloader independently controls replacement of your own and other people's links; preserved sources receive the media as a reply. Explicit downloads bypass automatic platform switches, failed extraction can be retried immediately, and hung extractors have a four-minute deadline. AI Twin descriptions/transcripts persist across restarts, are scoped to each chat, and expire when their messages leave the 1000-message history window rather than after two days. See the [behavior guide](docs/media-downloader.md).
 
 NexusTG is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 

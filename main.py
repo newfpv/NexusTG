@@ -377,7 +377,6 @@ async def main():
     asyncio.create_task(event_loop_monitor())
     asyncio.create_task(chat_directory.get_dialogs(userbot_app))
     asyncio.create_task(userbot_health_monitor())
-    asyncio.create_task(plugins.cleanup_media_cache())
     
     from core.environment import mark_ready
     me=getattr(userbot_app,'me',None)
